@@ -2,17 +2,38 @@
 # dmx_audio_react.py (v2: NO OLA) + DEV_NO_HW + Plug&Play Audio
 #
 # Audio-reactive DMX with optional hardware:
-#   - 6 knobs (MCP3008 via SPI)
-#   - 4-position program switch (GPIO)
-#   - RESET button (GPIO25), READY LED (GPIO17)
-#   - optional OLED
+#   - 3 pots + 1 slider (MCP3008 via SPI0 CE0, CH0-CH3)
+#   - 2 rotary encoders with push buttons
+#   - SPI OLED display (shares MOSI/CLK with MCP3008, uses CE1)
+#
+# Hardware Wiring:
+#   MCP3008 (SPI0 CE0):
+#     CH0: Pot 1 (Center Freq)
+#     CH1: Pot 2 (Q)
+#     CH2: Pot 3 (Threshold)
+#     CH3: Slider (Brightness)
+#
+#   SPI OLED (shares MOSI/CLK):
+#     RST: GPIO 12
+#     DC:  GPIO 24
+#     CS:  CE1 (GPIO 7)
+#
+#   Rotary Encoder 1 (Program/Cycle):
+#     CLK: GPIO 5
+#     DT:  GPIO 6
+#     SW:  GPIO 13 (Reset button)
+#
+#   Rotary Encoder 2 (Decay):
+#     CLK: GPIO 17
+#     DT:  GPIO 27
+#     SW:  GPIO 22
 #
 # DMX backends:
 #   DMX_BACKEND=null  -> run without DMX output
 #   DMX_BACKEND=uart  -> DMX over UART (/dev/serial0) via RS485 transceiver (pyserial)
 #
 # DEV mode (skip all hardware except audio + DMX):
-#   DEV_NO_HW=1 -> skips SPI/MCP3008, GPIO switch/reset/LED, OLED
+#   DEV_NO_HW=1 -> skips SPI/MCP3008, GPIO, OLED
 #
 # Plug & Play audio device selection:
 #   AUDIO_DEVICE=1
@@ -35,12 +56,12 @@ try:
 except Exception:
     GPIO = None
 
-# --- OLED (optional) ---
+# --- OLED (optional, SPI) ---
 _OLED_AVAILABLE = False
 try:
-    import board, busio
     from PIL import Image, ImageDraw, ImageFont
-    import adafruit_ssd1305
+    from luma.core.interface.serial import spi as luma_spi
+    from luma.oled.device import ssd1309  # Waveshare 2.42" uses SSD1309
     _OLED_AVAILABLE = True
 except Exception:
     _OLED_AVAILABLE = False
@@ -49,7 +70,7 @@ except Exception:
 
 DEV_NO_HW = os.environ.get("DEV_NO_HW", "0").strip() == "1"
 
-DMX_BACKEND = os.environ.get("DMX_BACKEND", "null").strip().lower()
+DMX_BACKEND = os.environ.get("DMX_BACKEND", "uart").strip().lower()
 DMX_UART_DEVICE = os.environ.get("DMX_UART_DEVICE", "/dev/serial0")
 DMX_UART_BAUD = 250000  # DMX: 250k 8N2
 
@@ -100,23 +121,31 @@ PREFERRED_INPUTS = [
     r"hifiberry", r"dac\+adc", r"scarlett", r"usb audio", r"codec", r"line", r"pulse"
 ]
 
-# Rotary switch pins (BCM) and mapping
-SW_PINS = [21, 22, 23, 24]  # pulled-up
-SW_MAP = {
-    (1,1,1,1): 1,
-    (1,1,0,0): 2,
-    (1,0,1,0): 3,
-    (0,1,1,0): 4,
-}
-SW_DEBOUNCE_SAMPLES = 3
-SW_SAMPLE_PERIOD_S  = 0.01
+# Rotary Encoder 1 (Program/Cycle select + Reset button)
+ENC1_CLK = 5
+ENC1_DT  = 6
+ENC1_SW  = 13  # Also serves as reset button
 
-# Reset button and Ready LED
-RESET_PIN     = 25
-READY_LED_PIN = 17
+# Rotary Encoder 2 (Decay control)
+ENC2_CLK = 17
+ENC2_DT  = 27
+ENC2_SW  = 22
+
+# SPI OLED pins (Waveshare 2.42" SSD1309 on CE1)
+OLED_SPI_DEV = 1   # CE1 (GPIO 7)
+OLED_RST_PIN = 12
+OLED_DC_PIN  = 24
 
 # MCP3008 on SPI0 CE0
 SPI_BUS, SPI_DEV = 0, 0
+
+# Encoder state
+encoder1_value = 0
+encoder2_value = 0
+encoder1_button = False
+encoder2_button = False
+_enc1_last_clk = None
+_enc2_last_clk = None
 
 # DMX throttling
 DMX_RATE_HZ       = 25.0
@@ -516,41 +545,49 @@ def map_cycle_steps(x):
     return CYCLE_STEPS_OPTIONS[idx]
 
 def update_from_knobs():
-    global BRIGHTNESS, IGNORE_KNOBS_UNTIL, CYCLE_STEPS
+    """
+    Read analog inputs from MCP3008:
+      CH0: Center Frequency (pot 1)
+      CH1: Q Factor (pot 2)
+      CH2: Threshold (pot 3)
+      CH3: Brightness (slider)
+    """
+    global BRIGHTNESS, IGNORE_KNOBS_UNTIL
     if DEV_NO_HW:
         return
     if time.time() < IGNORE_KNOBS_UNTIL:
         return
+    # Pot 1: Center Frequency
     v = _jump_takeover(0, map_center, alpha=0.35)
     if v is not None: band.center = v
+    # Pot 2: Q Factor
     v = _jump_takeover(1, map_q, alpha=0.35)
     if v is not None: band.q = v
+    # Pot 3: Threshold
     v = _jump_takeover(2, map_thresh, alpha=0.30)
     if v is not None: band.thresh = v
-    v = _jump_takeover(3, map_cycle_steps, alpha=0.30)
-    if v is not None and int(v) != CYCLE_STEPS:
-        set_cycle_steps(v)
-    v = _jump_takeover(4, map_decay, alpha=0.35)
-    if v is not None: band.decay_ms = v
-    v = _jump_takeover(5, map_bright, alpha=0.35)
+    # Slider: Brightness
+    v = _jump_takeover(3, map_bright, alpha=0.35)
     if v is not None: BRIGHTNESS = v
 
-# ===================== GPIO switch/reset =====================
+# ===================== GPIO / Rotary Encoders =====================
 
 def reset_to_defaults(channel=None):
-    global IGNORE_KNOBS_UNTIL
+    global IGNORE_KNOBS_UNTIL, encoder1_value, encoder2_value
     band.center    = DEFAULT_CENTER_HZ
     band.q         = DEFAULT_Q
     band.thresh    = DEFAULT_THRESH
     band.attack_ms = DEFAULT_ATTACK_MS
     band.decay_ms  = DEFAULT_DECAY_MS
     set_cycle_steps(0)
-    for i in range(6):
+    encoder1_value = 0
+    encoder2_value = 0
+    for i in range(4):
         _knob_ema[i]         = None
         _knob_last_soft[i]   = None
         _knob_jumped_soft[i] = False
     IGNORE_KNOBS_UNTIL = time.time() + 0.3
-    ui_flash("[RESET] Defaults (C0; brightness kept).", 1.5)
+    ui_flash("[RESET] Defaults restored.", 1.5)
 
 def setup_gpio_inputs():
     if DEV_NO_HW:
@@ -559,48 +596,87 @@ def setup_gpio_inputs():
         raise RuntimeError("RPi.GPIO not available")
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
-    for p in SW_PINS:
-        GPIO.setup(p, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(READY_LED_PIN, GPIO.OUT, initial=GPIO.LOW)
+    
+    # Rotary Encoder 1
+    GPIO.setup(ENC1_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC1_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC1_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    
+    # Rotary Encoder 2
+    GPIO.setup(ENC2_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC2_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC2_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-def switch_reader():
+def encoder_reader():
+    """
+    Read rotary encoders:
+      Encoder 1: Controls program selection (1-4) via rotation, reset via button
+      Encoder 2: Controls decay time via rotation
+    """
+    global encoder1_value, encoder2_value, encoder1_button, encoder2_button
+    global _enc1_last_clk, _enc2_last_clk
     global BASE_PROGRAM, CYCLE_TRIGGER_COUNT, CYCLE_PHASE
+    
     if DEV_NO_HW:
         return
-    last_switch = None
-    switch_stable = 0
-    last_reset_state = 1
+    
+    _enc1_last_clk = GPIO.input(ENC1_CLK)
+    _enc2_last_clk = GPIO.input(ENC2_CLK)
+    last_enc1_btn = 1
+    last_enc2_btn = 1
+    
     try:
         while not STOP_THREADS:
             try:
-                s = tuple(GPIO.input(p) for p in SW_PINS)
-                r = GPIO.input(RESET_PIN)
+                # Encoder 1 rotation
+                enc1_clk = GPIO.input(ENC1_CLK)
+                enc1_dt = GPIO.input(ENC1_DT)
+                enc1_sw = GPIO.input(ENC1_SW)
+                
+                if enc1_clk != _enc1_last_clk:
+                    if enc1_dt != enc1_clk:
+                        encoder1_value += 1
+                    else:
+                        encoder1_value -= 1
+                    # Map encoder value to program (1-4)
+                    new_prog = ((encoder1_value // 4) % 4) + 1
+                    if new_prog != BASE_PROGRAM:
+                        BASE_PROGRAM = new_prog
+                        CYCLE_TRIGGER_COUNT = 0
+                        CYCLE_PHASE = 0
+                        ui_flash(f"Program {BASE_PROGRAM}", 0.5)
+                _enc1_last_clk = enc1_clk
+                
+                # Encoder 1 button (reset)
+                encoder1_button = (enc1_sw == 0)
+                if last_enc1_btn == 1 and enc1_sw == 0:
+                    time.sleep(0.02)
+                    if GPIO.input(ENC1_SW) == 0:
+                        reset_to_defaults()
+                last_enc1_btn = enc1_sw
+                
+                # Encoder 2 rotation (decay)
+                enc2_clk = GPIO.input(ENC2_CLK)
+                enc2_dt = GPIO.input(ENC2_DT)
+                enc2_sw = GPIO.input(ENC2_SW)
+                
+                if enc2_clk != _enc2_last_clk:
+                    if enc2_dt != enc2_clk:
+                        encoder2_value += 1
+                    else:
+                        encoder2_value -= 1
+                    # Map encoder to decay (150-9999ms, ~50ms per click)
+                    band.decay_ms = clamp(150.0 + encoder2_value * 50.0, 150.0, 9999.0)
+                _enc2_last_clk = enc2_clk
+                
+                # Encoder 2 button (could be used for something else)
+                encoder2_button = (enc2_sw == 0)
+                last_enc2_btn = enc2_sw
+                
             except RuntimeError:
                 break
-
-            if s == last_switch:
-                switch_stable += 1
-            else:
-                last_switch, switch_stable = s, 1
-
-            if switch_stable >= SW_DEBOUNCE_SAMPLES:
-                prog = SW_MAP.get(s)
-                if prog and prog != BASE_PROGRAM:
-                    BASE_PROGRAM = prog
-                    CYCLE_TRIGGER_COUNT = 0
-                    CYCLE_PHASE = 0
-
-            if last_reset_state == 1 and r == 0:
-                time.sleep(0.02)
-                try:
-                    if GPIO.input(RESET_PIN) == 0:
-                        reset_to_defaults()
-                except RuntimeError:
-                    break
-
-            last_reset_state = r
-            time.sleep(SW_SAMPLE_PERIOD_S)
+            
+            time.sleep(0.001)  # 1ms polling for responsive encoders
     finally:
         pass
 
@@ -718,34 +794,49 @@ def audio_loop():
         _set_stop(True)
         _set_run(False)
 
-# ===================== OLED UI (optional) =====================
+# ===================== OLED UI (SPI) =====================
 
 class OledUI:
-    def __init__(self, addr=0x3D, fps=15):
+    """
+    SPI OLED display (Waveshare 2.42" SSD1309)
+    Shares MOSI/CLK with MCP3008, uses CE1
+    RST=GPIO12, DC=GPIO24, CS=CE1(GPIO7)
+    """
+    def __init__(self, width=128, height=64, fps=15):
         self.enabled = False
-        self.addr = addr
+        self.width = width
+        self.height = height
         self.period = 1.0 / max(1, fps)
         self._font = None
+        self.device = None
+        
         if DEV_NO_HW or not _OLED_AVAILABLE:
             return
         try:
-            self.i2c = busio.I2C(board.SCL, board.SDA)
-            self.oled = adafruit_ssd1305.SSD1305_I2C(128, 32, self.i2c, addr=self.addr)
-            self.oled.fill(0); self.oled.show()
+            serial = luma_spi(
+                device=OLED_SPI_DEV,  # CE1
+                port=0,
+                bus_speed_hz=8000000,
+                gpio_DC=OLED_DC_PIN,
+                gpio_RST=OLED_RST_PIN,
+            )
+            self.device = ssd1309(serial, width=width, height=height, rotate=0)
             try:
                 self._font = ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 8
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10
                 )
             except Exception:
                 self._font = ImageFont.load_default()
             self.enabled = True
-        except Exception:
+        except Exception as e:
+            print(f"[OLED] Init failed: {e}")
             self.enabled = False
 
     def clear(self):
-        if not self.enabled: return
+        if not self.enabled or self.device is None:
+            return
         try:
-            self.oled.fill(0); self.oled.show()
+            self.device.clear()
         except Exception:
             pass
 
@@ -766,10 +857,10 @@ class OledUI:
 
     def _render_error(self, draw, err_msg):
         f = self._font
-        draw.text((0, 0),  "ERROR", font=f, fill=1)
+        draw.text((0, 0), "ERROR", font=f, fill=1)
         msg = (err_msg or "See logs")[:20]
-        draw.text((0, 12), msg, font=f, fill=1)
-        draw.text((0, 24), "Reboot or fix & retry", font=f, fill=1)
+        draw.text((0, 14), msg, font=f, fill=1)
+        draw.text((0, 28), "Check logs", font=f, fill=1)
 
     def snapshot_params(self):
         return {
@@ -784,9 +875,9 @@ class OledUI:
         }
 
     def render_once(self):
-        if not self.enabled:
+        if not self.enabled or self.device is None:
             return
-        W, H = self.oled.width, self.oled.height
+        W, H = self.width, self.height
         image = Image.new("1", (W, H))
         draw = ImageDraw.Draw(image)
         f = self._font
@@ -795,16 +886,28 @@ class OledUI:
             self._render_error(draw, APP_ERROR)
         else:
             s = self.snapshot_params()
+            # Line 1: Program and frequency
             line1 = f"P{s['active_program']}  {self._fmt_center(s['center'])}Hz  Q{s['q']:.1f}"
             draw.text((0, 0), line1, font=f, fill=1)
-            self._draw_meter(draw, 0, 10, W, 8, s["env"], s["thr"])
+            
+            # Envelope meter
+            self._draw_meter(draw, 0, 14, W, 10, s["env"], s["thr"])
+            
+            # Line 3: Threshold and decay
             thr_norm = thresh_to_ui(s["thr"])
-            line3 = f"Th{thr_norm:0.1f}  C{s['c']}  D{int(s['d'])}  B{s['b']:.2f}"
-            draw.text((0, 22), line3, font=f, fill=1)
+            line3 = f"Th:{thr_norm:.1f}  D:{int(s['d'])}ms"
+            draw.text((0, 28), line3, font=f, fill=1)
+            
+            # Line 4: Brightness and cycle
+            line4 = f"Brt:{s['b']:.0%}  Cyc:{s['c']}"
+            draw.text((0, 42), line4, font=f, fill=1)
+            
+            # Line 5: Encoder values (debug)
+            line5 = f"E1:{encoder1_value:3d} E2:{encoder2_value:3d}"
+            draw.text((0, 54), line5, font=f, fill=1)
 
         try:
-            self.oled.image(image)
-            self.oled.show()
+            self.device.display(image)
         except Exception:
             self.enabled = False
 
@@ -874,7 +977,7 @@ def tui(stdscr):
             f"ENV_EMA={ENV_EMA:.2f}  AGC={'ON' if AGC_ON else 'OFF'} target={AGC_TARGET:.3f}  "
             f"Refractory={REFRACTORY_MS:.0f}ms  Weighting={'ON' if WEIGHTING_ON else 'OFF'}"
         )
-        safe_addstr(stdscr, 2, 0, f"Cycle: C={CYCLE_STEPS}  phase={CYCLE_PHASE}  count={CYCLE_TRIGGER_COUNT}")
+        safe_addstr(stdscr, 2, 0, f"Cycle: C={CYCLE_STEPS}  phase={CYCLE_PHASE}  count={CYCLE_TRIGGER_COUNT}  Enc1={encoder1_value}  Enc2={encoder2_value}")
 
         row = 4
         labels_vals = [
@@ -935,23 +1038,24 @@ def main():
     dmx_backend = make_dmx_backend()
     threading.Thread(target=lambda: dmx_sender_loop(dmx_backend), daemon=True).start()
 
-    # OLED UI (optional)
-    oled_ui = OledUI(addr=0x3D, fps=15)
+    # OLED UI (SPI)
+    oled_ui = OledUI(width=128, height=64, fps=15)
     if getattr(oled_ui, "enabled", False):
         threading.Thread(target=oled_ui.loop, daemon=True).start()
-        print("[OK] OLED UI: 128x32 @ 0x3D")
+        print("[OK] OLED UI: 128x64 SPI (RST=GPIO12, DC=GPIO24, CS=CE1)")
     else:
         print("[INFO] OLED UI not available (skipping).")
 
-    # Switch/reset thread (GPIO)
+    # Encoder reader thread (GPIO)
     if not DEV_NO_HW:
-        threading.Thread(target=switch_reader, daemon=True).start()
+        threading.Thread(target=encoder_reader, daemon=True).start()
+        print("[OK] Encoders: E1(GPIO5,6,13) E2(GPIO17,27,22)")
 
     # Audio thread
     threading.Thread(target=audio_loop, daemon=True).start()
 
-    # TUI thread
-    use_tui = sys.stdout.isatty() and os.environ.get("ENABLE_TUI", "1") == "1"
+    # TUI thread (enabled by default if running in a TTY)
+    use_tui = sys.stdout.isatty() and os.environ.get("ENABLE_TUI", "1") != "0"
     if use_tui:
         threading.Thread(target=lambda: curses.wrapper(tui), daemon=True).start()
     else:
