@@ -2,31 +2,31 @@
 # dmx_audio_react.py (v2: NO OLA) + DEV_NO_HW + Plug&Play Audio + FFT OLED Display
 #
 # Audio-reactive DMX with optional hardware:
-#   - 3 pots + 1 slider (MCP3008 via SPI0 CE0, CH0-CH3)
-#   - 2 rotary encoders with push buttons
-#   - SPI OLED display with FFT spectrum (shares MOSI/CLK with MCP3008, uses CE1)
+#   - 5 rotary encoders with push buttons (no MCP3008)
+#   - SPI OLED display with FFT spectrum (CE1)
 #
 # Hardware Wiring:
-#   MCP3008 (SPI0 CE0):
-#     CH0: Pot 1 (Center Freq on HOME, reserved on ADV)
-#     CH1: Pot 2 (Threshold on HOME, Q on ADV)
-#     CH2: Pot 3 (Release on HOME, Decay on ADV)
-#     CH3: Slider (Brightness - always)
-#
-#   SPI OLED (shares MOSI/CLK):
+#   SPI OLED:
 #     RST: GPIO 12
 #     DC:  GPIO 24
 #     CS:  CE1 (GPIO 7)
 #
 #   Rotary Encoder 1 (Page selection):
-#     CLK: GPIO 5
-#     DT:  GPIO 6
-#     SW:  GPIO 13 (Reset button)
+#     CLK: GPIO 5,  DT: GPIO 6,  SW: GPIO 13
 #
-#   Rotary Encoder 2 (Preset selection):
-#     CLK: GPIO 17
-#     DT:  GPIO 27
-#     SW:  GPIO 22
+#   Rotary Encoder 2 (Param A - Freq/Speed/Preset):
+#     CLK: GPIO 17, DT: GPIO 27, SW: GPIO 22
+#
+#   Rotary Encoder 3 (Param B - Thresh/Beats):
+#     CLK: GPIO 19, DT: GPIO 26, SW: GPIO 23
+#
+#   Rotary Encoder 4 (Param C - Release/Mode):
+#     CLK: GPIO 16, DT: GPIO 20, SW: GPIO 21
+#
+#   Rotary Encoder 5 (Brightness):
+#     CLK: GPIO 4,  DT: GPIO 18, SW: GPIO 8
+#
+#   Reset Button: GPIO 25
 #
 # DMX backends:
 #   DMX_BACKEND=null  -> run without DMX output
@@ -167,26 +167,30 @@ PREFERRED_INPUTS = [
     r"hifiberry", r"dac\+adc", r"scarlett", r"usb audio", r"codec", r"line", r"pulse"
 ]
 
-# Rotary Encoder 1 (Page selection + Reset button)
+# Rotary Encoder 1 (Page selection)
 ENC1_CLK = 5
 ENC1_DT  = 6
 ENC1_SW  = 13
 
-# Rotary Encoder 2 - disabled (was preset selection, now using pot on PRE page)
-# ENC2_CLK = 17
-# ENC2_DT  = 27
-# ENC2_SW  = 22
+# Rotary Encoder 2 - Param A (Freq/Speed/Preset depending on page)
+ENC2_CLK = 17
+ENC2_DT  = 27
+ENC2_SW  = 22
 
-# Parameter Encoders (replacing MCP3008 pots 0, 1, 2)
-# Encoder A (was Pot 1): Freq/Speed/Preset depending on page
-PARAM_ENC_A_CLK = 17
-PARAM_ENC_A_DT  = 27
-# Encoder B (was Pot 2): Thresh/Beats depending on page
-PARAM_ENC_B_CLK = 19
-PARAM_ENC_B_DT  = 26
-# Encoder C (was Pot 3): Release/Mode depending on page
-PARAM_ENC_C_CLK = 16
-PARAM_ENC_C_DT  = 20
+# Rotary Encoder 3 - Param B (Thresh/Beats depending on page)
+ENC3_CLK = 19
+ENC3_DT  = 26
+ENC3_SW  = 23
+
+# Rotary Encoder 4 - Param C (Release/Mode depending on page)
+ENC4_CLK = 16
+ENC4_DT  = 20
+ENC4_SW  = 21
+
+# Rotary Encoder 5 - Brightness (global)
+ENC5_CLK = 4
+ENC5_DT  = 18
+ENC5_SW  = 8
 
 # Reset button (separate from encoder buttons)
 RESET_PIN = 25
@@ -197,9 +201,6 @@ OLED_RST_PIN = 12
 OLED_DC_PIN  = 24
 OLED_WIDTH   = 128
 OLED_HEIGHT  = 64
-
-# MCP3008 on SPI0 CE0
-SPI_BUS, SPI_DEV = 0, 0
 
 # ===================== Page System =====================
 
@@ -310,30 +311,23 @@ fft_max_decay = 0.995
 # ===================== Encoder / Pot State =====================
 
 encoder1_value = 0
-encoder2_value = 1  # Program selection (1-4)
 encoder1_button = False
-encoder2_button = False
-_enc1_last_clk = None
-_enc2_last_clk = None
 _reset_last_state = 1  # Reset button state (1 = not pressed)
 
-# Parameter encoder state (for the 3 encoders replacing pots 0, 1, 2)
-_param_enc_last_clk = [None, None, None]  # Last CLK state for each encoder
-# Encoder deltas - accumulated since last update_pots() call
-_param_enc_delta = [0, 0, 0]
+# Encoder state for all 5 encoders
+# Encoders 1-4: Page, Param A, Param B, Param C (indices 0-3)
+# Encoder 5: Brightness (index 4)
+_enc_last_clk = [None, None, None, None, None]
+_enc_last_sw = [1, 1, 1, 1, 1]  # Switch states (1 = not pressed)
+# Encoder deltas - accumulated since last update call
+_enc_delta = [0, 0, 0, 0, 0]
 
-# Pot values (0-1 normalized) - now only used for slider (CH3)
-pot_values = [0.5, 0.5, 0.5, 0.5]
-pot_display = [50, 50, 50, 50]
-_pot_raw = [0.5, 0.5, 0.5, 0.5]  # Raw readings for change detection
-POT_EMA_ALPHA = 0.15  # Moderate smoothing for responsiveness
-POT_CHANGE_THRESHOLD = 0.03  # 3% change needed to take over
-POT_STABLE_FRAMES = 0  # Counter for stability
-
-# Pot takeover system - only for slider now (CH3)
-_pot_has_taken_over = [False, False, False, False]
-_pot_initial_reading = [None, None, None, None]
-POT_TAKEOVER_THRESHOLD = 0.10  # 10% movement from initial to take over
+# Brightness fade toggle state
+_brightness_saved = DEFAULT_BRIGHT  # Saved brightness before fade-out
+_brightness_fading = False  # True while fading
+_brightness_target = DEFAULT_BRIGHT  # Target for fade animation
+_brightness_off = False  # True when faded to zero
+BRIGHTNESS_FADE_SPEED = 0.05  # How fast to fade (per frame)
 
 # Display-specific smoothed values (separate from control values)
 _display_freq = DEFAULT_CENTER_HZ
@@ -342,8 +336,6 @@ _display_q = DEFAULT_Q
 _display_bright = DEFAULT_BRIGHT
 _display_release = int((DEFAULT_DECAY_MS - 40.0) / 4960.0 * 99)  # Release display value
 _display_q_pct = round((Q_MAX - DEFAULT_Q) / (Q_MAX - Q_MIN) * 99)  # Q display value (0-99)
-_display_values_locked = [None, None, None, None]  # Lock display when stable
-DISPLAY_LOCK_THRESHOLD = 0.005  # Lock if change < 0.5%
 
 # DMX throttling
 DMX_RATE_HZ       = 25.0
@@ -703,120 +695,37 @@ def choose_input_device():
 
 DEVICE_INDEX, DEVICE_NAME = choose_input_device()
 
-# ===================== MCP3008 (knobs) =====================
 
-spi = None
-spi_lock = threading.Lock()
-_pot_ema = [None] * 4
-
-def init_spi():
-    global spi
-    if DEV_NO_HW:
-        return
-    if spidev is None:
-        raise RuntimeError("spidev module not available")
-    s = spidev.SpiDev()
-    s.open(SPI_BUS, SPI_DEV)
-    s.max_speed_hz = 1000000
-    s.mode = 0
-    spi = s
-
-def read_mcp3008(ch: int) -> int:
-    if DEV_NO_HW or spi is None:
-        return 512
-    cmd = [1, (8+ch) << 4, 0]
-    with spi_lock:
-        try:
-            resp = spi.xfer2(cmd)
-        except OSError:
-            time.sleep(0.02)
-            try:
-                spi.close()
-            except Exception:
-                pass
-            spi.open(SPI_BUS, SPI_DEV)
-            spi.max_speed_hz = 1000000
-            spi.mode = 0
-            resp = spi.xfer2(cmd)
-        # Small delay to let SPI bus settle before OLED uses it
-        time.sleep(0.0005)  # 0.5ms
-    return ((resp[1] & 3) << 8) | resp[2]
-
-_pot_stable_count = [0, 0, 0, 0]  # Count consecutive stable readings
-
-def read_pot_smoothed(channel):
-    """Read pot with takeover system - defaults used until pot is moved significantly."""
-    global _pot_raw, _display_values_locked, _pot_has_taken_over, _pot_initial_reading, _pot_stable_count
-    
-    raw = read_mcp3008(channel) / 1023.0
-    
-    # First reading - store initial position
-    if _pot_initial_reading[channel] is None:
-        _pot_initial_reading[channel] = raw
-        _pot_ema[channel] = raw
-        _pot_raw[channel] = raw
-        _pot_stable_count[channel] = 0
-        return raw
-    
-    # Check if pot has taken over yet
-    if not _pot_has_taken_over[channel]:
-        # Check if pot moved enough from initial position to take over
-        if abs(raw - _pot_initial_reading[channel]) > POT_TAKEOVER_THRESHOLD:
-            _pot_has_taken_over[channel] = True
-            _pot_ema[channel] = raw
-            _pot_raw[channel] = raw
-            _display_values_locked[channel] = None
-            _pot_stable_count[channel] = 0
-        else:
-            # Pot hasn't taken over - don't update
-            return _pot_ema[channel]
-    
-    # Pot has taken over - normal smoothing
-    change = abs(raw - _pot_raw[channel])
-    _pot_raw[channel] = raw
-    
-    if change > POT_CHANGE_THRESHOLD:
-        # Pot is moving - be responsive
-        _pot_ema[channel] = 0.4 * raw + 0.6 * _pot_ema[channel]
-        _display_values_locked[channel] = None
-        _pot_stable_count[channel] = 0
-    else:
-        # Pot is stable - smooth very heavily
-        _pot_ema[channel] = 0.02 * raw + 0.98 * _pot_ema[channel]
-        _pot_stable_count[channel] += 1
-        
-        # Lock display after 5 consecutive stable readings
-        if _pot_stable_count[channel] >= 5 and _display_values_locked[channel] is None:
-            _display_values_locked[channel] = _pot_ema[channel]
-    
-    if _display_values_locked[channel] is not None:
-        return _display_values_locked[channel]
-    return _pot_ema[channel]
-
-def update_pots():
-    """Read slider (brightness) and apply encoder deltas based on current page."""
-    global pot_values, pot_display, BRIGHTNESS, BASE_PROGRAM, CYCLES_BETWEEN_INDEX
+def update_encoders():
+    """Apply encoder deltas based on current page and handle brightness."""
+    global BRIGHTNESS, BASE_PROGRAM, CYCLES_BETWEEN_INDEX
     global ambient_speed, ambient_fade_time, DEFAULTS_MODE_INDEX
-    global _param_enc_delta
+    global _enc_delta, _brightness_target, _brightness_fading
     
     if DEV_NO_HW:
         return
     if time.time() < IGNORE_KNOBS_UNTIL:
         return
     
-    # Only read slider (CH3) from MCP3008 for brightness
-    pot_values[3] = read_pot_smoothed(3)
-    new_pct = int(pot_values[3] * 100)
-    if new_pct != pot_display[3]:
-        pot_display[3] = new_pct
+    # Get encoder deltas and reset them (indices 1-3 are param encoders, 4 is brightness)
+    deltas = _enc_delta[1:4]  # Param A, B, C deltas
+    brightness_delta = _enc_delta[4]
+    _enc_delta = [0, 0, 0, 0, 0]
     
-    # Slider (CH3) is always brightness (global) - only if taken over
-    if _pot_has_taken_over[3]:
-        BRIGHTNESS = pot_values[3]
+    # Handle brightness encoder (Encoder 5)
+    if brightness_delta != 0 and not _brightness_off:
+        # Each click changes brightness by 2%
+        _brightness_target = max(0.0, min(1.0, _brightness_target + brightness_delta * 0.02))
+        _brightness_fading = True
     
-    # Get encoder deltas and reset them
-    deltas = _param_enc_delta[:]
-    _param_enc_delta = [0, 0, 0]
+    # Animate brightness fade
+    if _brightness_fading:
+        diff = _brightness_target - BRIGHTNESS
+        if abs(diff) < BRIGHTNESS_FADE_SPEED:
+            BRIGHTNESS = _brightness_target
+            _brightness_fading = False
+        else:
+            BRIGHTNESS += BRIGHTNESS_FADE_SPEED if diff > 0 else -BRIGHTNESS_FADE_SPEED
     
     # Update parameters based on current page using encoder deltas
     page_name = PAGES[current_page]
@@ -888,25 +797,29 @@ def update_pots():
                 save_defaults_mode(new_idx)
                 ui_flash(f"Defaults: {mode_name}", 0.8)
 
+def toggle_brightness():
+    """Toggle brightness between current value and zero with fade animation."""
+    global _brightness_saved, _brightness_off, _brightness_target, _brightness_fading
+    
+    if _brightness_off:
+        # Fade back to saved brightness
+        _brightness_target = _brightness_saved
+        _brightness_off = False
+        _brightness_fading = True
+        ui_flash(f"Brightness: {int(_brightness_saved * 100)}%", 0.8)
+    else:
+        # Save current brightness and fade to zero
+        _brightness_saved = BRIGHTNESS if BRIGHTNESS > 0.05 else _brightness_saved
+        _brightness_target = 0.0
+        _brightness_off = True
+        _brightness_fading = True
+        ui_flash("Brightness: OFF", 0.8)
+
 # ===================== GPIO / Rotary Encoders =====================
 
-def reset_pot_takeover():
-    """Reset slider takeover state.
-    Called when switching pages to prevent values from jumping."""
-    global IGNORE_KNOBS_UNTIL, _pot_has_taken_over, _pot_initial_reading, _pot_ema, _pot_raw
-    
-    # Only reset slider (CH3) takeover state
-    current_pos = read_mcp3008(3) / 1023.0
-    _pot_initial_reading[3] = current_pos
-    _pot_ema[3] = current_pos
-    _pot_raw[3] = current_pos
-    _pot_has_taken_over[3] = False
-    
-    IGNORE_KNOBS_UNTIL = time.time() + 0.3
-
-def reset_to_defaults(channel=None):
+def reset_to_defaults():
     """Reset HOME page parameters (Freq, Threshold, Release, Q) to current defaults mode."""
-    global IGNORE_KNOBS_UNTIL, _pot_has_taken_over, _pot_initial_reading, _pot_ema, _pot_raw
+    global IGNORE_KNOBS_UNTIL
     
     # Get values from current defaults mode
     mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
@@ -918,14 +831,7 @@ def reset_to_defaults(channel=None):
     band.decay_ms = decay_ms
     band.q        = q_factor
     
-    # Reset slider (CH3) takeover state
-    current_pos = read_mcp3008(3) / 1023.0
-    _pot_initial_reading[3] = current_pos
-    _pot_ema[3] = current_pos
-    _pot_raw[3] = current_pos
-    _pot_has_taken_over[3] = False
-    
-    IGNORE_KNOBS_UNTIL = time.time() + 0.5
+    IGNORE_KNOBS_UNTIL = time.time() + 0.3
     ui_flash(f"Reset to {mode_name}", 1.0)
 
 def setup_gpio_inputs():
@@ -941,102 +847,147 @@ def setup_gpio_inputs():
     GPIO.setup(ENC1_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(ENC1_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     
-    # Parameter Encoder A (was Pot 1)
-    GPIO.setup(PARAM_ENC_A_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(PARAM_ENC_A_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    # Rotary Encoder 2 (Param A - Freq/Speed/Preset)
+    GPIO.setup(ENC2_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC2_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC2_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     
-    # Parameter Encoder B (was Pot 2)
-    GPIO.setup(PARAM_ENC_B_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(PARAM_ENC_B_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    # Rotary Encoder 3 (Param B - Thresh/Beats)
+    GPIO.setup(ENC3_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     
-    # Parameter Encoder C (was Pot 3)
-    GPIO.setup(PARAM_ENC_C_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(PARAM_ENC_C_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    # Rotary Encoder 4 (Param C - Release/Mode)
+    GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC4_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC4_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    
+    # Rotary Encoder 5 (Brightness)
+    GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     
     # Reset button
     GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 def encoder_reader():
-    """Read rotary encoders for page selection and parameter control."""
-    global encoder1_value, encoder2_value, encoder1_button, encoder2_button
-    global _enc1_last_clk, _enc2_last_clk, _reset_last_state
-    global current_page, BASE_PROGRAM
-    global _param_enc_last_clk, _param_enc_delta
+    """Read all 5 rotary encoders for page selection, parameters, and brightness."""
+    global encoder1_value, encoder1_button
+    global current_page
+    global _enc_last_clk, _enc_last_sw, _enc_delta, _reset_last_state
     
     if DEV_NO_HW:
         return
     
-    _enc1_last_clk = GPIO.input(ENC1_CLK)
-    _reset_last_state = GPIO.input(RESET_PIN)
-    last_enc1_btn = 1
+    # Initialize all encoder CLK states
+    _enc_last_clk[0] = GPIO.input(ENC1_CLK)
+    _enc_last_clk[1] = GPIO.input(ENC2_CLK)
+    _enc_last_clk[2] = GPIO.input(ENC3_CLK)
+    _enc_last_clk[3] = GPIO.input(ENC4_CLK)
+    _enc_last_clk[4] = GPIO.input(ENC5_CLK)
     
-    # Initialize parameter encoder states
-    _param_enc_last_clk[0] = GPIO.input(PARAM_ENC_A_CLK)
-    _param_enc_last_clk[1] = GPIO.input(PARAM_ENC_B_CLK)
-    _param_enc_last_clk[2] = GPIO.input(PARAM_ENC_C_CLK)
+    # Initialize all switch states
+    _enc_last_sw[0] = GPIO.input(ENC1_SW)
+    _enc_last_sw[1] = GPIO.input(ENC2_SW)
+    _enc_last_sw[2] = GPIO.input(ENC3_SW)
+    _enc_last_sw[3] = GPIO.input(ENC4_SW)
+    _enc_last_sw[4] = GPIO.input(ENC5_SW)
+    
+    _reset_last_state = GPIO.input(RESET_PIN)
     
     try:
         while not STOP_THREADS:
             try:
-                # Encoder 1 - page selection
+                # ===== Encoder 1 - Page selection =====
                 enc1_clk = GPIO.input(ENC1_CLK)
                 enc1_dt = GPIO.input(ENC1_DT)
                 enc1_sw = GPIO.input(ENC1_SW)
                 
-                # Only trigger on falling edge of CLK (0) to avoid double-counting
-                if enc1_clk == 0 and _enc1_last_clk == 1:
+                # Rotation - falling edge of CLK
+                if enc1_clk == 0 and _enc_last_clk[0] == 1:
                     if enc1_dt == 1:  # CW
                         encoder1_value += 1
                     else:  # CCW
                         encoder1_value -= 1
-                    # Clamp page (no wrap around)
                     encoder1_value = max(0, min(len(PAGES) - 1, encoder1_value))
                     if current_page != encoder1_value:
                         current_page = encoder1_value
-                _enc1_last_clk = enc1_clk
-
-                # Encoder 1 button (reset)
-                encoder1_button = (enc1_sw == 0)
-                if last_enc1_btn == 1 and enc1_sw == 0:
-                    time.sleep(0.02)
+                _enc_last_clk[0] = enc1_clk
+                
+                # Switch - reset to defaults
+                if enc1_sw == 0 and _enc_last_sw[0] == 1:
+                    time.sleep(0.02)  # Debounce
                     if GPIO.input(ENC1_SW) == 0:
                         reset_to_defaults()
-                last_enc1_btn = enc1_sw
+                _enc_last_sw[0] = enc1_sw
                 
-                # Parameter Encoder A - accumulate delta
-                enc_a_clk = GPIO.input(PARAM_ENC_A_CLK)
-                enc_a_dt = GPIO.input(PARAM_ENC_A_DT)
-                if enc_a_clk == 0 and _param_enc_last_clk[0] == 1:
-                    if enc_a_dt == 1:
-                        _param_enc_delta[0] += 1
-                    else:
-                        _param_enc_delta[0] -= 1
-                _param_enc_last_clk[0] = enc_a_clk
+                # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
+                enc2_clk = GPIO.input(ENC2_CLK)
+                enc2_dt = GPIO.input(ENC2_DT)
+                enc2_sw = GPIO.input(ENC2_SW)
                 
-                # Parameter Encoder B - accumulate delta
-                enc_b_clk = GPIO.input(PARAM_ENC_B_CLK)
-                enc_b_dt = GPIO.input(PARAM_ENC_B_DT)
-                if enc_b_clk == 0 and _param_enc_last_clk[1] == 1:
-                    if enc_b_dt == 1:
-                        _param_enc_delta[1] += 1
-                    else:
-                        _param_enc_delta[1] -= 1
-                _param_enc_last_clk[1] = enc_b_clk
+                if enc2_clk == 0 and _enc_last_clk[1] == 1:
+                    _enc_delta[1] += 1 if enc2_dt == 1 else -1
+                _enc_last_clk[1] = enc2_clk
                 
-                # Parameter Encoder C - accumulate delta
-                enc_c_clk = GPIO.input(PARAM_ENC_C_CLK)
-                enc_c_dt = GPIO.input(PARAM_ENC_C_DT)
-                if enc_c_clk == 0 and _param_enc_last_clk[2] == 1:
-                    if enc_c_dt == 1:
-                        _param_enc_delta[2] += 1
-                    else:
-                        _param_enc_delta[2] -= 1
-                _param_enc_last_clk[2] = enc_c_clk
+                # Switch - TBD (could be used for quick actions)
+                if enc2_sw == 0 and _enc_last_sw[1] == 1:
+                    time.sleep(0.02)
+                    if GPIO.input(ENC2_SW) == 0:
+                        pass  # Reserved for future use
+                _enc_last_sw[1] = enc2_sw
                 
-                # Reset button (GPIO 25) - resets HOME page defaults
+                # ===== Encoder 3 - Param B (Thresh/Beats) =====
+                enc3_clk = GPIO.input(ENC3_CLK)
+                enc3_dt = GPIO.input(ENC3_DT)
+                enc3_sw = GPIO.input(ENC3_SW)
+                
+                if enc3_clk == 0 and _enc_last_clk[2] == 1:
+                    _enc_delta[2] += 1 if enc3_dt == 1 else -1
+                _enc_last_clk[2] = enc3_clk
+                
+                # Switch - TBD
+                if enc3_sw == 0 and _enc_last_sw[2] == 1:
+                    time.sleep(0.02)
+                    if GPIO.input(ENC3_SW) == 0:
+                        pass  # Reserved for future use
+                _enc_last_sw[2] = enc3_sw
+                
+                # ===== Encoder 4 - Param C (Release/Mode) =====
+                enc4_clk = GPIO.input(ENC4_CLK)
+                enc4_dt = GPIO.input(ENC4_DT)
+                enc4_sw = GPIO.input(ENC4_SW)
+                
+                if enc4_clk == 0 and _enc_last_clk[3] == 1:
+                    _enc_delta[3] += 1 if enc4_dt == 1 else -1
+                _enc_last_clk[3] = enc4_clk
+                
+                # Switch - TBD
+                if enc4_sw == 0 and _enc_last_sw[3] == 1:
+                    time.sleep(0.02)
+                    if GPIO.input(ENC4_SW) == 0:
+                        pass  # Reserved for future use
+                _enc_last_sw[3] = enc4_sw
+                
+                # ===== Encoder 5 - Brightness =====
+                enc5_clk = GPIO.input(ENC5_CLK)
+                enc5_dt = GPIO.input(ENC5_DT)
+                enc5_sw = GPIO.input(ENC5_SW)
+                
+                if enc5_clk == 0 and _enc_last_clk[4] == 1:
+                    _enc_delta[4] += 1 if enc5_dt == 1 else -1
+                _enc_last_clk[4] = enc5_clk
+                
+                # Switch - Toggle brightness on/off with fade
+                if enc5_sw == 0 and _enc_last_sw[4] == 1:
+                    time.sleep(0.02)
+                    if GPIO.input(ENC5_SW) == 0:
+                        toggle_brightness()
+                _enc_last_sw[4] = enc5_sw
+                
+                # ===== Reset button (GPIO 25) =====
                 reset_btn = GPIO.input(RESET_PIN)
                 if reset_btn == 0 and _reset_last_state == 1:
-                    # Debounce
                     time.sleep(0.02)
                     if GPIO.input(RESET_PIN) == 0:
                         reset_to_defaults()
@@ -1634,7 +1585,7 @@ class OledUI:
         
         while not STOP_THREADS:
             start = time.time()
-            update_pots()
+            update_encoders()
             self.render_once()
             
             elapsed = time.time() - start
@@ -1700,7 +1651,8 @@ def tui(stdscr):
             f"Center={band.center:.0f}Hz  Q={band.q:.1f}  Thresh={band.thresh:.2f}  "
             f"Decay={band.decay_ms:.0f}ms  Bright={BRIGHTNESS:.0%}"
         )
-        safe_addstr(stdscr, 2, 0, f"Pots: {pot_display[0]:3d} {pot_display[1]:3d} {pot_display[2]:3d} {pot_display[3]:3d}")
+        bright_status = "OFF" if _brightness_off else f"{int(BRIGHTNESS*100)}%"
+        safe_addstr(stdscr, 2, 0, f"Brightness: {bright_status}  (saved: {int(_brightness_saved*100)}%)")
 
         row = 4
         safe_addstr(stdscr, row, 0, "Band Env vs Threshold (| is threshold):")
@@ -1732,17 +1684,16 @@ def main():
     print(f"[OK] Using input: {DEVICE_INDEX} - {DEVICE_NAME}")
     print(f"[OK] DMX backend: {DMX_BACKEND} (Universe {UNIVERSE}, Channels 1..4)")
     if DEV_NO_HW:
-        print("[OK] DEV_NO_HW=1: skipping SPI/MCP3008, GPIO, OLED.")
+        print("[OK] DEV_NO_HW=1: skipping GPIO, OLED.")
     else:
-        print("[OK] Hardware mode: SPI + GPIO enabled.")
+        print("[OK] Hardware mode: GPIO + OLED enabled.")
 
     global APP_STATE, IGNORE_KNOBS_UNTIL
     APP_STATE = "loading"
     IGNORE_KNOBS_UNTIL = time.time() + 0.3
 
-    # init SPI/GPIO if enabled
+    # init GPIO if enabled
     if not DEV_NO_HW:
-        init_spi()
         setup_gpio_inputs()
 
     # DMX backend + sender thread
@@ -1760,7 +1711,8 @@ def main():
     # Encoder reader thread (GPIO)
     if not DEV_NO_HW:
         threading.Thread(target=encoder_reader, daemon=True).start()
-        print("[OK] Encoders: E1(GPIO5,6,13) E2(GPIO17,27,22)")
+        print("[OK] Encoders: 5 rotary encoders with switches")
+        print("     E1(5,6,13) E2(17,27,22) E3(19,26,23) E4(16,20,21) E5(4,18,8) RST(25)")
 
     # Audio thread
     threading.Thread(target=audio_loop, daemon=True).start()
@@ -1793,11 +1745,6 @@ def main():
         except Exception:
             pass
         
-        try:
-            if spi is not None:
-                spi.close()
-        except Exception:
-            pass
         try:
             if (not DEV_NO_HW) and (GPIO is not None):
                 GPIO.cleanup()
