@@ -39,7 +39,7 @@
 #   AUDIO_DEVICE=1
 #   AUDIO_DEVICE_NAME="USB Audio"
 
-import os, sys, time, math, threading, curses, re
+import os, sys, time, math, threading, curses, re, random
 from dataclasses import dataclass
 
 import numpy as np
@@ -77,13 +77,59 @@ DMX_UART_BAUD = 250000  # DMX: 250k 8N2
 UNIVERSE   = 0
 DMX_CHANS  = 4
 
-# Startup defaults
+# Startup defaults (used by "LOW" mode)
 DEFAULT_CENTER_HZ = 120.0   # 120 Hz
-DEFAULT_Q         = 2.0
-DEFAULT_THRESH    = 0.60    # 60 on 0-99 scale
+DEFAULT_Q         = 4.24    # 60 on 0-99 scale ((10-4.24)/9.5*99 = 60)
+DEFAULT_THRESH    = 0.61    # 60 on 0-99 scale (0.61 * 99 = 60.39 → 60)
 DEFAULT_ATTACK_MS = 10.0
-DEFAULT_DECAY_MS  = 536.0   # ~10 on 0-99 scale (40 + 0.10 * 4960 = 536ms)
+DEFAULT_DECAY_MS  = 542.0   # 10 on 0-99 scale ((542-40)/4960*99 = 10.02 → 10)
 DEFAULT_BRIGHT    = 0.5
+
+# Defaults modes: LOW, MID, HIGH target different frequency ranges
+# Each mode has (center_hz, thresh, decay_ms, q) - Q varies by range
+DEFAULTS_MODES = ["LOW", "MID", "HIGH", "USR1", "USR2", "USR3"]
+DEFAULTS_PRESETS = {
+    #           (center_hz, thresh, decay_ms, q_factor)
+    "LOW":  (120.0,  0.61, 542.0, 2.0),    # Low frequencies ~120Hz, thresh=60
+    "MID":  (1000.0, 0.41, 542.0, 1.5),    # Mid frequencies ~1kHz, thresh=40
+    "HIGH": (5000.0, 0.25, 542.0, 1.0),    # High frequencies ~5kHz, thresh=25
+    "USR1": (120.0,  0.61, 542.0, 2.0),    # User preset 1 (not active yet)
+    "USR2": (120.0,  0.61, 542.0, 2.0),    # User preset 2 (not active yet)
+    "USR3": (120.0,  0.61, 542.0, 2.0),    # User preset 3 (not active yet)
+}
+
+# Config file for persisting settings
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dmx_config")
+
+def load_defaults_mode():
+    """Load the defaults mode from config file."""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    if line.startswith("defaults_mode="):
+                        mode_name = line.strip().split("=")[1]
+                        if mode_name in DEFAULTS_MODES:
+                            return DEFAULTS_MODES.index(mode_name)
+    except Exception:
+        pass
+    return 0  # Default to LOW
+
+def save_defaults_mode(idx):
+    """Save the defaults mode to config file."""
+    try:
+        mode_name = DEFAULTS_MODES[idx]
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(f"defaults_mode={mode_name}\n")
+    except Exception:
+        pass
+
+DEFAULTS_MODE_INDEX = load_defaults_mode()  # Load from config or default to LOW
+
+# Q factor range: 0.5 (very wide) to 8.0 (very narrow)
+# Display: 0 = narrow (Q=8), 99 = wide (Q=0.5)
+Q_MIN = 0.5   # Widest (display 99)
+Q_MAX = 8.0   # Narrowest (display 0)
 
 THRESH_MIN = 0.001
 THRESH_MAX = 1.0
@@ -126,10 +172,24 @@ ENC1_CLK = 5
 ENC1_DT  = 6
 ENC1_SW  = 13
 
-# Rotary Encoder 2 (Preset selection)
-ENC2_CLK = 17
-ENC2_DT  = 27
-ENC2_SW  = 22
+# Rotary Encoder 2 - disabled (was preset selection, now using pot on PRE page)
+# ENC2_CLK = 17
+# ENC2_DT  = 27
+# ENC2_SW  = 22
+
+# Parameter Encoders (replacing MCP3008 pots 0, 1, 2)
+# Encoder A (was Pot 1): Freq/Speed/Preset depending on page
+PARAM_ENC_A_CLK = 17
+PARAM_ENC_A_DT  = 27
+# Encoder B (was Pot 2): Thresh/Beats depending on page
+PARAM_ENC_B_CLK = 19
+PARAM_ENC_B_DT  = 26
+# Encoder C (was Pot 3): Release/Mode depending on page
+PARAM_ENC_C_CLK = 16
+PARAM_ENC_C_DT  = 20
+
+# Reset button (separate from encoder buttons)
+RESET_PIN = 25
 
 # SPI OLED pins (Waveshare 2.42" SSD1309 on CE1)
 OLED_SPI_DEV = 1   # CE1 (GPIO 7)
@@ -147,9 +207,9 @@ PAGES = ["HOME", "ADV", "PRE", "COLOR", "SET"]
 PAGE_POT_LABELS = {
     "HOME": ["Freq", "Thresh", "Rels"],      # Freq center, Threshold, Release
     "ADV": ["Q", "ThPre", "RelMd"],           # Q, Threshold Preset, Release Mode
-    "PRE": ["BtCyc", "CycBt", "Reset"],       # Beat cycles, Cycles between, Reset mode
+    "PRE": ["Preset", "Beats", "Mode"],       # Preset selection, Beat cycles, Cycle mode
     "COLOR": ["Light", "HSV", "Sat"],         # Light select, HSV, Saturation
-    "SET": ["--", "--", "--"],                # TBD
+    "SET": ["Dflt", "--", "--"],              # Defaults mode, TBD, TBD
 }
 
 # Page icons - pixel art as coordinate lists (drawn in 9x9 space)
@@ -201,7 +261,7 @@ PAGE_ICONS = {
 current_page = 0  # Index into PAGES
 
 # Program names for display
-PROGRAM_NAMES = ["ALL", "1+2/3+4", "1+3/2+4", "CHASE"]
+PROGRAM_NAMES = ["ALL", "1+2/3+4", "1+3/2+4", "CHASE", "RANDOM", "AMBIENT"]
 
 # ===================== FFT Display =====================
 
@@ -255,8 +315,14 @@ encoder1_button = False
 encoder2_button = False
 _enc1_last_clk = None
 _enc2_last_clk = None
+_reset_last_state = 1  # Reset button state (1 = not pressed)
 
-# Pot values (0-1 normalized)
+# Parameter encoder state (for the 3 encoders replacing pots 0, 1, 2)
+_param_enc_last_clk = [None, None, None]  # Last CLK state for each encoder
+# Encoder deltas - accumulated since last update_pots() call
+_param_enc_delta = [0, 0, 0]
+
+# Pot values (0-1 normalized) - now only used for slider (CH3)
 pot_values = [0.5, 0.5, 0.5, 0.5]
 pot_display = [50, 50, 50, 50]
 _pot_raw = [0.5, 0.5, 0.5, 0.5]  # Raw readings for change detection
@@ -264,11 +330,10 @@ POT_EMA_ALPHA = 0.15  # Moderate smoothing for responsiveness
 POT_CHANGE_THRESHOLD = 0.03  # 3% change needed to take over
 POT_STABLE_FRAMES = 0  # Counter for stability
 
-# Pot takeover system - pots don't control until moved significantly
-# This allows script defaults to be used on startup
+# Pot takeover system - only for slider now (CH3)
 _pot_has_taken_over = [False, False, False, False]
 _pot_initial_reading = [None, None, None, None]
-POT_TAKEOVER_THRESHOLD = 0.05  # 5% movement from initial to take over
+POT_TAKEOVER_THRESHOLD = 0.10  # 10% movement from initial to take over
 
 # Display-specific smoothed values (separate from control values)
 _display_freq = DEFAULT_CENTER_HZ
@@ -276,6 +341,7 @@ _display_thresh = DEFAULT_THRESH
 _display_q = DEFAULT_Q
 _display_bright = DEFAULT_BRIGHT
 _display_release = int((DEFAULT_DECAY_MS - 40.0) / 4960.0 * 99)  # Release display value
+_display_q_pct = round((Q_MAX - DEFAULT_Q) / (Q_MAX - Q_MIN) * 99)  # Q display value (0-99)
 _display_values_locked = [None, None, None, None]  # Lock display when stable
 DISPLAY_LOCK_THRESHOLD = 0.005  # Lock if change < 0.5%
 
@@ -309,22 +375,38 @@ def _set_run(val: bool):
 
 # ===================== Cycle logic =====================
 
-CYCLE_STEPS_OPTIONS = [0, 4, 8, 16, 32, 64, 128, 256]
+# Beat cycle options: 0 = off, then 4, 8, 16, 32, 64, 128, 256, 512
+CYCLE_STEPS_OPTIONS = [0, 4, 8, 16, 32, 64, 128, 256, 512]
 CYCLE_STEPS         = 0
 CYCLE_TRIGGER_COUNT = 0
 CYCLE_PHASE         = 0
+CYCLE_STEPS_INDEX   = 0  # Index into CYCLE_STEPS_OPTIONS (0 = off)
+
+# Cycles between modes
+CYCLES_BETWEEN_MODES = ["x+1"]  # For now just one mode
+CYCLES_BETWEEN_INDEX = 0
+
+# Number of presets (can be expanded later)
+NUM_PRESETS = 6
 
 def program_pair_for_base(base: int):
-    if base == 1: return (1, 2)
-    if base == 2: return (2, 3)
-    if base == 3: return (3, 4)
-    return (4, 1)
+    """Get the pair of programs for cycling: current and next (wrapping)."""
+    # base is 1-indexed (1 to NUM_PRESETS)
+    # Returns (current, next) where next wraps around
+    next_prog = (base % NUM_PRESETS) + 1  # 1->2, 2->3, 3->4, 4->1
+    return (base, next_prog)
 
 def set_cycle_steps(steps: int):
     global CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE
     CYCLE_STEPS         = int(steps)
     CYCLE_TRIGGER_COUNT = 0
     CYCLE_PHASE         = 0
+
+def set_cycle_steps_by_index(idx: int):
+    """Set cycle steps by index into CYCLE_STEPS_OPTIONS."""
+    global CYCLE_STEPS_INDEX
+    CYCLE_STEPS_INDEX = max(0, min(len(CYCLE_STEPS_OPTIONS) - 1, idx))
+    set_cycle_steps(CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX])
 
 # ===================== DMX backends =====================
 
@@ -444,11 +526,14 @@ POST_EMA = 0.6
 
 class BandParams:
     def __init__(self):
-        self.center    = DEFAULT_CENTER_HZ
-        self.q         = DEFAULT_Q
-        self.thresh    = DEFAULT_THRESH
+        # Initialize from the loaded defaults mode (persisted from last session)
+        mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+        center_hz, thresh, decay_ms, q_factor = DEFAULTS_PRESETS[mode_name]
+        self.center    = center_hz
+        self.q         = q_factor
+        self.thresh    = thresh
         self.attack_ms = DEFAULT_ATTACK_MS
-        self.decay_ms  = DEFAULT_DECAY_MS
+        self.decay_ms  = decay_ms
 
 band = BandParams()
 _runtime = {'attack_ms': band.attack_ms, 'decay_ms': band.decay_ms}
@@ -480,6 +565,41 @@ def update_lights(dt_ms):
         s.post = POST_EMA*s.env + (1.0-POST_EMA)*s.post
         vals.append(int(255 * s.post * BRIGHTNESS))
     return vals
+
+def update_ambient_mode(dt_ms):
+    """Update ambient mode - non-audio-reactive random fading."""
+    global ambient_targets, ambient_current, ambient_last_change
+    global ambient_speed, ambient_fade_time
+    
+    now = time.time()
+    dt_sec = dt_ms / 1000.0
+    
+    # Get speed and fade time from pots (when in ambient mode)
+    # Speed: 0.2x to 5x (controlled by what would be Freq pot)
+    # Fade time: 0.5s to 10s (controlled by what would be Release pot)
+    
+    for i in range(4):
+        # Check if it's time to pick a new target for this channel
+        time_since_change = now - ambient_last_change[i]
+        # Random interval based on speed: faster speed = shorter intervals
+        interval = (2.0 + random.random() * 3.0) / ambient_speed
+        
+        if time_since_change > interval:
+            # Pick a new random target (0.0 to 1.0)
+            ambient_targets[i] = random.random()
+            ambient_last_change[i] = now
+        
+        # Smoothly fade current toward target
+        diff = ambient_targets[i] - ambient_current[i]
+        fade_rate = dt_sec / max(0.1, ambient_fade_time)
+        if abs(diff) < fade_rate:
+            ambient_current[i] = ambient_targets[i]
+        else:
+            ambient_current[i] += fade_rate if diff > 0 else -fade_rate
+        
+        # Apply to state (bypass normal trigger system)
+        states[i].env = ambient_current[i]
+        states[i].post = ambient_current[i]
 
 # ===================== DSP =====================
 
@@ -674,66 +794,139 @@ def read_pot_smoothed(channel):
     return _pot_ema[channel]
 
 def update_pots():
-    """Read pots and update parameters based on current page.
-    Uses takeover system - defaults are used until pot is moved significantly."""
-    global pot_values, pot_display, BRIGHTNESS
+    """Read slider (brightness) and apply encoder deltas based on current page."""
+    global pot_values, pot_display, BRIGHTNESS, BASE_PROGRAM, CYCLES_BETWEEN_INDEX
+    global ambient_speed, ambient_fade_time, DEFAULTS_MODE_INDEX
+    global _param_enc_delta
     
     if DEV_NO_HW:
         return
     if time.time() < IGNORE_KNOBS_UNTIL:
         return
     
-    for i in range(4):
-        pot_values[i] = read_pot_smoothed(i)
-        new_pct = int(pot_values[i] * 100)
-        if new_pct != pot_display[i]:
-            pot_display[i] = new_pct
+    # Only read slider (CH3) from MCP3008 for brightness
+    pot_values[3] = read_pot_smoothed(3)
+    new_pct = int(pot_values[3] * 100)
+    if new_pct != pot_display[3]:
+        pot_display[3] = new_pct
     
     # Slider (CH3) is always brightness (global) - only if taken over
     if _pot_has_taken_over[3]:
         BRIGHTNESS = pot_values[3]
     
-    # Update parameters based on current page - only if pot has taken over
+    # Get encoder deltas and reset them
+    deltas = _param_enc_delta[:]
+    _param_enc_delta = [0, 0, 0]
+    
+    # Update parameters based on current page using encoder deltas
     page_name = PAGES[current_page]
+    
     if page_name == "HOME":
-        # Pot 0: Center frequency (log scale)
-        if _pot_has_taken_over[0]:
-            log_min = math.log10(FFT_MIN_FREQ)
-            log_max = math.log10(FFT_MAX_FREQ)
-            band.center = 10 ** (log_min + pot_values[0] * (log_max - log_min))
-        # Pot 1: Threshold
-        if _pot_has_taken_over[1]:
-            band.thresh = pot_values[1]
-        # Pot 2: Release/Decay (50ms to 5000ms range)
-        if _pot_has_taken_over[2]:
-            band.decay_ms = 40.0 + pot_values[2] * 4960.0
+        # Check if we're in AMBIENT mode (preset 6) - different encoder behavior
+        if BASE_PROGRAM == 6:
+            # AMBIENT mode: Enc A = Speed, Enc B = nothing, Enc C = Fade time
+            if deltas[0] != 0:
+                # Speed: 0.2x to 5x, step by 0.1x per click
+                ambient_speed = max(0.2, min(5.0, ambient_speed + deltas[0] * 0.1))
+            if deltas[2] != 0:
+                # Fade time: 0.5s to 10s, step by 0.2s per click
+                ambient_fade_time = max(0.5, min(10.0, ambient_fade_time + deltas[2] * 0.2))
+        else:
+            # Normal audio-reactive mode
+            # Enc A: Center frequency (log scale) - multiply/divide by factor per click
+            if deltas[0] != 0:
+                # Each click changes freq by ~5%
+                factor = 1.05 ** deltas[0]
+                band.center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
+            # Enc B: Threshold (0-1, display 0-99)
+            if deltas[1] != 0:
+                band.thresh = max(0.0, min(1.0, band.thresh + deltas[1] * 0.01))
+            # Enc C: Release/Decay (40-5000ms)
+            if deltas[2] != 0:
+                # Step by ~50ms per click
+                band.decay_ms = max(40.0, min(5000.0, band.decay_ms + deltas[2] * 50.0))
+                
     elif page_name == "ADV":
-        # Pot 0: Q factor - inverted so higher value = wider range (lower Q)
-        # pot 0 = Q of 10 (narrow), pot 99 = Q of 0.5 (wide)
-        if _pot_has_taken_over[0]:
-            band.q = 10.0 - pot_values[0] * 9.5  # Inverted: 10 down to 0.5
-        # Pot 2: Decay (50ms to 5000ms range)
-        if _pot_has_taken_over[2]:
-            band.decay_ms = 40.0 + pot_values[2] * 4960.0
+        # Enc A: Q factor (0.5 to 8.0, display 0-99 inverted)
+        if deltas[0] != 0:
+            # Each click changes Q by 0.1 (inverted: CW = lower Q = wider)
+            band.q = max(Q_MIN, min(Q_MAX, band.q - deltas[0] * 0.1))
+        # Enc C: Decay (40-5000ms)
+        if deltas[2] != 0:
+            band.decay_ms = max(40.0, min(5000.0, band.decay_ms + deltas[2] * 50.0))
+            
+    elif page_name == "PRE":
+        # Enc A: Preset selection (1-6)
+        if deltas[0] != 0:
+            new_preset = max(1, min(NUM_PRESETS, BASE_PROGRAM + deltas[0]))
+            if new_preset != BASE_PROGRAM:
+                BASE_PROGRAM = new_preset
+                ui_flash(f"Preset: {PROGRAM_NAMES[new_preset-1]}", 0.8)
+        # Enc B: Beat Cycles index (0-8)
+        if deltas[1] != 0:
+            new_idx = max(0, min(len(CYCLE_STEPS_OPTIONS) - 1, CYCLE_STEPS_INDEX + deltas[1]))
+            set_cycle_steps_by_index(new_idx)
+        # Enc C: Cycle mode (0 for now, only x+1)
+        if deltas[2] != 0:
+            new_idx = max(0, min(len(CYCLES_BETWEEN_MODES) - 1, CYCLES_BETWEEN_INDEX + deltas[2]))
+            CYCLES_BETWEEN_INDEX = new_idx
+            
+    elif page_name == "SET":
+        # Enc A: Defaults mode (0-2 for LOW/MID/HIGH)
+        if deltas[0] != 0:
+            new_idx = max(0, min(2, DEFAULTS_MODE_INDEX + deltas[0]))
+            if new_idx != DEFAULTS_MODE_INDEX:
+                DEFAULTS_MODE_INDEX = new_idx
+                # Apply the new defaults immediately
+                mode_name = DEFAULTS_MODES[new_idx]
+                center_hz, thresh, decay_ms, q_factor = DEFAULTS_PRESETS[mode_name]
+                band.center   = center_hz
+                band.thresh   = thresh
+                band.decay_ms = decay_ms
+                band.q        = q_factor
+                # Save to config file for persistence
+                save_defaults_mode(new_idx)
+                ui_flash(f"Defaults: {mode_name}", 0.8)
 
 # ===================== GPIO / Rotary Encoders =====================
 
-def reset_to_defaults(channel=None):
-    """Reset HOME page parameters (Freq, Threshold, Release) to defaults."""
-    global IGNORE_KNOBS_UNTIL, _pot_has_taken_over, _pot_initial_reading
-    # Only reset HOME page parameters
-    band.center    = DEFAULT_CENTER_HZ
-    band.thresh    = DEFAULT_THRESH
-    # Release is not currently stored separately, but we reset decay
-    band.decay_ms  = DEFAULT_DECAY_MS
+def reset_pot_takeover():
+    """Reset slider takeover state.
+    Called when switching pages to prevent values from jumping."""
+    global IGNORE_KNOBS_UNTIL, _pot_has_taken_over, _pot_initial_reading, _pot_ema, _pot_raw
     
-    # Reset pot takeover state so defaults are used until pots are moved again
-    for i in range(4):
-        _pot_ema[i] = None
-        _pot_has_taken_over[i] = False
-        _pot_initial_reading[i] = None
+    # Only reset slider (CH3) takeover state
+    current_pos = read_mcp3008(3) / 1023.0
+    _pot_initial_reading[3] = current_pos
+    _pot_ema[3] = current_pos
+    _pot_raw[3] = current_pos
+    _pot_has_taken_over[3] = False
+    
     IGNORE_KNOBS_UNTIL = time.time() + 0.3
-    ui_flash("HOME defaults reset", 1.0)
+
+def reset_to_defaults(channel=None):
+    """Reset HOME page parameters (Freq, Threshold, Release, Q) to current defaults mode."""
+    global IGNORE_KNOBS_UNTIL, _pot_has_taken_over, _pot_initial_reading, _pot_ema, _pot_raw
+    
+    # Get values from current defaults mode
+    mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+    center_hz, thresh, decay_ms, q_factor = DEFAULTS_PRESETS[mode_name]
+    
+    # Reset HOME page parameters to the current defaults mode
+    band.center   = center_hz
+    band.thresh   = thresh
+    band.decay_ms = decay_ms
+    band.q        = q_factor
+    
+    # Reset slider (CH3) takeover state
+    current_pos = read_mcp3008(3) / 1023.0
+    _pot_initial_reading[3] = current_pos
+    _pot_ema[3] = current_pos
+    _pot_raw[3] = current_pos
+    _pot_has_taken_over[3] = False
+    
+    IGNORE_KNOBS_UNTIL = time.time() + 0.5
+    ui_flash(f"Reset to {mode_name}", 1.0)
 
 def setup_gpio_inputs():
     if DEV_NO_HW:
@@ -743,28 +936,44 @@ def setup_gpio_inputs():
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
     
-    # Rotary Encoder 1
+    # Rotary Encoder 1 (Page selection)
     GPIO.setup(ENC1_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(ENC1_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(ENC1_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     
-    # Rotary Encoder 2
-    GPIO.setup(ENC2_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC2_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC2_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    # Parameter Encoder A (was Pot 1)
+    GPIO.setup(PARAM_ENC_A_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(PARAM_ENC_A_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    
+    # Parameter Encoder B (was Pot 2)
+    GPIO.setup(PARAM_ENC_B_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(PARAM_ENC_B_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    
+    # Parameter Encoder C (was Pot 3)
+    GPIO.setup(PARAM_ENC_C_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(PARAM_ENC_C_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    
+    # Reset button
+    GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 def encoder_reader():
-    """Read rotary encoders for page and program selection."""
+    """Read rotary encoders for page selection and parameter control."""
     global encoder1_value, encoder2_value, encoder1_button, encoder2_button
-    global _enc1_last_clk, _enc2_last_clk
+    global _enc1_last_clk, _enc2_last_clk, _reset_last_state
     global current_page, BASE_PROGRAM
+    global _param_enc_last_clk, _param_enc_delta
     
     if DEV_NO_HW:
         return
     
     _enc1_last_clk = GPIO.input(ENC1_CLK)
-    _enc2_last_clk = GPIO.input(ENC2_CLK)
+    _reset_last_state = GPIO.input(RESET_PIN)
     last_enc1_btn = 1
+    
+    # Initialize parameter encoder states
+    _param_enc_last_clk[0] = GPIO.input(PARAM_ENC_A_CLK)
+    _param_enc_last_clk[1] = GPIO.input(PARAM_ENC_B_CLK)
+    _param_enc_last_clk[2] = GPIO.input(PARAM_ENC_C_CLK)
     
     try:
         while not STOP_THREADS:
@@ -782,7 +991,8 @@ def encoder_reader():
                         encoder1_value -= 1
                     # Clamp page (no wrap around)
                     encoder1_value = max(0, min(len(PAGES) - 1, encoder1_value))
-                    current_page = encoder1_value
+                    if current_page != encoder1_value:
+                        current_page = encoder1_value
                 _enc1_last_clk = enc1_clk
 
                 # Encoder 1 button (reset)
@@ -793,24 +1003,44 @@ def encoder_reader():
                         reset_to_defaults()
                 last_enc1_btn = enc1_sw
                 
-                # Encoder 2 - program selection (1-4)
-                enc2_clk = GPIO.input(ENC2_CLK)
-                enc2_dt = GPIO.input(ENC2_DT)
-                enc2_sw = GPIO.input(ENC2_SW)
+                # Parameter Encoder A - accumulate delta
+                enc_a_clk = GPIO.input(PARAM_ENC_A_CLK)
+                enc_a_dt = GPIO.input(PARAM_ENC_A_DT)
+                if enc_a_clk == 0 and _param_enc_last_clk[0] == 1:
+                    if enc_a_dt == 1:
+                        _param_enc_delta[0] += 1
+                    else:
+                        _param_enc_delta[0] -= 1
+                _param_enc_last_clk[0] = enc_a_clk
                 
-                # Only trigger on falling edge of CLK (0) to avoid double-counting
-                if enc2_clk == 0 and _enc2_last_clk == 1:
-                    if enc2_dt == 1:  # CW
-                        encoder2_value += 1
-                    else:  # CCW
-                        encoder2_value -= 1
-                    # Clamp program to 1-4
-                    BASE_PROGRAM = max(1, min(4, encoder2_value))
-                    encoder2_value = BASE_PROGRAM
-                    ui_flash(f"Program: {PROGRAM_NAMES[BASE_PROGRAM-1]}", 0.8)
-                _enc2_last_clk = enc2_clk
+                # Parameter Encoder B - accumulate delta
+                enc_b_clk = GPIO.input(PARAM_ENC_B_CLK)
+                enc_b_dt = GPIO.input(PARAM_ENC_B_DT)
+                if enc_b_clk == 0 and _param_enc_last_clk[1] == 1:
+                    if enc_b_dt == 1:
+                        _param_enc_delta[1] += 1
+                    else:
+                        _param_enc_delta[1] -= 1
+                _param_enc_last_clk[1] = enc_b_clk
                 
-                encoder2_button = (enc2_sw == 0)
+                # Parameter Encoder C - accumulate delta
+                enc_c_clk = GPIO.input(PARAM_ENC_C_CLK)
+                enc_c_dt = GPIO.input(PARAM_ENC_C_DT)
+                if enc_c_clk == 0 and _param_enc_last_clk[2] == 1:
+                    if enc_c_dt == 1:
+                        _param_enc_delta[2] += 1
+                    else:
+                        _param_enc_delta[2] -= 1
+                _param_enc_last_clk[2] = enc_c_clk
+                
+                # Reset button (GPIO 25) - resets HOME page defaults
+                reset_btn = GPIO.input(RESET_PIN)
+                if reset_btn == 0 and _reset_last_state == 1:
+                    # Debounce
+                    time.sleep(0.02)
+                    if GPIO.input(RESET_PIN) == 0:
+                        reset_to_defaults()
+                _reset_last_state = reset_btn
                 
             except RuntimeError:
                 break
@@ -827,6 +1057,13 @@ input_rms       = 0.0
 last_trigger_ts = 0.0
 chase_idx       = 0
 group34_phase   = 0
+
+# Ambient mode state
+ambient_targets = [0.0, 0.0, 0.0, 0.0]  # Target brightness for each channel
+ambient_current = [0.0, 0.0, 0.0, 0.0]  # Current brightness for each channel
+ambient_last_change = [0.0, 0.0, 0.0, 0.0]  # Time of last target change
+ambient_speed = 1.0  # Speed multiplier (controlled by Freq pot in ambient mode)
+ambient_fade_time = 2.0  # Fade in/out time in seconds (controlled by Release pot)
 
 # Trigger indicator for UI
 trigger_flash = 0.0  # Decays over time, >0 means recently triggered
@@ -987,6 +1224,11 @@ def audio_loop():
                 else:
                     trigger_idxs([2, 3], band.attack_ms, band.decay_ms)
                     group34_phase = 0
+            elif active_prog == 5:
+                # RANDOM - trigger a random channel each time
+                random_idx = random.randint(0, 3)
+                trigger_idxs([random_idx], band.attack_ms, band.decay_ms)
+            # Note: active_prog == 6 (AMBIENT) doesn't trigger here - it's handled separately
 
             if CYCLE_STEPS > 0:
                 CYCLE_TRIGGER_COUNT += 1
@@ -994,6 +1236,10 @@ def audio_loop():
                     CYCLE_TRIGGER_COUNT = 0
                     CYCLE_PHASE = 1 - CYCLE_PHASE
 
+        # Handle AMBIENT mode separately (non-audio-reactive)
+        if active_prog == 6:
+            update_ambient_mode(frame_dt_ms)
+        
         send_dmx(update_lights(frame_dt_ms))
         was_above = above
 
@@ -1258,6 +1504,10 @@ class OledUI:
         page_name = PAGES[current_page]
         labels = PAGE_POT_LABELS[page_name]
         
+        # Override labels for HOME page when in AMBIENT mode
+        if page_name == "HOME" and BASE_PROGRAM == 6:
+            labels = ["Speed", "--", "Fade"]
+        
         # Use actual values directly - pot smoothing handles stability
         _display_freq = band.center
         _display_thresh = band.thresh
@@ -1275,33 +1525,60 @@ class OledUI:
             
             # Format value based on page and pot (using smoothed display values)
             if page_name == "HOME":
-                if i == 0:  # Frequency - show in Hz
-                    freq_hz = int(_display_freq)
-                    if freq_hz >= 1000:
-                        val_str = f"{freq_hz//1000}k"
-                    else:
-                        val_str = f"{freq_hz}"
-                elif i == 1:  # Threshold - 0-99
-                    val_str = f"{int(_display_thresh * 99)}"
-                else:  # Release - 0-99 (based on decay_ms: 40-5000ms range)
-                    global _display_release
-                    # Convert decay_ms back to 0-99 scale
-                    release_pct = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                    release_pct = max(0, min(99, release_pct))
-                    # Only update display if changed by more than 1
-                    if abs(release_pct - _display_release) > 1:
-                        _display_release = release_pct
-                    val_str = f"{_display_release}"
+                # Check if in AMBIENT mode
+                if BASE_PROGRAM == 6:
+                    if i == 0:  # Speed - show as multiplier
+                        val_str = f"{ambient_speed:.1f}x"
+                    elif i == 1:  # Nothing
+                        val_str = "--"
+                    else:  # Fade time - show in seconds
+                        val_str = f"{ambient_fade_time:.1f}s"
+                else:
+                    # Normal audio-reactive mode
+                    if i == 0:  # Frequency - show in Hz
+                        freq_hz = int(_display_freq)
+                        if freq_hz >= 1000:
+                            val_str = f"{freq_hz//1000}k"
+                        else:
+                            val_str = f"{freq_hz}"
+                    elif i == 1:  # Threshold - 0-99
+                        val_str = f"{int(_display_thresh * 99)}"
+                    else:  # Release - 0-99 (based on decay_ms: 40-5000ms range)
+                        global _display_release
+                        # Convert decay_ms back to 0-99 scale
+                        release_pct = int((band.decay_ms - 40.0) / 4960.0 * 99)
+                        release_pct = max(0, min(99, release_pct))
+                        # Only update display if changed by more than 1
+                        if abs(release_pct - _display_release) > 1:
+                            _display_release = release_pct
+                        val_str = f"{_display_release}"
             elif page_name == "ADV":
                 if i == 0:  # Q factor - display as 0-99 (inverted: higher = wider range)
-                    # Q ranges from 10 (narrow) to 0.5 (wide)
-                    # Convert to 0-99 where 99 = widest (Q=0.5), 0 = narrowest (Q=10)
-                    q_pct = int((10.0 - _display_q) / 9.5 * 99)
+                    global _display_q_pct
+                    # Q ranges from Q_MAX (narrow) to Q_MIN (wide)
+                    # Convert to 0-99 where 99 = widest (Q_MIN), 0 = narrowest (Q_MAX)
+                    q_pct = round((Q_MAX - _display_q) / (Q_MAX - Q_MIN) * 99)
                     q_pct = max(0, min(99, q_pct))
-                    val_str = f"{q_pct}"
+                    # Only update display if changed by more than 1 (hysteresis)
+                    if abs(q_pct - _display_q_pct) > 1:
+                        _display_q_pct = q_pct
+                    val_str = f"{_display_q_pct}"
                 elif i == 2:  # Decay
                     val_str = f"{int(band.decay_ms)}"
                 else:
+                    val_str = "--"
+            elif page_name == "PRE":
+                if i == 0:  # Preset - show preset name
+                    val_str = PROGRAM_NAMES[BASE_PROGRAM - 1]
+                elif i == 1:  # Beat Cycles - show actual value (0=OFF, 4, 8, 16, etc)
+                    steps = CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]
+                    val_str = "OFF" if steps == 0 else f"{steps}"
+                else:  # Mode - Cycles Between mode
+                    val_str = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+            elif page_name == "SET":
+                if i == 0:  # Defaults mode
+                    val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+                else:  # TBD
                     val_str = "--"
             else:
                 val_str = f"{pot_display[i]}" if labels[i] != "--" else "--"
@@ -1416,7 +1693,7 @@ def tui(stdscr):
         bar_width = max(20, min(65, w - 2))
 
         safe_addstr(stdscr, 0, 0,
-            f"Page={PAGES[current_page]}  Preset={preset_num}  P{PROGRAM}  RUN={'ON' if RUNNING else 'PAUSE'}  "
+            f"Page={PAGES[current_page]}  Preset={BASE_PROGRAM}  P{PROGRAM}  RUN={'ON' if RUNNING else 'PAUSE'}  "
             f"Device={DEVICE_NAME}  DMX={DMX_BACKEND}"
         )
         safe_addstr(stdscr, 1, 0,
