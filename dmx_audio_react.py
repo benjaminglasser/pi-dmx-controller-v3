@@ -1531,8 +1531,12 @@ class OledUI:
                     val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
                 else:  # TBD
                     val_str = "--"
+            elif page_name == "COLOR":
+                # COLOR page - not yet implemented
+                val_str = "--"
             else:
-                val_str = f"{pot_display[i]}" if labels[i] != "--" else "--"
+                # Fallback for any unhandled pages
+                val_str = "--"
             
             draw.text((px, y + 9), val_str, font=self._font_small, fill=1)
 
