@@ -318,9 +318,16 @@ _reset_last_state = 1  # Reset button state (1 = not pressed)
 # Encoders 1-4: Page, Param A, Param B, Param C (indices 0-3)
 # Encoder 5: Brightness (index 4)
 _enc_last_clk = [None, None, None, None, None]
+_enc_last_dt = [None, None, None, None, None]  # Track DT state too for quadrature
 _enc_last_sw = [1, 1, 1, 1, 1]  # Switch states (1 = not pressed)
 # Encoder deltas - accumulated since last update call
 _enc_delta = [0, 0, 0, 0, 0]
+
+# Quadrature state machine for reliable direction detection
+# State is encoded as (CLK << 1) | DT, giving values 0-3
+# Valid transitions: 0->1->3->2->0 (CW) or 0->2->3->1->0 (CCW)
+_enc_state = [0, 0, 0, 0, 0]
+_enc_count = [0, 0, 0, 0, 0]  # Raw quadrature counts (4 counts per detent)
 
 # Brightness fade toggle state
 _brightness_saved = DEFAULT_BRIGHT  # Saved brightness before fade-out
@@ -746,7 +753,9 @@ def update_encoders():
             if deltas[0] != 0:
                 # Each click changes freq by ~5%
                 factor = 1.05 ** deltas[0]
-                band.center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
+                new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
+                print(f"[FREQ] delta={deltas[0]} factor={factor:.3f} {band.center:.0f}Hz -> {new_center:.0f}Hz (Q={band.q:.2f} unchanged)")
+                band.center = new_center
             # Enc B: Threshold (0-1, display 0-99)
             if deltas[1] != 0:
                 band.thresh = max(0.0, min(1.0, band.thresh + deltas[1] * 0.01))
@@ -870,21 +879,113 @@ def setup_gpio_inputs():
     # Reset button
     GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
+def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
+    """Read encoder using quadrature state machine for reliable direction detection.
+    Returns direction: 1 for CW, -1 for CCW, 0 for no change or invalid transition.
+    Most encoders have 4 state changes per detent (click), so we accumulate and
+    return direction only when a full detent is completed."""
+    global _enc_state, _enc_count
+    
+    clk = GPIO.input(clk_pin)
+    dt = GPIO.input(dt_pin)
+    
+    # Encode current state as 2-bit value
+    new_state = (clk << 1) | dt
+    old_state = _enc_state[enc_idx]
+    
+    if new_state == old_state:
+        return 0  # No change
+    
+    _enc_state[enc_idx] = new_state
+    
+    # Quadrature state machine:
+    # Valid CW sequence:  0 -> 1 -> 3 -> 2 -> 0 (binary: 00->01->11->10->00)
+    # Valid CCW sequence: 0 -> 2 -> 3 -> 1 -> 0 (binary: 00->10->11->01->00)
+    
+    # Transition table: [old_state][new_state] -> direction (1=CW, -1=CCW, 0=invalid)
+    # This handles all valid transitions in the quadrature sequence
+    transition = [
+        # new: 0   1   2   3
+        [  0,  1, -1,  0],  # old = 0
+        [ -1,  0,  0,  1],  # old = 1
+        [  1,  0,  0, -1],  # old = 2
+        [  0, -1,  1,  0],  # old = 3
+    ]
+    
+    direction = transition[old_state][new_state]
+    
+    if direction != 0:
+        _enc_count[enc_idx] += direction
+        
+        # Most encoders have 4 state changes per detent
+        # Return direction only when we've completed a full detent
+        # Note: Direction is inverted so CW = positive (increase values)
+        if _enc_count[enc_idx] >= 4:
+            _enc_count[enc_idx] = 0
+            return -1  # CW click (inverted)
+        elif _enc_count[enc_idx] <= -4:
+            _enc_count[enc_idx] = 0
+            return 1  # CCW click (inverted)
+    
+    return 0  # Not a full detent yet
+
+
+# Page encoder uses a simpler "detent detection" approach
+# Triggers once per click when returning to rest position (both signals high)
+_page_enc_last_clk = 1
+_page_enc_direction = 0  # Stores detected direction until rest position
+
+def _read_page_encoder(clk_pin, dt_pin):
+    """Read page encoder with detent-based detection.
+    Returns direction only when encoder reaches rest position (click completed).
+    This ensures exactly one page change per physical click."""
+    global _page_enc_last_clk, _page_enc_direction
+    
+    clk = GPIO.input(clk_pin)
+    dt = GPIO.input(dt_pin)
+    
+    # Detect falling edge of CLK to determine direction
+    if clk == 0 and _page_enc_last_clk == 1:
+        # CLK just went low - check DT to determine direction
+        # DT high = CCW (left), DT low = CW (right)
+        _page_enc_direction = 1 if dt == 1 else -1
+    
+    _page_enc_last_clk = clk
+    
+    # Only return direction when both signals are high (rest/detent position)
+    # This is the "click" position where the encoder settles
+    if clk == 1 and dt == 1 and _page_enc_direction != 0:
+        direction = _page_enc_direction
+        _page_enc_direction = 0  # Reset for next click
+        return direction
+    
+    return 0
+
+
 def encoder_reader():
     """Read all 5 rotary encoders for page selection, parameters, and brightness."""
     global encoder1_value, encoder1_button
     global current_page
-    global _enc_last_clk, _enc_last_sw, _enc_delta, _reset_last_state
+    global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state
+    global _enc_state, _enc_count
     
     if DEV_NO_HW:
         return
     
-    # Initialize all encoder CLK states
-    _enc_last_clk[0] = GPIO.input(ENC1_CLK)
-    _enc_last_clk[1] = GPIO.input(ENC2_CLK)
-    _enc_last_clk[2] = GPIO.input(ENC3_CLK)
-    _enc_last_clk[3] = GPIO.input(ENC4_CLK)
-    _enc_last_clk[4] = GPIO.input(ENC5_CLK)
+    # Initialize all encoder states
+    enc_pins = [
+        (ENC1_CLK, ENC1_DT),
+        (ENC2_CLK, ENC2_DT),
+        (ENC3_CLK, ENC3_DT),
+        (ENC4_CLK, ENC4_DT),
+        (ENC5_CLK, ENC5_DT),
+    ]
+    
+    for i, (clk_pin, dt_pin) in enumerate(enc_pins):
+        clk = GPIO.input(clk_pin)
+        dt = GPIO.input(dt_pin)
+        _enc_state[i] = (clk << 1) | dt
+        _enc_count[i] = 0
     
     # Initialize all switch states
     _enc_last_sw[0] = GPIO.input(ENC1_SW)
@@ -898,23 +999,15 @@ def encoder_reader():
     try:
         while not STOP_THREADS:
             try:
-                # ===== Encoder 1 - Page selection =====
-                enc1_clk = GPIO.input(ENC1_CLK)
-                enc1_dt = GPIO.input(ENC1_DT)
-                enc1_sw = GPIO.input(ENC1_SW)
-                
-                # Rotation - falling edge of CLK
-                if enc1_clk == 0 and _enc_last_clk[0] == 1:
-                    if enc1_dt == 1:  # CW
-                        encoder1_value += 1
-                    else:  # CCW
-                        encoder1_value -= 1
+                # ===== Encoder 1 - Page selection (uses detent-based detection) =====
+                direction = _read_page_encoder(ENC1_CLK, ENC1_DT)
+                if direction != 0:
+                    encoder1_value += direction
                     encoder1_value = max(0, min(len(PAGES) - 1, encoder1_value))
                     if current_page != encoder1_value:
                         current_page = encoder1_value
-                _enc_last_clk[0] = enc1_clk
                 
-                # Switch - reset to defaults
+                enc1_sw = GPIO.input(ENC1_SW)
                 if enc1_sw == 0 and _enc_last_sw[0] == 1:
                     time.sleep(0.02)  # Debounce
                     if GPIO.input(ENC1_SW) == 0:
@@ -922,15 +1015,11 @@ def encoder_reader():
                 _enc_last_sw[0] = enc1_sw
                 
                 # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
-                enc2_clk = GPIO.input(ENC2_CLK)
-                enc2_dt = GPIO.input(ENC2_DT)
+                direction = _read_encoder_quadrature(1, ENC2_CLK, ENC2_DT)
+                if direction != 0:
+                    _enc_delta[1] += direction
+                
                 enc2_sw = GPIO.input(ENC2_SW)
-                
-                if enc2_clk == 0 and _enc_last_clk[1] == 1:
-                    _enc_delta[1] += 1 if enc2_dt == 1 else -1
-                _enc_last_clk[1] = enc2_clk
-                
-                # Switch - TBD (could be used for quick actions)
                 if enc2_sw == 0 and _enc_last_sw[1] == 1:
                     time.sleep(0.02)
                     if GPIO.input(ENC2_SW) == 0:
@@ -938,15 +1027,11 @@ def encoder_reader():
                 _enc_last_sw[1] = enc2_sw
                 
                 # ===== Encoder 3 - Param B (Thresh/Beats) =====
-                enc3_clk = GPIO.input(ENC3_CLK)
-                enc3_dt = GPIO.input(ENC3_DT)
+                direction = _read_encoder_quadrature(2, ENC3_CLK, ENC3_DT)
+                if direction != 0:
+                    _enc_delta[2] += direction
+                
                 enc3_sw = GPIO.input(ENC3_SW)
-                
-                if enc3_clk == 0 and _enc_last_clk[2] == 1:
-                    _enc_delta[2] += 1 if enc3_dt == 1 else -1
-                _enc_last_clk[2] = enc3_clk
-                
-                # Switch - TBD
                 if enc3_sw == 0 and _enc_last_sw[2] == 1:
                     time.sleep(0.02)
                     if GPIO.input(ENC3_SW) == 0:
@@ -954,15 +1039,11 @@ def encoder_reader():
                 _enc_last_sw[2] = enc3_sw
                 
                 # ===== Encoder 4 - Param C (Release/Mode) =====
-                enc4_clk = GPIO.input(ENC4_CLK)
-                enc4_dt = GPIO.input(ENC4_DT)
+                direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
+                if direction != 0:
+                    _enc_delta[3] += direction
+                
                 enc4_sw = GPIO.input(ENC4_SW)
-                
-                if enc4_clk == 0 and _enc_last_clk[3] == 1:
-                    _enc_delta[3] += 1 if enc4_dt == 1 else -1
-                _enc_last_clk[3] = enc4_clk
-                
-                # Switch - TBD
                 if enc4_sw == 0 and _enc_last_sw[3] == 1:
                     time.sleep(0.02)
                     if GPIO.input(ENC4_SW) == 0:
@@ -970,15 +1051,11 @@ def encoder_reader():
                 _enc_last_sw[3] = enc4_sw
                 
                 # ===== Encoder 5 - Brightness =====
-                enc5_clk = GPIO.input(ENC5_CLK)
-                enc5_dt = GPIO.input(ENC5_DT)
+                direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
+                if direction != 0:
+                    _enc_delta[4] += direction
+                
                 enc5_sw = GPIO.input(ENC5_SW)
-                
-                if enc5_clk == 0 and _enc_last_clk[4] == 1:
-                    _enc_delta[4] += 1 if enc5_dt == 1 else -1
-                _enc_last_clk[4] = enc5_clk
-                
-                # Switch - Toggle brightness on/off with fade
                 if enc5_sw == 0 and _enc_last_sw[4] == 1:
                     time.sleep(0.02)
                     if GPIO.input(ENC5_SW) == 0:
@@ -996,7 +1073,7 @@ def encoder_reader():
             except RuntimeError:
                 break
 
-            time.sleep(0.002)
+            time.sleep(0.001)  # Faster polling for better quadrature tracking
     finally:
         pass
 
@@ -1486,12 +1563,17 @@ class OledUI:
                         val_str = f"{ambient_fade_time:.1f}s"
                 else:
                     # Normal audio-reactive mode
-                    if i == 0:  # Frequency - show in Hz
-                        freq_hz = int(_display_freq)
+                    if i == 0:  # Frequency - show in Hz (with tenths for kHz)
+                        freq_hz = _display_freq
                         if freq_hz >= 1000:
-                            val_str = f"{freq_hz//1000}k"
+                            # Show to tenths place for kHz (e.g., "1.2k", "10.5k")
+                            freq_khz = freq_hz / 1000.0
+                            if freq_khz >= 10:
+                                val_str = f"{freq_khz:.1f}k"
+                            else:
+                                val_str = f"{freq_khz:.1f}k"
                         else:
-                            val_str = f"{freq_hz}"
+                            val_str = f"{int(freq_hz)}"
                     elif i == 1:  # Threshold - 0-99
                         val_str = f"{int(_display_thresh * 99)}"
                     else:  # Release - 0-99 (based on decay_ms: 40-5000ms range)
