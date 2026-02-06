@@ -70,7 +70,7 @@ except Exception:
 
 DEV_NO_HW = os.environ.get("DEV_NO_HW", "0").strip() == "1"
 
-DMX_BACKEND = os.environ.get("DMX_BACKEND", "uart").strip().lower()
+DMX_BACKEND = os.environ.get("DMX_BACKEND", "null").strip().lower()  # Default to null until DMX hardware connected
 DMX_UART_DEVICE = os.environ.get("DMX_UART_DEVICE", "/dev/serial0")
 DMX_UART_BAUD = 250000  # DMX: 250k 8N2
 
@@ -188,9 +188,11 @@ ENC4_DT  = 20
 ENC4_SW  = 21
 
 # Rotary Encoder 5 - Brightness (global)
+# NOTE: GPIO8 is SPI CE0, conflicts with OLED. SW for Enc5 is disabled.
 ENC5_CLK = 4
 ENC5_DT  = 18
-ENC5_SW  = 8
+ENC5_SW  = 8  # Not used - conflicts with SPI CE0
+ENC5_SW_DISABLED = True  # Flag to skip GPIO8 setup/reading
 
 # Reset button (separate from encoder buttons)
 RESET_PIN = 25
@@ -874,7 +876,8 @@ def setup_gpio_inputs():
     # Rotary Encoder 5 (Brightness)
     GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    # NOTE: ENC5_SW (GPIO8) is NOT configured - it conflicts with SPI CE0
+    # The brightness toggle will use the reset button or another method
     
     # Reset button
     GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -882,14 +885,17 @@ def setup_gpio_inputs():
 def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
     """Read encoder using quadrature state machine for reliable direction detection.
     Returns direction: 1 for CW, -1 for CCW, 0 for no change or invalid transition.
-    Most encoders have 4 state changes per detent (click), so we accumulate and
-    return direction only when a full detent is completed."""
+    Uses sub-count threshold of 2 for more responsive feel."""
     global _enc_state, _enc_count
     
     clk = GPIO.input(clk_pin)
     dt = GPIO.input(dt_pin)
     
-    # Encode current state as 2-bit value
+    # Encode current state as 2-bit value: (CLK << 1) | DT
+    # State 0 = 00 (both low)
+    # State 1 = 01 (CLK low, DT high)
+    # State 2 = 10 (CLK high, DT low)
+    # State 3 = 11 (both high) - detent/rest position
     new_state = (clk << 1) | dt
     old_state = _enc_state[enc_idx]
     
@@ -898,18 +904,18 @@ def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
     
     _enc_state[enc_idx] = new_state
     
-    # Quadrature state machine:
-    # Valid CW sequence:  0 -> 1 -> 3 -> 2 -> 0 (binary: 00->01->11->10->00)
-    # Valid CCW sequence: 0 -> 2 -> 3 -> 1 -> 0 (binary: 00->10->11->01->00)
-    
-    # Transition table: [old_state][new_state] -> direction (1=CW, -1=CCW, 0=invalid)
-    # This handles all valid transitions in the quadrature sequence
+    # Quadrature transition table:
+    # CW sequence:  3 -> 1 -> 0 -> 2 -> 3 (or 3 -> 2 -> 0 -> 1 -> 3 depending on encoder)
+    # CCW sequence: 3 -> 2 -> 0 -> 1 -> 3 (or reverse)
+    #
+    # Direction lookup: [old_state][new_state] -> direction
+    # +1 = CW, -1 = CCW, 0 = invalid/skip
     transition = [
-        # new: 0   1   2   3
-        [  0,  1, -1,  0],  # old = 0
-        [ -1,  0,  0,  1],  # old = 1
-        [  1,  0,  0, -1],  # old = 2
-        [  0, -1,  1,  0],  # old = 3
+        # new:  0   1   2   3
+        [  0, -1,  1,  0],  # old = 0
+        [  1,  0,  0, -1],  # old = 1
+        [ -1,  0,  0,  1],  # old = 2
+        [  0,  1, -1,  0],  # old = 3
     ]
     
     direction = transition[old_state][new_state]
@@ -917,17 +923,16 @@ def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
     if direction != 0:
         _enc_count[enc_idx] += direction
         
-        # Most encoders have 4 state changes per detent
-        # Return direction only when we've completed a full detent
-        # Note: Direction is inverted so CW = positive (increase values)
-        if _enc_count[enc_idx] >= 4:
+        # Using threshold of 2 for more responsive feel
+        # Most encoders have 4 state changes per detent, but 2 feels better
+        if _enc_count[enc_idx] >= 2:
             _enc_count[enc_idx] = 0
-            return -1  # CW click (inverted)
-        elif _enc_count[enc_idx] <= -4:
+            return 1  # CW click
+        elif _enc_count[enc_idx] <= -2:
             _enc_count[enc_idx] = 0
-            return 1  # CCW click (inverted)
+            return -1  # CCW click
     
-    return 0  # Not a full detent yet
+    return 0  # Not enough transitions yet
 
 
 # Page encoder uses a simpler "detent detection" approach
@@ -963,7 +968,11 @@ def _read_page_encoder(clk_pin, dt_pin):
 
 
 def encoder_reader():
-    """Read all 5 rotary encoders for page selection, parameters, and brightness."""
+    """Read all 5 rotary encoders for page selection, parameters, and brightness.
+    
+    Note: Encoder 5's SW pin (GPIO8) is disabled as it conflicts with SPI CE0.
+    Brightness toggle is triggered by long-press on reset button instead.
+    """
     global encoder1_value, encoder1_button
     global current_page
     global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state
@@ -982,19 +991,24 @@ def encoder_reader():
     ]
     
     for i, (clk_pin, dt_pin) in enumerate(enc_pins):
-        clk = GPIO.input(clk_pin)
-        dt = GPIO.input(dt_pin)
-        _enc_state[i] = (clk << 1) | dt
-        _enc_count[i] = 0
+        try:
+            clk = GPIO.input(clk_pin)
+            dt = GPIO.input(dt_pin)
+            _enc_state[i] = (clk << 1) | dt
+            _enc_count[i] = 0
+        except Exception:
+            _enc_state[i] = 3  # Default to rest position (both high)
+            _enc_count[i] = 0
     
-    # Initialize all switch states
+    # Initialize switch states (skip Encoder 5 SW - GPIO8 conflicts with SPI)
     _enc_last_sw[0] = GPIO.input(ENC1_SW)
     _enc_last_sw[1] = GPIO.input(ENC2_SW)
     _enc_last_sw[2] = GPIO.input(ENC3_SW)
     _enc_last_sw[3] = GPIO.input(ENC4_SW)
-    _enc_last_sw[4] = GPIO.input(ENC5_SW)
+    _enc_last_sw[4] = 1  # Encoder 5 SW disabled (GPIO8 = SPI CE0)
     
     _reset_last_state = GPIO.input(RESET_PIN)
+    _reset_press_time = 0  # Track how long reset button is held
     
     try:
         while not STOP_THREADS:
@@ -1050,30 +1064,35 @@ def encoder_reader():
                         pass  # Reserved for future use
                 _enc_last_sw[3] = enc4_sw
                 
-                # ===== Encoder 5 - Brightness =====
+                # ===== Encoder 5 - Brightness (SW disabled - GPIO8 = SPI CE0) =====
                 direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
                 if direction != 0:
                     _enc_delta[4] += direction
-                
-                enc5_sw = GPIO.input(ENC5_SW)
-                if enc5_sw == 0 and _enc_last_sw[4] == 1:
-                    time.sleep(0.02)
-                    if GPIO.input(ENC5_SW) == 0:
-                        toggle_brightness()
-                _enc_last_sw[4] = enc5_sw
+                # NOTE: Encoder 5 button (GPIO8) is NOT read - conflicts with SPI
                 
                 # ===== Reset button (GPIO 25) =====
+                # Short press = reset to defaults
+                # Long press (>1s) = toggle brightness
                 reset_btn = GPIO.input(RESET_PIN)
                 if reset_btn == 0 and _reset_last_state == 1:
-                    time.sleep(0.02)
-                    if GPIO.input(RESET_PIN) == 0:
+                    # Button just pressed - start timing
+                    _reset_press_time = time.time()
+                elif reset_btn == 1 and _reset_last_state == 0:
+                    # Button just released - check duration
+                    press_duration = time.time() - _reset_press_time
+                    if press_duration >= 1.0:
+                        # Long press - toggle brightness
+                        toggle_brightness()
+                    else:
+                        # Short press - reset to defaults
+                        time.sleep(0.02)  # Debounce
                         reset_to_defaults()
                 _reset_last_state = reset_btn
                 
             except RuntimeError:
                 break
 
-            time.sleep(0.001)  # Faster polling for better quadrature tracking
+            time.sleep(0.005)  # 5ms polling - balanced for all encoders
     finally:
         pass
 
@@ -1309,7 +1328,7 @@ class OledUI:
             serial = luma_spi(
                 device=OLED_SPI_DEV,
                 port=0,
-                bus_speed_hz=1000000,  # 1MHz for stability (reduced from 2MHz)
+                bus_speed_hz=2000000,  # 2MHz - tested stable on PCB v2
                 gpio_DC=OLED_DC_PIN,
                 gpio_RST=OLED_RST_PIN,
             )
@@ -1797,8 +1816,9 @@ def main():
     # Encoder reader thread (GPIO)
     if not DEV_NO_HW:
         threading.Thread(target=encoder_reader, daemon=True).start()
-        print("[OK] Encoders: 5 rotary encoders with switches")
-        print("     E1(5,6,13) E2(17,27,22) E3(19,26,23) E4(16,20,21) E5(4,18,8) RST(25)")
+        print("[OK] Encoders: 5 rotary encoders (E5 SW disabled - SPI conflict)")
+        print("     E1(5,6,13) E2(17,27,22) E3(19,26,23) E4(16,20,21) E5(4,18,-)")
+        print("     Reset(25): short=reset, long(>1s)=brightness toggle")
 
     # Audio thread
     threading.Thread(target=audio_loop, daemon=True).start()
