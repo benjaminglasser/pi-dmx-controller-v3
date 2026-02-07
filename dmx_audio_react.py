@@ -191,8 +191,8 @@ ENC4_SW  = 21
 # NOTE: GPIO8 is SPI CE0, conflicts with OLED. SW for Enc5 is disabled.
 ENC5_CLK = 4
 ENC5_DT  = 18
-ENC5_SW  = 8  # Not used - conflicts with SPI CE0
-ENC5_SW_DISABLED = True  # Flag to skip GPIO8 setup/reading
+ENC5_SW  = 8  # Brightness toggle (physical pin 24)
+ENC5_SW_DISABLED = False  # ENABLED - brightness toggle on GPIO8
 
 # Reset button (separate from encoder buttons)
 RESET_PIN = 25
@@ -331,12 +331,30 @@ _enc_delta = [0, 0, 0, 0, 0]
 _enc_state = [0, 0, 0, 0, 0]
 _enc_count = [0, 0, 0, 0, 0]  # Raw quadrature counts (4 counts per detent)
 
+# Velocity-sensitive encoding: track timestamps and smoothed velocity
+_enc_last_click_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time of last click per encoder
+_enc_prev_click_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time of previous click (for velocity calc)
+_enc_velocity = [0.0, 0.0, 0.0, 0.0, 0.0]  # Smoothed velocity (clicks/sec) per encoder
+
+# Simple velocity parameters - just max multiplier per parameter type
+# Velocity is calculated as clicks-per-second, then mapped logarithmically
+VELOCITY_MAX_FREQ = 25        # Frequency: large range, high acceleration
+VELOCITY_MAX_THRESH = 20      # Threshold: 0-99 range
+VELOCITY_MAX_DECAY = 20       # Decay/Release: 0-99 range
+VELOCITY_MAX_Q = 20           # Q factor: 0-99 range
+VELOCITY_MAX_BRIGHTNESS = 18  # Brightness: 0-99%
+VELOCITY_MAX_PRESET = 1       # Presets: no acceleration (always 1x)
+VELOCITY_MAX_PAGE = 1         # Pages: no acceleration (always 1x)
+VELOCITY_MAX_AMBIENT = 10     # Ambient params: moderate acceleration
+
 # Brightness fade toggle state
 _brightness_saved = DEFAULT_BRIGHT  # Saved brightness before fade-out
 _brightness_fading = False  # True while fading
 _brightness_target = DEFAULT_BRIGHT  # Target for fade animation
 _brightness_off = False  # True when faded to zero
 BRIGHTNESS_FADE_SPEED = 0.05  # How fast to fade (per frame)
+_brightness_click_flash = 0.0  # Decays over time, >0 means click detected recently
+_brightness_gpio8_state = 1  # Current GPIO8 state for debug display
 
 # Display-specific smoothed values (separate from control values)
 _display_freq = DEFAULT_CENTER_HZ
@@ -706,7 +724,8 @@ DEVICE_INDEX, DEVICE_NAME = choose_input_device()
 
 
 def update_encoders():
-    """Apply encoder deltas based on current page and handle brightness."""
+    """Apply encoder deltas based on current page and handle brightness.
+    Uses per-parameter velocity sensitivity for acceleration."""
     global BRIGHTNESS, BASE_PROGRAM, CYCLES_BETWEEN_INDEX
     global ambient_speed, ambient_fade_time, DEFAULTS_MODE_INDEX
     global _enc_delta, _brightness_target, _brightness_fading
@@ -716,15 +735,18 @@ def update_encoders():
     if time.time() < IGNORE_KNOBS_UNTIL:
         return
     
-    # Get encoder deltas and reset them (indices 1-3 are param encoders, 4 is brightness)
-    deltas = _enc_delta[1:4]  # Param A, B, C deltas
-    brightness_delta = _enc_delta[4]
+    # Get raw encoder deltas (direction only: -1, 0, or 1 per click)
+    # Indices: 1=Param A, 2=Param B, 3=Param C, 4=Brightness
+    raw_deltas = _enc_delta[1:4]  # Param A, B, C deltas
+    brightness_raw = _enc_delta[4]
     _enc_delta = [0, 0, 0, 0, 0]
     
-    # Handle brightness encoder (Encoder 5)
-    if brightness_delta != 0 and not _brightness_off:
-        # Each click changes brightness by 2%
-        _brightness_target = max(0.0, min(1.0, _brightness_target + brightness_delta * 0.02))
+    # Handle brightness encoder (Encoder 5) with its own velocity
+    if brightness_raw != 0 and not _brightness_off:
+        mult = _calc_velocity_multiplier(4, VELOCITY_MAX_BRIGHTNESS)
+        delta = brightness_raw * mult
+        # Small range (0-100%), ~0.3% per slow click
+        _brightness_target = max(0.0, min(0.99, _brightness_target + delta * 0.003))
         _brightness_fading = True
     
     # Animate brightness fade
@@ -736,65 +758,88 @@ def update_encoders():
         else:
             BRIGHTNESS += BRIGHTNESS_FADE_SPEED if diff > 0 else -BRIGHTNESS_FADE_SPEED
     
-    # Update parameters based on current page using encoder deltas
+    # Update parameters based on current page using encoder deltas with per-param velocity
     page_name = PAGES[current_page]
     
     if page_name == "HOME":
         # Check if we're in AMBIENT mode (preset 6) - different encoder behavior
         if BASE_PROGRAM == 6:
             # AMBIENT mode: Enc A = Speed, Enc B = nothing, Enc C = Fade time
-            if deltas[0] != 0:
-                # Speed: 0.2x to 5x, step by 0.1x per click
-                ambient_speed = max(0.2, min(5.0, ambient_speed + deltas[0] * 0.1))
-            if deltas[2] != 0:
-                # Fade time: 0.5s to 10s, step by 0.2s per click
-                ambient_fade_time = max(0.5, min(10.0, ambient_fade_time + deltas[2] * 0.2))
+            if raw_deltas[0] != 0:
+                mult = _calc_velocity_multiplier(1, VELOCITY_MAX_AMBIENT)
+                delta = raw_deltas[0] * mult
+                # Small range (0.2-5.0), fine control: 0.05x per slow click
+                ambient_speed = max(0.2, min(5.0, ambient_speed + delta * 0.05))
+            if raw_deltas[2] != 0:
+                mult = _calc_velocity_multiplier(3, VELOCITY_MAX_AMBIENT)
+                delta = raw_deltas[2] * mult
+                # Small range (0.5-10s), fine control: 0.1s per slow click
+                ambient_fade_time = max(0.5, min(10.0, ambient_fade_time + delta * 0.1))
         else:
             # Normal audio-reactive mode
             # Enc A: Center frequency (log scale) - multiply/divide by factor per click
-            if deltas[0] != 0:
-                # Each click changes freq by ~5%
-                factor = 1.05 ** deltas[0]
+            if raw_deltas[0] != 0:
+                mult = _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ)
+                delta = raw_deltas[0] * mult
+                # Large range (20Hz-20kHz), ~0.8% per slow click
+                factor = 1.008 ** delta
                 new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
-                print(f"[FREQ] delta={deltas[0]} factor={factor:.3f} {band.center:.0f}Hz -> {new_center:.0f}Hz (Q={band.q:.2f} unchanged)")
+                print(f"[FREQ] delta={delta} mult={mult} factor={factor:.3f} {band.center:.0f}Hz -> {new_center:.0f}Hz")
                 band.center = new_center
             # Enc B: Threshold (0-1, display 0-99)
-            if deltas[1] != 0:
-                band.thresh = max(0.0, min(1.0, band.thresh + deltas[1] * 0.01))
-            # Enc C: Release/Decay (40-5000ms)
-            if deltas[2] != 0:
-                # Step by ~50ms per click
-                band.decay_ms = max(40.0, min(5000.0, band.decay_ms + deltas[2] * 50.0))
+            if raw_deltas[1] != 0:
+                mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
+                delta = raw_deltas[1] * mult
+                # Medium range (0-99), ~0.3 display unit per slow click
+                band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.003))
+            # Enc C: Release/Decay (40-5000ms, display 0-99)
+            if raw_deltas[2] != 0:
+                mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY)
+                delta = raw_deltas[2] * mult
+                # Medium range, ~0.3 display unit per slow click (15ms step)
+                band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 15.0))
                 
     elif page_name == "ADV":
         # Enc A: Q factor (0.5 to 8.0, display 0-99 inverted)
-        if deltas[0] != 0:
-            # Each click changes Q by 0.1 (inverted: CW = lower Q = wider)
-            band.q = max(Q_MIN, min(Q_MAX, band.q - deltas[0] * 0.1))
-        # Enc C: Decay (40-5000ms)
-        if deltas[2] != 0:
-            band.decay_ms = max(40.0, min(5000.0, band.decay_ms + deltas[2] * 50.0))
+        if raw_deltas[0] != 0:
+            mult = _calc_velocity_multiplier(1, VELOCITY_MAX_Q)
+            delta = raw_deltas[0] * mult
+            # Medium range (0-99), ~0.3 display unit per slow click
+            band.q = max(Q_MIN, min(Q_MAX, band.q - delta * 0.025))
+        # Enc C: Decay (40-5000ms, display 0-99)
+        if raw_deltas[2] != 0:
+            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY)
+            delta = raw_deltas[2] * mult
+            # Medium range, ~1 display unit per slow click (50ms step)
+            band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
             
     elif page_name == "PRE":
-        # Enc A: Preset selection (1-6)
-        if deltas[0] != 0:
-            new_preset = max(1, min(NUM_PRESETS, BASE_PROGRAM + deltas[0]))
+        # Enc A: Preset selection (1-6) - NO acceleration, always 1 at a time
+        if raw_deltas[0] != 0:
+            mult = _calc_velocity_multiplier(1, VELOCITY_MAX_PRESET)
+            delta = raw_deltas[0] * mult
+            new_preset = max(1, min(NUM_PRESETS, BASE_PROGRAM + delta))
             if new_preset != BASE_PROGRAM:
                 BASE_PROGRAM = new_preset
                 ui_flash(f"Preset: {PROGRAM_NAMES[new_preset-1]}", 0.8)
-        # Enc B: Beat Cycles index (0-8)
-        if deltas[1] != 0:
-            new_idx = max(0, min(len(CYCLE_STEPS_OPTIONS) - 1, CYCLE_STEPS_INDEX + deltas[1]))
+        # Enc B: Beat Cycles index (0-8) - NO acceleration
+        if raw_deltas[1] != 0:
+            mult = _calc_velocity_multiplier(2, VELOCITY_MAX_PRESET)
+            delta = raw_deltas[1] * mult
+            new_idx = max(0, min(len(CYCLE_STEPS_OPTIONS) - 1, CYCLE_STEPS_INDEX + delta))
             set_cycle_steps_by_index(new_idx)
-        # Enc C: Cycle mode (0 for now, only x+1)
-        if deltas[2] != 0:
-            new_idx = max(0, min(len(CYCLES_BETWEEN_MODES) - 1, CYCLES_BETWEEN_INDEX + deltas[2]))
+        # Enc C: Cycle mode - NO acceleration
+        if raw_deltas[2] != 0:
+            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_PRESET)
+            delta = raw_deltas[2] * mult
+            new_idx = max(0, min(len(CYCLES_BETWEEN_MODES) - 1, CYCLES_BETWEEN_INDEX + delta))
             CYCLES_BETWEEN_INDEX = new_idx
             
     elif page_name == "SET":
-        # Enc A: Defaults mode (0-2 for LOW/MID/HIGH)
-        if deltas[0] != 0:
-            new_idx = max(0, min(2, DEFAULTS_MODE_INDEX + deltas[0]))
+        # Enc A: Defaults mode (0-2 for LOW/MID/HIGH) - NO acceleration, only 3 options
+        if raw_deltas[0] != 0:
+            # Always 1 at a time for settings with few options
+            new_idx = max(0, min(2, DEFAULTS_MODE_INDEX + raw_deltas[0]))
             if new_idx != DEFAULTS_MODE_INDEX:
                 DEFAULTS_MODE_INDEX = new_idx
                 # Apply the new defaults immediately
@@ -876,17 +921,86 @@ def setup_gpio_inputs():
     # Rotary Encoder 5 (Brightness)
     GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    # NOTE: ENC5_SW (GPIO8) is NOT configured - it conflicts with SPI CE0
-    # The brightness toggle will use the reset button or another method
+    if not ENC5_SW_DISABLED:
+        try:
+            GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        except Exception as e:
+            print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
     
     # Reset button
     GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
+def _calc_velocity_multiplier(enc_idx, max_mult=10):
+    """Calculate velocity multiplier using exponential smoothing.
+    
+    Uses a rolling average of clicks-per-second with logarithmic scaling
+    for natural-feeling acceleration. Much simpler and more robust than
+    threshold-based approaches.
+    
+    Args:
+        enc_idx: Encoder index for tracking timing
+        max_mult: Maximum multiplier for fast spinning
+    
+    Returns 1 for slow turning, up to max_mult for fast spinning."""
+    global _enc_last_click_time, _enc_prev_click_time, _enc_velocity
+    import math
+    
+    current_click = _enc_last_click_time[enc_idx]
+    prev_click = _enc_prev_click_time[enc_idx]
+    now = time.time()
+    
+    # First click or no history - return 1x
+    if prev_click == 0 or current_click == 0:
+        _enc_velocity[enc_idx] = 0
+        return 1
+    
+    # If it's been a while since last click, decay the velocity
+    time_since_last = now - current_click
+    if time_since_last > 0.2:  # 200ms pause = reset velocity
+        _enc_velocity[enc_idx] = 0
+        return 1
+    
+    # Calculate instantaneous velocity (clicks per second)
+    delta_s = current_click - prev_click
+    if delta_s <= 0:
+        return 1
+    
+    clicks_per_sec = 1.0 / delta_s
+    
+    # Exponential smoothing: blend new reading with history
+    # alpha=0.4 gives responsive but stable feel
+    alpha = 0.4
+    _enc_velocity[enc_idx] = alpha * clicks_per_sec + (1 - alpha) * _enc_velocity[enc_idx]
+    
+    velocity = _enc_velocity[enc_idx]
+    
+    # Map velocity to multiplier with logarithmic scaling
+    # ~15 clicks/sec (67ms between) = slow (1x)
+    # ~100 clicks/sec (10ms between) = fast (max_mult)
+    SLOW_VELOCITY = 15.0   # clicks/sec - below this = 1x
+    FAST_VELOCITY = 100.0  # clicks/sec - above this = max
+    
+    if velocity <= SLOW_VELOCITY:
+        mult = 1
+    elif velocity >= FAST_VELOCITY:
+        mult = max_mult
+    else:
+        # Logarithmic interpolation feels more natural
+        log_slow = math.log(SLOW_VELOCITY)
+        log_fast = math.log(FAST_VELOCITY)
+        log_vel = math.log(velocity)
+        ratio = (log_vel - log_slow) / (log_fast - log_slow)
+        mult = int(1 + ratio * (max_mult - 1))
+    
+    return max(1, min(max_mult, mult))
+
+
 def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
     """Read encoder using quadrature state machine for reliable direction detection.
-    Returns direction: 1 for CW, -1 for CCW, 0 for no change or invalid transition.
-    Uses sub-count threshold of 2 for more responsive feel."""
-    global _enc_state, _enc_count
+    Returns direction: 1 for CW, -1 for CCW, 0 for no change.
+    Uses sub-count threshold of 2 for more responsive feel.
+    Note: Velocity multiplier is applied later in update_encoders() per-parameter."""
+    global _enc_state, _enc_count, _enc_last_click_time, _enc_prev_click_time
     
     clk = GPIO.input(clk_pin)
     dt = GPIO.input(dt_pin)
@@ -927,9 +1041,17 @@ def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
         # Most encoders have 4 state changes per detent, but 2 feels better
         if _enc_count[enc_idx] >= 2:
             _enc_count[enc_idx] = 0
+            # Record click times for velocity calculation
+            # Move last click to prev BEFORE updating last click
+            _enc_prev_click_time[enc_idx] = _enc_last_click_time[enc_idx]
+            _enc_last_click_time[enc_idx] = time.time()
             return 1  # CW click
         elif _enc_count[enc_idx] <= -2:
             _enc_count[enc_idx] = 0
+            # Record click times for velocity calculation
+            # Move last click to prev BEFORE updating last click
+            _enc_prev_click_time[enc_idx] = _enc_last_click_time[enc_idx]
+            _enc_last_click_time[enc_idx] = time.time()
             return -1  # CCW click
     
     return 0  # Not enough transitions yet
@@ -970,13 +1092,12 @@ def _read_page_encoder(clk_pin, dt_pin):
 def encoder_reader():
     """Read all 5 rotary encoders for page selection, parameters, and brightness.
     
-    Note: Encoder 5's SW pin (GPIO8) is disabled as it conflicts with SPI CE0.
-    Brightness toggle is triggered by long-press on reset button instead.
+    Encoder 5's switch toggles brightness on/off with a fade animation.
     """
     global encoder1_value, encoder1_button
     global current_page
     global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state
-    global _enc_state, _enc_count
+    global _enc_state, _enc_count, _enc_last_click_time, _enc_velocity_mult
     
     if DEV_NO_HW:
         return
@@ -1000,12 +1121,18 @@ def encoder_reader():
             _enc_state[i] = 3  # Default to rest position (both high)
             _enc_count[i] = 0
     
-    # Initialize switch states (skip Encoder 5 SW - GPIO8 conflicts with SPI)
+    # Initialize switch states
     _enc_last_sw[0] = GPIO.input(ENC1_SW)
     _enc_last_sw[1] = GPIO.input(ENC2_SW)
     _enc_last_sw[2] = GPIO.input(ENC3_SW)
     _enc_last_sw[3] = GPIO.input(ENC4_SW)
-    _enc_last_sw[4] = 1  # Encoder 5 SW disabled (GPIO8 = SPI CE0)
+    if not ENC5_SW_DISABLED:
+        try:
+            _enc_last_sw[4] = GPIO.input(ENC5_SW)
+        except Exception:
+            _enc_last_sw[4] = 1
+    else:
+        _enc_last_sw[4] = 1
     
     _reset_last_state = GPIO.input(RESET_PIN)
     _reset_press_time = 0  # Track how long reset button is held
@@ -1064,11 +1191,29 @@ def encoder_reader():
                         pass  # Reserved for future use
                 _enc_last_sw[3] = enc4_sw
                 
-                # ===== Encoder 5 - Brightness (SW disabled - GPIO8 = SPI CE0) =====
+                # ===== Encoder 5 - Brightness =====
                 direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
                 if direction != 0:
                     _enc_delta[4] += direction
-                # NOTE: Encoder 5 button (GPIO8) is NOT read - conflicts with SPI
+                
+                # Encoder 5 switch - toggle brightness on/off with fade
+                global _brightness_click_flash, _brightness_gpio8_state
+                if not ENC5_SW_DISABLED:
+                    try:
+                        enc5_sw = GPIO.input(ENC5_SW)
+                    except Exception as e:
+                        enc5_sw = 1
+                    _brightness_gpio8_state = enc5_sw  # Update for UI display
+                    if enc5_sw == 0 and _enc_last_sw[4] == 1:
+                        _brightness_click_flash = 1.0  # Flash indicator in UI
+                        time.sleep(0.02)  # Debounce
+                        try:
+                            enc5_sw_after = GPIO.input(ENC5_SW)
+                        except Exception:
+                            enc5_sw_after = 1
+                        if enc5_sw_after == 0:
+                            toggle_brightness()
+                    _enc_last_sw[4] = enc5_sw
                 
                 # ===== Reset button (GPIO 25) =====
                 # Short press = reset to defaults
@@ -1243,8 +1388,9 @@ def audio_loop():
         PROGRAM = active_prog
 
         # Decay trigger flash indicator
-        global trigger_flash
+        global trigger_flash, _brightness_click_flash
         trigger_flash = trigger_flash * TRIGGER_FLASH_DECAY
+        _brightness_click_flash = _brightness_click_flash * 0.9  # Decay click indicator
 
         if above and not was_above and can_fire and active_prog in (1, 2, 3, 4):
             last_trigger_ts = now
@@ -1757,7 +1903,8 @@ def tui(stdscr):
             f"Decay={band.decay_ms:.0f}ms  Bright={BRIGHTNESS:.0%}"
         )
         bright_status = "OFF" if _brightness_off else f"{int(BRIGHTNESS*100)}%"
-        safe_addstr(stdscr, 2, 0, f"Brightness: {bright_status}  (saved: {int(_brightness_saved*100)}%)")
+        click_indicator = " [CLICK!]" if _brightness_click_flash > 0.5 else ""
+        safe_addstr(stdscr, 2, 0, f"Brightness: {bright_status}  (saved: {int(_brightness_saved*100)}%)  GPIO8={_brightness_gpio8_state}{click_indicator}")
 
         row = 4
         safe_addstr(stdscr, row, 0, "Band Env vs Threshold (| is threshold):")
