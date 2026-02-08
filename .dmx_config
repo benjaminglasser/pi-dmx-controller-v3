@@ -1,4 +1,4 @@
 defaults_mode=LOW
 dmx_output_mode=Dimmer
 dmx_channel_count=4
-LOW=120.96000000000001,0.4,542.0,2.0
+LOW=120.96000000000001,0.1953566380480208,542.0,2.0,1,0

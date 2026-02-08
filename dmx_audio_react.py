@@ -93,17 +93,18 @@ DEFAULT_DECAY_MS  = 542.0   # 10 on 0-99 scale ((542-40)/4960*99 = 10.02 → 10)
 DEFAULT_BRIGHT    = 0.5
 
 # Defaults modes: LOW, MID, HIGH are built-in presets, USR 1-3 are user-saveable slots
-# Each mode has (center_hz, thresh, decay_ms, q) - Q varies by range
+# Each mode has (center_hz, thresh, decay_ms, q, thresh_mode, release_mode)
 # Q display mapping: 0 = narrow (Q=8), 99 = wide (Q=0.5), so display 96 ≈ Q=0.74
+# thresh_mode: 0=fixed, 1=adapt | release_mode: 0=fixed, 1=react, 2=bright, 3=both, 4=rand
 DEFAULTS_MODES = ["LOW", "MID", "HIGH", "USR 1", "USR 2", "USR 3"]
 DEFAULTS_PRESETS = {
-    #           (center_hz, thresh, decay_ms, q_factor)
-    "LOW":   (120.0,  0.40, 542.0, 2.0),    # Low frequencies ~120Hz, thresh=40
-    "MID":   (1000.0, 0.41, 542.0, 1.5),    # Mid frequencies ~1kHz, thresh=40
-    "HIGH":  (5000.0, 0.25, 542.0, 0.82),   # High frequencies ~5kHz, thresh=25, Q display=90
-    "USR 1": (1200.0, 0.40, 542.0, 0.65),   # User preset 1: 1.2kHz, Q display=99
-    "USR 2": (1200.0, 0.40, 542.0, 0.65),   # User preset 2: 1.2kHz, Q display=99
-    "USR 3": (1200.0, 0.40, 542.0, 0.65),   # User preset 3: 1.2kHz, Q display=99
+    #           (center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode)
+    "LOW":   (120.0,  0.40, 542.0, 2.0, 0, 0),    # Low frequencies ~120Hz, thresh=40
+    "MID":   (1000.0, 0.41, 542.0, 1.5, 0, 0),    # Mid frequencies ~1kHz, thresh=40
+    "HIGH":  (5000.0, 0.25, 542.0, 0.82, 0, 0),   # High frequencies ~5kHz, thresh=25, Q display=90
+    "USR 1": (1200.0, 0.40, 542.0, 0.65, 0, 0),   # User preset 1: 1.2kHz, Q display=99
+    "USR 2": (1200.0, 0.40, 542.0, 0.65, 0, 0),   # User preset 2: 1.2kHz, Q display=99
+    "USR 3": (1200.0, 0.40, 542.0, 0.65, 0, 0),   # User preset 3: 1.2kHz, Q display=99
 }
 
 # Config file for persisting settings
@@ -134,12 +135,18 @@ def load_defaults_mode():
                         except ValueError:
                             pass
                     elif "=" in line:
-                        # Parse preset override: LOW=120.0,0.40,542.0,2.0
+                        # Parse preset override: LOW=120.0,0.40,542.0,2.0,0,0
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
                             parts = val.split(",")
-                            if len(parts) == 4:
-                                DEFAULTS_PRESETS[key] = tuple(float(p) for p in parts)
+                            if len(parts) >= 4:
+                                base = tuple(float(p) for p in parts[:4])
+                                if len(parts) >= 6:
+                                    # New format with thresh_mode and release_mode
+                                    DEFAULTS_PRESETS[key] = base + (int(parts[4]), int(parts[5]))
+                                else:
+                                    # Old format - default modes to 0 (fixed)
+                                    DEFAULTS_PRESETS[key] = base + (0, 0)
     except Exception:
         pass
     return mode_idx  # Default to LOW (0)
@@ -239,8 +246,8 @@ def save_dmx_channel_count(count):
     except Exception:
         pass
 
-def save_preset_values(mode_name, center_hz, thresh, decay_ms, q):
-    """Save custom preset values to config file."""
+def save_preset_values(mode_name, center_hz, thresh, decay_ms, q, thresh_mode, release_mode):
+    """Save custom preset values to config file (includes thresh_mode and release_mode)."""
     try:
         # Read existing config
         defaults_mode = "LOW"
@@ -264,8 +271,8 @@ def save_preset_values(mode_name, center_hz, thresh, decay_ms, q):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
                             preset_overrides[key] = val
-        # Update the preset override
-        preset_overrides[mode_name] = f"{center_hz},{thresh},{decay_ms},{q}"
+        # Update the preset override with all 6 values
+        preset_overrides[mode_name] = f"{center_hz},{thresh},{decay_ms},{q},{thresh_mode},{release_mode}"
         # Write back
         with open(CONFIG_FILE, 'w') as f:
             f.write(f"defaults_mode={defaults_mode}\n")
@@ -333,7 +340,7 @@ _recent_min = 1.0           # Tracks recent minimum for adaptive mode
 _effective_thresh = 0.3     # Effective threshold for display (varies by mode)
 
 # Release modes
-RELEASE_MODES = ["fixed", "react", "bright", "rand"]
+RELEASE_MODES = ["fixed", "react", "bright", "both", "rand"]
 RELEASE_MODE_INDEX = 0  # Default to fixed (current behavior)
 _reactive_brightness_scale = 1.0  # For bright mode: scales brightness by level above threshold
 _effective_release_display = 0  # For displaying reactive release values (0-99)
@@ -341,6 +348,11 @@ _effective_brightness_display = 50  # For displaying reactive brightness (0-99, 
 _brightness_knob_last_turn = 0.0  # Timestamp of last brightness knob turn
 _release_knob_last_turn = 0.0  # Timestamp of last release knob turn
 REACTIVE_BUFFER_SECONDS = 2.0  # Seconds to wait after knob turn before reactivity kicks in
+_trigger_speed_multiplier = 1.0  # 0.3 to 2.0, fast = lower, slow = higher
+TRIGGER_SPEED_FAST_MS = 200.0  # Triggers faster than this = min multiplier (0.3x)
+TRIGGER_SPEED_SLOW_MS = 1000.0  # Triggers slower than this = max multiplier (2.0x)
+TRIGGER_SPEED_MIN_MULT = 0.3  # Minimum multiplier for fast triggers (dampens effect)
+TRIGGER_SPEED_MAX_MULT = 2.0  # Maximum multiplier for slow triggers
 
 # Program state
 PROGRAM      = 1
@@ -577,12 +589,16 @@ _last_preset_before_ambient = 1  # Stores the preset to return to when toggling 
 # Velocity is calculated as clicks-per-second, then mapped logarithmically
 VELOCITY_MAX_FREQ = 25        # Frequency: large range, high acceleration
 VELOCITY_MAX_THRESH = 20      # Threshold: 0-99 range
-VELOCITY_MAX_DECAY = 20       # Decay/Release: 0-99 range
+VELOCITY_MAX_DECAY = 8        # Decay/Release: reduced for more precision
 VELOCITY_MAX_Q = 20           # Q factor: 0-99 range
 VELOCITY_MAX_BRIGHTNESS = 18  # Brightness: 0-99%
 VELOCITY_MAX_PRESET = 1       # Presets: no acceleration (always 1x)
 VELOCITY_MAX_PAGE = 1         # Pages: no acceleration (always 1x)
 VELOCITY_MAX_AMBIENT = 10     # Ambient params: moderate acceleration
+
+# Minimum velocity multiplier for precision mode (sub-1x for slow turning)
+# Set to 1.0 to disable precision mode, lower values = more precise at slow speeds
+VELOCITY_MIN_DECAY = 0.1      # Decay/Release: 10x more precise when turning slowly
 
 # Brightness fade toggle state
 _brightness_saved = DEFAULT_BRIGHT  # Saved brightness before fade-out
@@ -813,9 +829,17 @@ POST_EMA = 0.6
 
 class BandParams:
     def __init__(self):
+        global THRESH_MODE_INDEX, RELEASE_MODE_INDEX
         # Initialize from the loaded defaults mode (persisted from last session)
         mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-        center_hz, thresh, decay_ms, q_factor = DEFAULTS_PRESETS[mode_name]
+        preset = DEFAULTS_PRESETS[mode_name]
+        # Handle both old 4-value and new 6-value preset formats
+        if len(preset) >= 6:
+            center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
+            THRESH_MODE_INDEX = thresh_mode
+            RELEASE_MODE_INDEX = release_mode
+        else:
+            center_hz, thresh, decay_ms, q_factor = preset[:4]
         self.center    = center_hz
         self.q         = q_factor
         self.thresh    = thresh
@@ -897,18 +921,18 @@ def update_lights(dt_ms):
     # Calculate base brightness display value
     base_brightness_display = int(BRIGHTNESS * 99)
     
-    if release_mode == "bright":
-        # Bright mode: use the reactive brightness scale (set on each trigger, stays until next)
+    if release_mode in ("bright", "both"):
+        # Bright/both mode: use the reactive brightness scale (set on each trigger, stays until next)
         effective_brightness = _reactive_brightness_scale
     else:
         effective_brightness = BRIGHTNESS
-        # Reset reactive brightness to base when not in bright mode
+        # Reset reactive brightness to base when not in bright/both mode
         _reactive_brightness_scale = BRIGHTNESS
         _effective_brightness_display = base_brightness_display
     
-    # React and rand modes: keep their values until next trigger
+    # React, rand, and both modes: keep their release values until next trigger
     # Only reset display when switching away from these modes
-    if release_mode not in ("react", "rand"):
+    if release_mode not in ("react", "rand", "both"):
         _effective_release_display = base_release_display
     
     for i in range(DMX_CHANNEL_COUNT):
@@ -1122,10 +1146,10 @@ def update_encoders():
         # Small range (0-100%), ~1% per slow click
         BRIGHTNESS = max(0.0, min(0.99, BRIGHTNESS + delta * 0.01))
         _brightness_target = BRIGHTNESS  # Keep target in sync
-        # In bright mode, snap reactive brightness back to base when knob is turned
+        # In bright/both mode, snap reactive brightness back to base when knob is turned
         # and set buffer timestamp to delay reactivity
         global _reactive_brightness_scale, _effective_brightness_display, _brightness_knob_last_turn
-        if RELEASE_MODES[RELEASE_MODE_INDEX] == "bright":
+        if RELEASE_MODES[RELEASE_MODE_INDEX] in ("bright", "both"):
             _reactive_brightness_scale = BRIGHTNESS
             _effective_brightness_display = int(BRIGHTNESS * 99)
             _brightness_knob_last_turn = time.time()
@@ -1222,16 +1246,19 @@ def update_encoders():
                     # Release mode: (40-5000ms, display 0-99)
                     # Clamp base delta to ±1, velocity multiplier handles acceleration
                     base_delta = 1 if raw_deltas[2] > 0 else -1
-                    mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY)
+                    mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
                     delta = base_delta * mult
                     # Medium range, ~1 display unit per slow click (50ms step)
+                    # With precision mode (min_mult=0.2), slow turns give ~10ms steps
                     band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
-                    # In react/rand mode, snap effective release back to base when knob is turned
-                    global _effective_release_display
+                    # In react/rand/both mode, snap effective release back to base when knob is turned
+                    # and set buffer timestamp to delay reactivity
+                    global _effective_release_display, _release_knob_last_turn
                     release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
-                    if release_mode in ("react", "rand"):
+                    if release_mode in ("react", "rand", "both"):
                         _effective_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
                         _effective_release_display = max(0, min(99, _effective_release_display))
+                        _release_knob_last_turn = time.time()
                 
     elif page_name == "ADV":
         # Enc A: Q factor (display 0-99 inverted) - logarithmic scaling
@@ -1247,9 +1274,10 @@ def update_encoders():
         # Enc C: Decay (40-5000ms, display 0-99)
         if raw_deltas[2] != 0:
             base_delta = 1 if raw_deltas[2] > 0 else -1
-            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY)
+            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
             delta = base_delta * mult
             # Medium range, ~1 display unit per slow click (50ms step)
+            # With precision mode (min_mult=0.2), slow turns give ~10ms steps
             band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
             
     elif page_name == "PRE":
@@ -1321,7 +1349,12 @@ def update_encoders():
                     preset = DEFAULTS_PRESETS[mode_name]
                     # Apply the defaults immediately (only if preset has values)
                     if preset is not None:
-                        center_hz, thresh, decay_ms, q_factor = preset
+                        if len(preset) >= 6:
+                            center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
+                            THRESH_MODE_INDEX = thresh_mode
+                            RELEASE_MODE_INDEX = release_mode
+                        else:
+                            center_hz, thresh, decay_ms, q_factor = preset[:4]
                         band.center   = center_hz
                         band.thresh   = thresh
                         band.decay_ms = decay_ms
@@ -1419,8 +1452,8 @@ def toggle_brightness():
 # ===================== GPIO / Rotary Encoders =====================
 
 def reset_to_defaults():
-    """Reset HOME page parameters (Freq, Threshold, Release, Q) to current defaults mode."""
-    global IGNORE_KNOBS_UNTIL
+    """Reset HOME page parameters (Freq, Threshold, Release, Q) and modes to current defaults."""
+    global IGNORE_KNOBS_UNTIL, THRESH_MODE_INDEX, RELEASE_MODE_INDEX
     
     # Get values from current defaults mode
     mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
@@ -1431,7 +1464,13 @@ def reset_to_defaults():
         ui_flash(f"{mode_name} is empty", 1.0)
         return
     
-    center_hz, thresh, decay_ms, q_factor = preset
+    # Handle both old 4-value and new 6-value preset formats
+    if len(preset) >= 6:
+        center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
+        THRESH_MODE_INDEX = thresh_mode
+        RELEASE_MODE_INDEX = release_mode
+    else:
+        center_hz, thresh, decay_ms, q_factor = preset[:4]
     
     # Reset HOME page parameters to the current defaults mode
     band.center   = center_hz
@@ -1443,12 +1482,14 @@ def reset_to_defaults():
     ui_flash(f"Reset to {mode_name}", 1.0)
 
 def save_current_as_default():
-    """Save current band params as the selected default preset."""
+    """Save current band params and modes as the selected default preset."""
     mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-    # Update in-memory preset
-    DEFAULTS_PRESETS[mode_name] = (band.center, band.thresh, band.decay_ms, band.q)
+    # Update in-memory preset with all 6 values
+    DEFAULTS_PRESETS[mode_name] = (band.center, band.thresh, band.decay_ms, band.q,
+                                    THRESH_MODE_INDEX, RELEASE_MODE_INDEX)
     # Persist to config file
-    save_preset_values(mode_name, band.center, band.thresh, band.decay_ms, band.q)
+    save_preset_values(mode_name, band.center, band.thresh, band.decay_ms, band.q,
+                       THRESH_MODE_INDEX, RELEASE_MODE_INDEX)
 
 def setup_gpio_inputs():
     if DEV_NO_HW:
@@ -1493,7 +1534,7 @@ def setup_gpio_inputs():
 _enc_last_update_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time when delta was last consumed
 _enc_update_velocity = [0.0, 0.0, 0.0, 0.0, 0.0]   # Smoothed velocity based on update intervals
 
-def _calc_velocity_multiplier(enc_idx, max_mult=10):
+def _calc_velocity_multiplier(enc_idx, max_mult=10, min_mult=1.0):
     """Calculate velocity multiplier based on time between update_encoders() calls.
     
     This measures the time between when deltas are CONSUMED (physical detent rate),
@@ -1502,8 +1543,10 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10):
     Args:
         enc_idx: Encoder index for tracking timing
         max_mult: Maximum multiplier for fast spinning
+        min_mult: Minimum multiplier for slow turning (< 1.0 enables precision mode)
     
-    Returns 1 for slow turning, up to max_mult for fast spinning."""
+    Returns min_mult for very slow turning, 1.0 for normal slow turning, 
+    up to max_mult for fast spinning."""
     global _enc_last_update_time, _enc_update_velocity
     import math
     
@@ -1514,7 +1557,7 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10):
     if last_update == 0:
         _enc_last_update_time[enc_idx] = now
         _enc_update_velocity[enc_idx] = 0
-        return 1
+        return 1.0
     
     # Calculate time since last update with non-zero delta
     delta_s = now - last_update
@@ -1523,11 +1566,11 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10):
     # If it's been a while since last update, reset velocity
     if delta_s > 0.8:  # 800ms pause = reset velocity, return 1x
         _enc_update_velocity[enc_idx] = 0
-        return 1
+        return 1.0
     
     # Calculate updates per second (physical detent rate)
     if delta_s <= 0:
-        return 1
+        return 1.0
     
     updates_per_sec = 1.0 / delta_s
     
@@ -1539,25 +1582,33 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10):
     
     # Map velocity to multiplier with logarithmic scaling
     # Based on PHYSICAL detent rate (updates per second), not internal clicks
-    # 800ms between detents = 1.25/sec = slow (1x)
-    # 200ms between detents = 5/sec = moderate 
-    # 50ms between detents = 20/sec = fast (max_mult)
-    SLOW_VELOCITY = 1.5    # updates/sec - below this = 1x (>660ms between physical detents)
-    FAST_VELOCITY = 15.0   # updates/sec - above this = max (<67ms between physical detents)
+    # Velocity thresholds for different speed zones:
+    PRECISION_VELOCITY = 0.8  # updates/sec - below this = min_mult (>1250ms between detents)
+    SLOW_VELOCITY = 1.5       # updates/sec - at this point = 1x (>660ms between physical detents)
+    FAST_VELOCITY = 15.0      # updates/sec - above this = max (<67ms between physical detents)
     
-    if velocity <= SLOW_VELOCITY:
-        mult = 1
+    if min_mult < 1.0 and velocity <= PRECISION_VELOCITY:
+        # Precision mode: very slow turning gets sub-1x multiplier
+        mult = min_mult
+    elif velocity <= SLOW_VELOCITY:
+        if min_mult < 1.0:
+            # Interpolate between min_mult and 1.0 in the precision-to-slow zone
+            ratio = (velocity - PRECISION_VELOCITY) / (SLOW_VELOCITY - PRECISION_VELOCITY)
+            ratio = max(0.0, min(1.0, ratio))
+            mult = min_mult + ratio * (1.0 - min_mult)
+        else:
+            mult = 1.0
     elif velocity >= FAST_VELOCITY:
-        mult = max_mult
+        mult = float(max_mult)
     else:
-        # Logarithmic interpolation feels more natural
+        # Logarithmic interpolation from 1x to max_mult feels more natural
         log_slow = math.log(SLOW_VELOCITY)
         log_fast = math.log(FAST_VELOCITY)
         log_vel = math.log(velocity)
         ratio = (log_vel - log_slow) / (log_fast - log_slow)
-        mult = int(1 + ratio * (max_mult - 1))
+        mult = 1.0 + ratio * (max_mult - 1.0)
     
-    return max(1, min(max_mult, mult))
+    return max(min_mult, min(float(max_mult), mult))
 
 
 def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
@@ -1979,6 +2030,7 @@ def audio_loop():
         global fft_bands, fft_peaks, fft_peak_times, fft_recent_max
         global _recent_min, _effective_thresh
         global _reactive_brightness_scale, _effective_release_display, _effective_brightness_display
+        global _trigger_speed_multiplier
 
         if not RUNNING:
             return
@@ -2085,9 +2137,9 @@ def audio_loop():
         should_trigger = False
 
         if thresh_mode == "fixed":
-            # Fixed: edge-triggered (must drop below to retrigger)
+            # Fixed: level-triggered (retriggers while above threshold after refractory period)
             _effective_thresh = band.thresh
-            should_trigger = above and not was_above and can_fire
+            should_trigger = above and can_fire
         elif thresh_mode == "adapt":
             # Adaptive: trigger on rise above recent minimum
             # Scale threshold: 0=very sensitive (0.02 rise), 99=less sensitive (0.6 rise)
@@ -2099,57 +2151,94 @@ def audio_loop():
                 _recent_min = live_band_env  # Reset after trigger
 
         if should_trigger and active_prog in (1, 2, 3, 4, 5):
+            # Calculate time since last trigger for speed multiplier
+            time_since_last_ms = (now - last_trigger_ts) * 1000.0
+            
+            # Update speed multiplier based on trigger interval
+            # Slow triggers (> 1000ms apart) = max multiplier (2.0x) - boosts effect
+            # Fast triggers (< 200ms apart) = min multiplier (0.3x) - dampens effect
+            if time_since_last_ms >= TRIGGER_SPEED_SLOW_MS:
+                _trigger_speed_multiplier = TRIGGER_SPEED_MAX_MULT
+            elif time_since_last_ms <= TRIGGER_SPEED_FAST_MS:
+                _trigger_speed_multiplier = TRIGGER_SPEED_MIN_MULT
+            else:
+                # Linear interpolation between min and max multiplier
+                speed_range = TRIGGER_SPEED_SLOW_MS - TRIGGER_SPEED_FAST_MS
+                t = (time_since_last_ms - TRIGGER_SPEED_FAST_MS) / speed_range
+                _trigger_speed_multiplier = TRIGGER_SPEED_MIN_MULT + t * (TRIGGER_SPEED_MAX_MULT - TRIGGER_SPEED_MIN_MULT)
+            
             last_trigger_ts = now
             trigger_flash = 1.0  # Flash on trigger
             if TRIG_DEBUG:
-                print(f"[TRIG] mode={thresh_mode} env={live_band_env:.5f} thr={band.thresh:.5f} prog={active_prog}")
+                print(f"[TRIG] mode={thresh_mode} env={live_band_env:.5f} thr={band.thresh:.5f} prog={active_prog} mult={_trigger_speed_multiplier:.2f}")
 
             # Calculate effective decay based on release mode
             release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
             effective_decay = band.decay_ms
             
-            # Calculate boost amount based on threshold mode
-            # Use the signal level directly - stronger signal = more boost
-            # For fixed mode: normalize by how much above threshold (as ratio of remaining headroom)
-            # For adapt mode: use signal level directly
-            if thresh_mode == "fixed":
-                # Fixed: boost based on how far above threshold as ratio of headroom
-                # e.g., if thresh=0.3 and env=0.6, that's 0.3/0.7 = 43% of headroom
-                headroom = max(0.01, 1.0 - band.thresh)
-                excess = max(0, live_band_env - band.thresh)
-                boost_amount = excess / headroom  # 0 to 1 range
-            else:
-                # Adaptive: boost based on peak level (louder = more boost)
-                boost_amount = live_band_env
+            # Calculate boost amount from signal energy directly
+            # live_band_env is 0-1, representing the smoothed amplitude of the frequency band
+            # Louder/more energetic = higher value = more boost
+            # This works the same regardless of threshold mode
+            boost_amount = live_band_env
+            
+            # Multiply amplitude by speed multiplier
+            # Fast triggers (< 200ms) = 1.0x (just amplitude)
+            # Slow triggers (> 1000ms) = 2.0x (amplitude doubled)
+            combined_boost = boost_amount * _trigger_speed_multiplier
             
             if release_mode == "react":
-                # Reactive: release scales up from set value based on signal strength
-                # Proportional boost - stronger = longer release (up to 2x)
-                scale = 1.0 + boost_amount * 1.0  # 1x to 2x
-                effective_decay = band.decay_ms * scale
-                # Update display value (0-99 scale)
-                _effective_release_display = int((effective_decay - 40.0) / 4960.0 * 99)
-                _effective_release_display = max(0, min(99, _effective_release_display))
+                # Reactive: release scales up from set value based on signal strength + speed
+                # Check if we're still in the buffer period after knob turn
+                if (now - _release_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
+                    # Max 300% boost based on combined signal strength and trigger speed
+                    scale = 1.0 + min(3.0, combined_boost * 3.0)  # 1x to 4x
+                    effective_decay = band.decay_ms * scale
+                    # Update display value (0-99 scale)
+                    _effective_release_display = int((effective_decay - 40.0) / 4960.0 * 99)
+                    _effective_release_display = max(0, min(99, _effective_release_display))
             elif release_mode == "bright":
-                # Reactive brightness: brightness scales up from set value based on signal strength
-                # Proportional boost - stronger = brighter (can go to 100%)
-                # boost_amount is 0-1, so add it directly to brightness
-                _reactive_brightness_scale = min(1.0, BRIGHTNESS + boost_amount * (1.0 - BRIGHTNESS))
-                # Update display value (0-99 scale)
-                _effective_brightness_display = int(_reactive_brightness_scale * 99)
-                _effective_brightness_display = max(0, min(99, _effective_brightness_display))
+                # Reactive brightness: brightness scales up from set value based on signal strength + speed
+                # Check if we're still in the buffer period after knob turn
+                if (now - _brightness_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
+                    # Max 50% boost based on combined signal strength and trigger speed
+                    boost = min(0.5, combined_boost * 0.5) * BRIGHTNESS  # Up to 50% of set brightness
+                    _reactive_brightness_scale = min(1.0, BRIGHTNESS + boost)
+                    # Update display value (0-99 scale)
+                    _effective_brightness_display = int(_reactive_brightness_scale * 99)
+                    _effective_brightness_display = max(0, min(99, _effective_brightness_display))
+            elif release_mode == "both":
+                # Both: combines react (release scaling) and bright (brightness scaling)
+                # Check release buffer
+                if (now - _release_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
+                    # Max 300% boost based on combined signal strength and trigger speed
+                    scale = 1.0 + min(3.0, combined_boost * 3.0)  # 1x to 4x
+                    effective_decay = band.decay_ms * scale
+                    # Update display value (0-99 scale)
+                    _effective_release_display = int((effective_decay - 40.0) / 4960.0 * 99)
+                    _effective_release_display = max(0, min(99, _effective_release_display))
+                # Check brightness buffer
+                if (now - _brightness_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
+                    # Max 50% boost based on combined signal strength and trigger speed
+                    boost = min(0.5, combined_boost * 0.5) * BRIGHTNESS  # Up to 50% of set brightness
+                    _reactive_brightness_scale = min(1.0, BRIGHTNESS + boost)
+                    # Update display value (0-99 scale)
+                    _effective_brightness_display = int(_reactive_brightness_scale * 99)
+                    _effective_brightness_display = max(0, min(99, _effective_brightness_display))
             elif release_mode == "rand":
                 # Random: add/subtract random value between -20 and +20 from current release
-                # Calculate base release display value (0-99)
-                base_release = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                base_release = max(0, min(99, base_release))
-                # Add random offset between -20 and +20
-                rand_offset = random.randint(-20, 20)
-                new_release_display = max(0, min(99, base_release + rand_offset))
-                # Convert back to decay_ms
-                effective_decay = 40.0 + (new_release_display / 99.0) * 4960.0
-                # Update display value
-                _effective_release_display = new_release_display
+                # Check if we're still in the buffer period after knob turn
+                if (now - _release_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
+                    # Calculate base release display value (0-99)
+                    base_release = int((band.decay_ms - 40.0) / 4960.0 * 99)
+                    base_release = max(0, min(99, base_release))
+                    # Add random offset between -20 and +20
+                    rand_offset = random.randint(-20, 20)
+                    new_release_display = max(0, min(99, base_release + rand_offset))
+                    # Convert back to decay_ms
+                    effective_decay = 40.0 + (new_release_display / 99.0) * 4960.0
+                    # Update display value
+                    _effective_release_display = new_release_display
 
             if active_prog == 1:
                 # ALL - trigger all configured channels
@@ -2430,8 +2519,8 @@ class OledUI:
         self._draw_sun_icon(draw, x, y + 10, size=7)
         release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
         base_brt = int(_display_bright * 100)
-        if release_mode == "bright" and _effective_brightness_display > base_brt:
-            # Show effective brightness when boosted in bright mode
+        if release_mode in ("bright", "both") and _effective_brightness_display > base_brt:
+            # Show effective brightness when boosted in bright/both mode
             brt_pct = _effective_brightness_display
             draw.text((x + 9, y + 11), f"{brt_pct:2d}", font=self._font_small, fill=1)
         else:
@@ -2442,8 +2531,8 @@ class OledUI:
         self._draw_sun_icon(draw, x, y, size=7)
         release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
         base_brt = int(_display_bright * 100)
-        if release_mode == "bright" and _effective_brightness_display > base_brt:
-            # Show effective brightness when boosted in bright mode
+        if release_mode in ("bright", "both") and _effective_brightness_display > base_brt:
+            # Show effective brightness when boosted in bright/both mode
             brt_pct = _effective_brightness_display
             draw.text((x + 9, y + 1), f"{brt_pct:2d}", font=self._font_small, fill=1)
         else:
@@ -2631,9 +2720,9 @@ class OledUI:
                             if abs(release_pct - _display_release) > 1:
                                 _display_release = release_pct
                             
-                            # Show effective value for react/rand modes, base value otherwise
+                            # Show effective value for react/rand/both modes, base value otherwise
                             release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
-                            if release_mode in ("react", "rand"):
+                            if release_mode in ("react", "rand", "both"):
                                 val_str = f"{_effective_release_display}"
                             else:
                                 val_str = f"{_display_release}"

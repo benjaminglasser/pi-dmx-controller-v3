@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import time, subprocess
+import time, subprocess, os
+from io import BytesIO
 try:
     import board, busio
     from PIL import Image, ImageDraw, ImageFont
@@ -7,9 +8,18 @@ try:
 except Exception:
     raise SystemExit(0)
 
-LOGO = "/home/pi/pi-dmx-controller/assets/logo.jpg"  # your JPEG
+# Try to import cairosvg for SVG support (optional)
+try:
+    import cairosvg
+    HAS_CAIROSVG = True
+except ImportError:
+    HAS_CAIROSVG = False
+
+ASSETS_DIR = "/home/benglasser/pi-dmx-controller-v2/assets"
+LOGO_SVG = os.path.join(ASSETS_DIR, "csw.svg")
+LOGO_JPG = os.path.join(ASSETS_DIR, "logo.jpg")
 W, H = 128, 32
-HOLD_SECONDS = 2.0   # show logo up to this long before switching
+HOLD_SECONDS = 5.0   # show logo for 5 seconds before switching
 
 def safe_font(size=8):
     try:
@@ -17,13 +27,30 @@ def safe_font(size=8):
     except Exception:
         return ImageFont.load_default()
 
+def load_image(path):
+    """Load an image file (SVG, JPG, PNG, BMP) and return a PIL Image."""
+    if path.endswith('.svg') and HAS_CAIROSVG:
+        # Convert SVG to PNG in memory, then load as PIL Image
+        png_data = cairosvg.svg2png(url=path, output_width=W, output_height=H)
+        return Image.open(BytesIO(png_data)).convert("1")
+    else:
+        return Image.open(path).convert("1")
+
 def draw_logo(oled):
-    from PIL import Image
+    """Draw the logo on the OLED. Tries csw.svg first, falls back to logo.jpg."""
     try:
-        img = Image.open(LOGO).convert("1")
+        # Try SVG first if it exists and cairosvg is available
+        if os.path.exists(LOGO_SVG) and HAS_CAIROSVG:
+            img = load_image(LOGO_SVG)
+        elif os.path.exists(LOGO_JPG):
+            img = load_image(LOGO_JPG)
+        else:
+            return False
+        
         if (img.width, img.height) != (W, H):
             img = img.resize((W, H))
-        oled.image(img); oled.show()
+        oled.image(img)
+        oled.show()
         return True
     except Exception:
         return False

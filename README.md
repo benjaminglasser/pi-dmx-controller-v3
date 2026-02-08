@@ -1,354 +1,480 @@
-# DMX Audio‑Reactive Light Controller (Pi + HiFiBerry + OLA)
+# DMX Audio-Reactive Light Controller v2
 
-## Overview
-This project transforms a Raspberry Pi into a fully standalone, audio‑reactive DMX lighting engine.
+A fully standalone, audio-reactive DMX lighting controller for Raspberry Pi with OLED display, rotary encoders, and UART-based DMX output.
 
-It uses:
-- **HiFiBerry DAC+ADC** for clean audio input  
-- **MCP3008** for six analog knobs  
-- **Rotary switch** for preset selection  
-- **Custom OLED boot splash pipeline** (super‑fast, firmware‑level + systemd early boot)  
-- **OLA (Open Lighting Architecture)** for DMX output  
+## Features
 
-This README includes:
-- Original documentation  
-- All OLED improvements (splash, animation, early‑boot service)  
-- All boot‑speed optimizations  
-- All systemd service definitions  
-- Full setup + troubleshooting  
+### Audio Processing
+- Real-time FFT spectrum analysis with 32 frequency bands
+- Configurable center frequency (80Hz - 12kHz)
+- Adjustable Q factor (bandwidth) with visual feedback
+- Multiple threshold modes: Fixed and Adaptive
+- Multiple release modes: Fixed, Reactive, Brightness-reactive, Both, Random
 
----
+### DMX Output
+- UART-based DMX512 output via RS485 transceiver (no USB adapter needed)
+- 4-24 configurable DMX channels
+- 6 program modes:
+  - **ALL**: All channels trigger together
+  - **CHASE**: Sequential single channel cycling
+  - **GROUPS**: First half alternates with second half
+  - **ODD/EVEN**: Odd channels alternate with even
+  - **RANDOM**: Random channel each trigger
+  - **AMBIENT**: Non-audio-reactive random fading
 
-## FEATURES
-Six knobs:
-  - Center Frequency (20–18k Hz, log scale)
-  - Q (0.4–6.0)
-  - Threshold (0.001–0.200)
-  - Cycle (N) — 0,4,8,16,32,64,128,256 triggers
-  - Decay (150–9999 ms)
-  - Brightness (0.0–1.0)
-- Four program modes (rotary switch):
-  - Program 1: All channels
-  - Program 2: Single-channel Chase (1→2→3→4)
-  - Program 3: Group Chase A (1+4 ↔ 2+3)
-  - Program 4: Group Chase B (1+2 ↔ 3+4)
-- Reset button restores defaults  
-- Ready LED (GPIO17)  
-- OLED 128×32 UI  
-- Fast boot + logo splash (~2 seconds)  
-- Auto‑start on boot (systemd)  
-- Optional TUI mode  
-- Raspberry Pi OS Bookworm tested  
+### Hardware Interface
+- 128x64 SPI OLED display with live FFT visualization
+- 5 rotary encoders with push buttons for parameter control
+- Multi-page UI: HOME, PRE (presets), SET (settings), COLOR (DMX mode only)
+- 6 preset slots (3 built-in: LOW/MID/HIGH, 3 user-saveable)
+- Persistent settings saved to config file
+
+### Boot & Startup
+- 5-second splash screen on OLED at boot
+- Auto-start on power-up via systemd
+- Development mode toggle (`dmx-dev` command)
+- Fast boot optimizations
 
 ---
 
-## HARDWARE
+## Quick Start Guide
+
+This guide will take you from a blank SD card to a fully working DMX controller.
+
+### What You'll Need
+
 | Component | Purpose |
-|----------|----------|
-| Raspberry Pi 4 / 5 | Core computer |
-| HiFiBerry DAC+ADC | Audio I/O |
-| MCP3008 | Analog input |
-| 6× 10k Pots | Knobs |
-| 4‑way Rotary | Program selector |
-| Push Button | Reset |
-| LED + 330Ω | Ready indicator |
-| DMXKing UltraDMX Pro | DMX interface |
-| DMX fixture | Output |
+|-----------|---------|
+| Raspberry Pi 4 or 5 | Main computer |
+| HiFiBerry DAC+ADC (or USB audio interface) | Audio input |
+| MAX485 or similar RS485 transceiver | DMX output |
+| SPI OLED 128x64 (SSD1309) | Display |
+| 5x Rotary encoders with push buttons | Controls |
+| 3-pin or 5-pin XLR connector | DMX output |
+| DMX fixtures | Lights! |
 
 ---
 
-## WIRING (BCM numbering)
+## Step 1: Prepare the Raspberry Pi
 
-### MCP3008 (SPI0 CE0)
-```
-VDD, VREF → 3.3 V  
-AGND, DGND → GND  
-CLK  → BCM11  
-MOSI → BCM10  
-MISO → BCM9  
-CE0  → BCM8  
-CH0–CH5 → Potentiometers  
-```
+### 1.1 Flash the OS
 
-### ROTARY SWITCH
-```
-BCM21, BCM22, BCM23, BCM24 (all with pull‑ups)
+1. Download [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
+2. Flash **Raspberry Pi OS Bookworm (32-bit)** to your SD card
+3. In Imager settings, enable SSH and set your username/password
+4. Insert SD card and boot the Pi
 
-Truth table:
-(1,1,1,1) → Program 1  
-(1,1,0,0) → Program 2  
-(1,0,1,0) → Program 3  
-(0,1,1,0) → Program 4  
-```
+### 1.2 Initial System Setup
 
-### RESET BUTTON
-```
-BCM25 → Button → GND
-```
-
-### READY LED
-```
-BCM17 → 330Ω → LED → GND
-```
-
----
-
-## DEFAULT STARTUP VALUES
-```
-Center: 120 Hz  
-Q: 1.7  
-Threshold: 0.032  
-Cycles(N): 0 
-Decay: 50 ms  
-Brightness: 1.0  
-```
-
----
-
-# INSTALLATION GUIDE
-This guide is optimized for rebuilding a **new SD card** as quickly and reliably as possible.
-
----
-
-## 0. What the bootstrap script does
-
-`scripts/bootstrap_pi.sh` will:
-
-1. Update OS packages  
-2. Install Python, PortAudio, ALSA, OLA  
-3. Enable **SPI** and **I²C**  
-4. Configure **HiFiBerry DAC+ADC** overlay  
-5. Create `.venv` with system‑site packages  
-6. Enable + patch OLA → Universe 0  
-7. (Optional) Install + enable:  
-   - `oled_splash.service`  
-   - `pi-dmx.service`  
-
-Reboot required afterwards.
-
----
-
-## 1. Fresh Install on a Clean Pi
-
-Flash Raspberry Pi OS Bookworm (32‑bit) → enable SSH → boot → then run:
+SSH into your Pi and run:
 
 ```bash
 sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y git
+sudo apt install -y git python3 python3-venv python3-pip
 sudo reboot
 ```
 
 ---
 
-## 2. Clone the Repo & Run Bootstrap
+## Step 2: Clone and Install
+
+### 2.1 Clone the Repository
+
 ```bash
 cd ~
-git clone https://github.com/benjaminglasser/pi-dmx-controller.git
-cd ~/pi-dmx-controller
+git clone https://github.com/benjaminglasser/pi-dmx-controller-v2.git
+cd pi-dmx-controller-v2
+```
+
+### 2.2 Run the Bootstrap Script
+
+```bash
 bash scripts/bootstrap_pi.sh
 sudo reboot
 ```
 
----
+The bootstrap script will:
+- Install all required system packages
+- Enable SPI and I2C interfaces
+- Configure HiFiBerry DAC+ADC overlay (if using)
+- Create Python virtual environment
+- Install Python dependencies
+- Configure OLA for DMX output
 
-## 3. Manual Python Environment (Optional)
-```bash
-cd ~/pi-dmx-controller
-python3 -m venv .venv --system-site-packages
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+### 2.3 Install Startup Services
 
----
-
-## 4. Install & Enable Services
+After reboot, install the systemd services:
 
 ```bash
-cd ~/pi-dmx-controller
-
-sudo cp systemd/pi-dmx.service /etc/systemd/system/
-sudo cp systemd/oled_splash.service /etc/systemd/system/
-
-sudo systemctl daemon-reload
-sudo systemctl enable oled_splash.service
-sudo systemctl enable pi-dmx.service
-
-sudo systemctl start oled_splash.service
-sudo systemctl start pi-dmx.service
+cd ~/pi-dmx-controller-v2
+sudo scripts/install_services.sh
 ```
 
-Reboot → logo appears at 2s → “Starting…” animation → app UI.
+This installs:
+- **oled_splash.service** - Shows logo on OLED for 5 seconds at boot
+- **dmx_audio_react.service** - Main DMX controller (auto-starts after splash)
+- **dmx-dev** command - Toggle development mode
 
 ---
 
-## 5. Verify OLA & DMXKing
-```bash
-sudo systemctl start olad
-sleep 2
-ola_dev_info | grep -A2 DMXking
-```
+## Step 3: Hardware Wiring
 
-Expected:
+### Pin Reference (BCM Numbering)
+
+#### SPI OLED Display (128x64 SSD1309 on CE1)
+
+| OLED Pin | Pi GPIO | Pi Pin |
+|----------|---------|--------|
+| VCC | 3.3V | Pin 1 |
+| GND | GND | Pin 6 |
+| DIN (MOSI) | BCM 10 | Pin 19 |
+| CLK (SCLK) | BCM 11 | Pin 23 |
+| CS | BCM 7 (CE1) | Pin 26 |
+| DC | BCM 24 | Pin 18 |
+| RST | BCM 12 | Pin 32 |
+
+#### Rotary Encoders
+
+| Encoder | Function | CLK | DT | SW (Button) |
+|---------|----------|-----|-----|-------------|
+| Encoder 1 | Page Selection | BCM 5 | BCM 6 | BCM 13 |
+| Encoder 2 | Param A (Freq/Speed/Preset) | BCM 17 | BCM 27 | BCM 22 |
+| Encoder 3 | Param B (Thresh/Beats) | BCM 19 | BCM 26 | BCM 23 |
+| Encoder 4 | Param C (Release/Mode) | BCM 16 | BCM 20 | BCM 21 |
+| Encoder 5 | Brightness | BCM 4 | BCM 18 | BCM 8 |
+
+All encoder common pins connect to GND.
+
+#### Reset Button
+
+| Pin | Connection |
+|-----|------------|
+| BCM 25 | Button terminal 1 |
+| GND | Button terminal 2 |
+
+#### DMX Output (UART via RS485)
+
+| Pi GPIO | RS485 Module | Notes |
+|---------|--------------|-------|
+| BCM 14 (TXD) | DI (Data In) | UART TX |
+| BCM 15 (RXD) | RO (Receive Out) | Optional, not used |
+| 3.3V | VCC | Power |
+| GND | GND | Ground |
+| 3.3V | DE + RE | Tied high for TX-only mode |
+
+RS485 module output connects to DMX XLR:
+- **A (D+)** → XLR Pin 3 (Data+)
+- **B (D-)** → XLR Pin 2 (Data-)
+- **GND** → XLR Pin 1 (Ground)
+
+#### HiFiBerry DAC+ADC (if using)
+
+The HiFiBerry connects via the 40-pin GPIO header. No additional wiring needed - just stack it on the Pi.
+
+Add to `/boot/firmware/config.txt`:
 ```
-Device 10: DMXking.com – UltraDMX2 PRO
-  port 0, OUT, patched to universe 0
+dtparam=audio=off
+dtoverlay=hifiberry-dacplusadc
+dtparam=spi=on
 ```
 
 ---
 
-## 6. Quick DMX Test
+## Step 4: Configuration
+
+### 4.1 Audio Input
+
+The controller auto-detects audio input devices. Priority order:
+1. HiFiBerry DAC+ADC
+2. USB audio interfaces (Scarlett, etc.)
+3. Any device with input channels
+
+To force a specific device, set environment variables:
 ```bash
-ola_streaming_client --universe 0 --dmx 255,0,0,0
+export AUDIO_DEVICE=1
+export AUDIO_DEVICE_NAME="USB Audio"
 ```
 
-Turn off:
+### 4.2 DMX Backend
+
+Default is UART output. Options:
+
 ```bash
-ola_streaming_client --universe 0 --dmx 0,0,0,0
+# UART (RS485 transceiver) - Default
+export DMX_BACKEND=uart
+
+# No DMX output (testing)
+export DMX_BACKEND=null
 ```
 
----
+### 4.3 Development Mode (No Hardware)
 
-## 7. TUI Mode
-### aka How to Stop the Service, Edit Code, and Run Manually
+To run without hardware (for development/testing):
 
-### 1. Stop the running service
 ```bash
-sudo systemctl stop pi-dmx
-```
-
-### 2. Activate your virtualenv
- ```bash
-cd ~/pi-dmx-controller
-source .venv/bin/activate
- ```
-
-### 3. Run the app manually
-```bash
+export DEV_NO_HW=1
 python dmx_audio_react.py
 ```
-Press q to exit TUI.
 
-### 4. Restart autostart service
+---
+
+## Step 5: Usage
+
+### Boot Sequence
+
+1. Power on the Pi
+2. OLED shows splash logo for 5 seconds
+3. DMX controller starts automatically
+4. OLED shows FFT spectrum and controls
+
+### UI Pages
+
+Navigate pages with **Encoder 1** (turn to switch, press to confirm):
+
+| Page | Encoder 2 | Encoder 3 | Encoder 4 |
+|------|-----------|-----------|-----------|
+| **HOME** | Frequency (press: Q) | Threshold (press: Thresh Mode) | Release (press: Release Mode) |
+| **PRE** | Preset Select | Program Mode | Beat Cycles |
+| **SET** | Reset Defaults | Input Gain | Output Mode / Channel Count |
+| **COLOR** | Light Select | Hue/Temp | Saturation |
+
+**Encoder 5** always controls brightness.
+
+### Presets
+
+| Preset | Center Freq | Description |
+|--------|-------------|-------------|
+| LOW | 120 Hz | Bass/kick drums |
+| MID | 1000 Hz | Vocals/snare |
+| HIGH | 5000 Hz | Hi-hats/cymbals |
+| USR 1-3 | Custom | User-saveable slots |
+
+**Saving Presets:** Long-press Encoder 2 on the PRE page to save current settings to a USR slot.
+
+Each preset stores:
+- Center frequency
+- Q factor (bandwidth)
+- Threshold level
+- Release time
+- Threshold mode (fixed/adapt)
+- Release mode (fixed/react/bright/both/rand)
+
+### Release Modes
+
+| Mode | Behavior |
+|------|----------|
+| **fixed** | Constant release time from knob |
+| **react** | Release time varies with trigger speed |
+| **bright** | Brightness varies with signal level |
+| **both** | Both reactive release and brightness |
+| **rand** | Random release time each trigger |
+
+### Threshold Modes
+
+| Mode | Behavior |
+|------|----------|
+| **fixed** | Constant threshold from knob |
+| **adapt** | Threshold adapts to signal level |
+
+---
+
+## Development Mode
+
+### Enter Development Mode
+
+Stop the auto-starting service and prevent it from restarting:
+
 ```bash
-sudo systemctl start pi-dmx
+dmx-dev disable
 ```
 
-### 5. Disable autostart if needed
+This:
+- Stops the running DMX service
+- Creates a flag file that prevents auto-start on boot
+- Lets you run the script manually for development
+
+### Run Manually
+
 ```bash
-sudo systemctl disable pi-dmx
+cd ~/pi-dmx-controller-v2
+source .venv/bin/activate
+python dmx_audio_react.py
 ```
 
-### 6. Re-enable autostart when you’re done
+Press `q` to exit the TUI.
+
+### Exit Development Mode
+
+Re-enable auto-start:
+
 ```bash
-sudo systemctl enable pi-dmx
+dmx-dev enable
 ```
 
-### 7. Ensure OLED splash also autostarts (optional)
+The service will auto-start on next boot. To start immediately:
+
 ```bash
-sudo systemctl enable oled_splash.service
+sudo systemctl start dmx_audio_react.service
 ```
----
 
-## 8. New SD Card / Recovery Checklist
+### Check Status
+
 ```bash
-sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y git
-git clone https://github.com/benjaminglasser/pi-dmx-controller.git
-cd ~/pi-dmx-controller
-bash scripts/bootstrap_pi.sh
-sudo systemctl daemon-reload
-sudo systemctl enable oled_splash.service pi-dmx.service
-sudo reboot
+dmx-dev status
 ```
 
 ---
 
-# OLED SYSTEM
+## Service Management
 
-## 1. `oled_boot.service`
-```
-[Unit]
-Description=OLED Early Boot Logo
-DefaultDependencies=no
-After=dev-i2c-1.device
-Before=sysinit.target
+### Systemd Services
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /home/pi/pi-dmx-controller/utils/oled_boot.py
-TimeoutSec=8
+| Service | Purpose |
+|---------|---------|
+| `oled_splash.service` | Shows boot logo on OLED |
+| `dmx_audio_react.service` | Main DMX controller |
 
-[Install]
-WantedBy=sysinit.target
-```
+### Common Commands
 
----
+```bash
+# Check service status
+sudo systemctl status dmx_audio_react.service
 
-## 2. `oled_boot.py`
-Full script lives in `/utils/oled_boot.py`  
-Contains:
-- ultra‑fast I²C init  
-- logo display  
-- “Starting…” animation with pulse dot  
-- exits after HOLD period or once overwritten  
+# View logs
+sudo journalctl -u dmx_audio_react.service -f
 
----
+# Restart service
+sudo systemctl restart dmx_audio_react.service
 
-## 3. Boot Speed Optimizations
-You applied:
+# Stop service
+sudo systemctl stop dmx_audio_react.service
 
-- Removed:
-  ```
-  splash quiet plymouth.ignore-serial-consoles
-  ```
-- Disabled:
-  ```
-  NetworkManager-wait-online.service
-  avahi-daemon
-  bluetooth
-  ```
-- Validated fast device availability  
-- Total boot:
-  - OLED logo: ~2s  
-  - Controller live: ~8–10s  
+# Disable auto-start
+sudo systemctl disable dmx_audio_react.service
 
----
-
-# MAIN APP AUTOSTART
-
-## `pi-dmx.service`
-```
-[Unit]
-Description=Pi DMX Controller
-After=network-online.target sound.target olad.service
-Wants=network-online.target olad.service
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/pi-dmx-controller
-Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/pi/pi-dmx-controller/.venv/bin/python3 /home/pi/pi-dmx-controller/dmx_audio_react.py
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
+# Re-enable auto-start
+sudo systemctl enable dmx_audio_react.service
 ```
 
 ---
 
-# TROUBLESHOOTING
-| Problem | Fix |
-|--------|-----|
-| No OLED at boot | Check `oled_splash.service` |
-| Slow boot | Disable `wait-online` |
-| No DMX | Check `ola_dev_info` |
-| No audio | Verify HiFiBerry overlay |
-| Knobs jitter | Check wiring |
+## File Structure
+
+```
+pi-dmx-controller-v2/
+├── dmx_audio_react.py      # Main application
+├── requirements.txt        # Python dependencies
+├── .dmx_config            # Persistent settings (auto-created)
+├── assets/
+│   ├── csw.svg            # Boot splash logo (optional)
+│   ├── logo.jpg           # Fallback boot logo
+│   └── logo.BMP           # Alternative logo format
+├── config/
+│   └── firmware-config.snippet.txt  # /boot/firmware/config.txt additions
+├── docs/
+│   └── WIRING.md          # Detailed wiring guide
+├── scripts/
+│   ├── bootstrap_pi.sh    # Initial setup script
+│   ├── install_services.sh # Install systemd services
+│   ├── dmx-dev            # Development mode toggle
+│   └── verify_universe.sh # OLA/DMX verification
+├── systemd/
+│   ├── dmx_audio_react.service  # Main service definition
+│   └── oled_splash.service      # Boot splash service
+├── utils/
+│   └── oled_boot.py       # Boot splash screen script
+└── tests/
+    ├── hardware_test.py   # Hardware verification
+    ├── mcp3008_test.py    # ADC test (legacy)
+    └── vu_meter_test.py   # Audio level test
+```
 
 ---
 
-# LICENSE
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| No OLED display | Check SPI wiring, verify `dtparam=spi=on` in config.txt |
+| No audio input | Run `arecord -l` to list devices, check HiFiBerry overlay |
+| No DMX output | Check RS485 wiring, verify UART is enabled |
+| Service won't start | Check logs: `journalctl -u dmx_audio_react.service -n 50` |
+| Encoders not responding | Check GPIO wiring, verify pull-ups |
+| Boot splash missing | Check `csw.svg` or `logo.jpg` in assets folder |
+| "No suitable input device" | Connect audio interface or set `DEV_NO_HW=1` |
+
+### Verify Hardware
+
+```bash
+# Check SPI devices
+ls /dev/spidev*
+
+# Check I2C devices
+sudo i2cdetect -y 1
+
+# Check audio devices
+arecord -l
+
+# Check UART
+ls /dev/serial*
+
+# Test DMX output
+cd ~/pi-dmx-controller-v2
+source .venv/bin/activate
+python -c "from dmx_audio_react import *; dmx_send([255,0,0,0])"
+```
+
+---
+
+## Boot Speed Optimizations
+
+For fastest boot, add to `/boot/firmware/cmdline.txt`:
+```
+quiet loglevel=3
+```
+
+Disable unnecessary services:
+```bash
+sudo systemctl disable NetworkManager-wait-online.service
+sudo systemctl disable bluetooth
+sudo systemctl disable avahi-daemon
+```
+
+Expected boot times:
+- OLED logo appears: ~2-3 seconds
+- Controller fully running: ~8-10 seconds
+
+---
+
+## Custom Splash Screen
+
+To use your own boot splash:
+
+1. Create an SVG file sized for 128x32 pixels (or it will be scaled)
+2. Save as `assets/csw.svg`
+3. The system will use it automatically on next boot
+
+Supported formats: SVG (preferred), JPG, PNG, BMP
+
+---
+
+## Dependencies
+
+### System Packages
+- python3, python3-venv, python3-pip
+- alsa-utils, libportaudio2, portaudio19-dev
+- python3-pil, i2c-tools
+
+### Python Packages (requirements.txt)
+- numpy - DSP/math
+- sounddevice - Audio capture
+- RPi.GPIO, spidev, gpiozero - Hardware control
+- luma.oled, luma.core, pillow - OLED display
+- pyserial - UART DMX output
+- cairosvg - SVG splash screen support
+
+---
+
+## License
+
 MIT © 2025 Ben Glasser

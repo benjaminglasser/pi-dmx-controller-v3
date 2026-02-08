@@ -1,0 +1,40 @@
+#!/bin/bash
+# dmx-dev: Toggle development mode for DMX controller
+# When dev mode is enabled, the DMX service won't auto-start on boot
+
+DEV_MODE_FLAG="/tmp/dmx-dev-mode"
+
+case "$1" in
+    disable|off)
+        touch "$DEV_MODE_FLAG"
+        sudo systemctl stop dmx_audio_react.service 2>/dev/null || true
+        echo "Dev mode ENABLED - DMX autostart disabled"
+        echo "The DMX controller has been stopped."
+        echo "Run 'dmx-dev enable' to re-enable autostart."
+        ;;
+    enable|on)
+        rm -f "$DEV_MODE_FLAG"
+        echo "Dev mode DISABLED - DMX will autostart on next boot"
+        echo "To start the service now, run: sudo systemctl start dmx_audio_react.service"
+        ;;
+    status)
+        if [ -f "$DEV_MODE_FLAG" ]; then
+            echo "Dev mode: ENABLED (autostart disabled)"
+        else
+            echo "Dev mode: DISABLED (autostart enabled)"
+        fi
+        # Also show service status
+        echo ""
+        echo "Service status:"
+        systemctl is-active dmx_audio_react.service 2>/dev/null || echo "dmx_audio_react.service is not running"
+        ;;
+    *)
+        echo "Usage: dmx-dev {disable|enable|status}"
+        echo ""
+        echo "Commands:"
+        echo "  disable, off  - Stop DMX service and prevent autostart"
+        echo "  enable, on    - Allow DMX service to autostart on boot"
+        echo "  status        - Show current dev mode and service status"
+        exit 1
+        ;;
+esac

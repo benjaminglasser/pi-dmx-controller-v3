@@ -1,4 +1,3 @@
-
 [Unit]
 Description=DMX Audio Reactive Light Controller
 After=oled_splash.service network-online.target sound.target olad.service
@@ -6,10 +5,12 @@ Wants=oled_splash.service network-online.target olad.service
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/pi-dmx-controller
+User=benglasser
+WorkingDirectory=/home/benglasser/pi-dmx-controller-v2
 Environment=PYTHONUNBUFFERED=1 ENABLE_TUI=0
-ExecStart=/home/pi/pi-dmx-controller/.venv/bin/python /home/pi/pi-dmx-controller/dmx_audio_react.py --no-tui
+# Skip startup if dev mode flag exists
+ExecStartPre=/bin/sh -c '! test -f /tmp/dmx-dev-mode'
+ExecStart=/home/benglasser/pi-dmx-controller-v2/.venv/bin/python /home/benglasser/pi-dmx-controller-v2/dmx_audio_react.py --no-tui
 Restart=on-failure
 RestartSec=3
 AmbientCapabilities=CAP_SYS_NICE
