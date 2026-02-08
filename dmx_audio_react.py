@@ -70,12 +70,19 @@ except Exception:
 
 DEV_NO_HW = os.environ.get("DEV_NO_HW", "0").strip() == "1"
 
-DMX_BACKEND = os.environ.get("DMX_BACKEND", "null").strip().lower()  # Default to null until DMX hardware connected
+DMX_BACKEND = os.environ.get("DMX_BACKEND", "uart").strip().lower()  # Default to uart for RS485 transceiver
 DMX_UART_DEVICE = os.environ.get("DMX_UART_DEVICE", "/dev/serial0")
 DMX_UART_BAUD = 250000  # DMX: 250k 8N2
 
 UNIVERSE   = 0
-DMX_CHANS  = 4
+DMX_CHANS  = 24  # Max supported channels (actual count controlled by DMX_CHANNEL_COUNT)
+
+# DMX Output Mode: 0=Dimmer, 1=DMX (DMX mode disabled for now)
+DMX_OUTPUT_MODE = 0
+DMX_OUTPUT_MODES = ["Dimmer", "(DMX)"]  # DMX in parentheses = disabled/not yet implemented
+
+# DMX Channel Count (4-24, affects all preset patterns)
+DMX_CHANNEL_COUNT = 4
 
 # Startup defaults (used by "LOW" mode)
 DEFAULT_CENTER_HZ = 120.0   # 120 Hz
@@ -85,51 +92,217 @@ DEFAULT_ATTACK_MS = 10.0
 DEFAULT_DECAY_MS  = 542.0   # 10 on 0-99 scale ((542-40)/4960*99 = 10.02 → 10)
 DEFAULT_BRIGHT    = 0.5
 
-# Defaults modes: LOW, MID, HIGH target different frequency ranges
+# Defaults modes: LOW, MID, HIGH are built-in presets, USR 1-3 are user-saveable slots
 # Each mode has (center_hz, thresh, decay_ms, q) - Q varies by range
-DEFAULTS_MODES = ["LOW", "MID", "HIGH", "USR1", "USR2", "USR3"]
+# Q display mapping: 0 = narrow (Q=8), 99 = wide (Q=0.5), so display 96 ≈ Q=0.74
+DEFAULTS_MODES = ["LOW", "MID", "HIGH", "USR 1", "USR 2", "USR 3"]
 DEFAULTS_PRESETS = {
     #           (center_hz, thresh, decay_ms, q_factor)
-    "LOW":  (120.0,  0.61, 542.0, 2.0),    # Low frequencies ~120Hz, thresh=60
-    "MID":  (1000.0, 0.41, 542.0, 1.5),    # Mid frequencies ~1kHz, thresh=40
-    "HIGH": (5000.0, 0.25, 542.0, 1.0),    # High frequencies ~5kHz, thresh=25
-    "USR1": (120.0,  0.61, 542.0, 2.0),    # User preset 1 (not active yet)
-    "USR2": (120.0,  0.61, 542.0, 2.0),    # User preset 2 (not active yet)
-    "USR3": (120.0,  0.61, 542.0, 2.0),    # User preset 3 (not active yet)
+    "LOW":   (120.0,  0.40, 542.0, 2.0),    # Low frequencies ~120Hz, thresh=40
+    "MID":   (1000.0, 0.41, 542.0, 1.5),    # Mid frequencies ~1kHz, thresh=40
+    "HIGH":  (5000.0, 0.25, 542.0, 0.82),   # High frequencies ~5kHz, thresh=25, Q display=90
+    "USR 1": (1200.0, 0.40, 542.0, 0.65),   # User preset 1: 1.2kHz, Q display=99
+    "USR 2": (1200.0, 0.40, 542.0, 0.65),   # User preset 2: 1.2kHz, Q display=99
+    "USR 3": (1200.0, 0.40, 542.0, 0.65),   # User preset 3: 1.2kHz, Q display=99
 }
 
 # Config file for persisting settings
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dmx_config")
 
 def load_defaults_mode():
-    """Load the defaults mode from config file."""
+    """Load defaults mode, DMX output mode, channel count, and any custom preset values from config."""
+    global DEFAULTS_PRESETS, DMX_OUTPUT_MODE, DMX_CHANNEL_COUNT
+    mode_idx = 0
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 for line in f:
+                    line = line.strip()
                     if line.startswith("defaults_mode="):
-                        mode_name = line.strip().split("=")[1]
+                        mode_name = line.split("=")[1]
                         if mode_name in DEFAULTS_MODES:
-                            return DEFAULTS_MODES.index(mode_name)
+                            mode_idx = DEFAULTS_MODES.index(mode_name)
+                    elif line.startswith("dmx_output_mode="):
+                        output_mode = line.split("=")[1]
+                        if output_mode in DMX_OUTPUT_MODES:
+                            DMX_OUTPUT_MODE = DMX_OUTPUT_MODES.index(output_mode)
+                    elif line.startswith("dmx_channel_count="):
+                        try:
+                            count = int(line.split("=")[1])
+                            if 4 <= count <= 24:
+                                DMX_CHANNEL_COUNT = count
+                        except ValueError:
+                            pass
+                    elif "=" in line:
+                        # Parse preset override: LOW=120.0,0.40,542.0,2.0
+                        key, val = line.split("=", 1)
+                        if key in DEFAULTS_PRESETS:
+                            parts = val.split(",")
+                            if len(parts) == 4:
+                                DEFAULTS_PRESETS[key] = tuple(float(p) for p in parts)
     except Exception:
         pass
-    return 0  # Default to LOW
+    return mode_idx  # Default to LOW (0)
 
 def save_defaults_mode(idx):
-    """Save the defaults mode to config file."""
+    """Save the defaults mode to config file, preserving preset overrides, DMX output mode, and channel count."""
     try:
         mode_name = DEFAULTS_MODES[idx]
+        # Read existing preset overrides and DMX settings
+        preset_overrides = {}
+        dmx_output = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
+        channel_count = DMX_CHANNEL_COUNT
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("dmx_output_mode="):
+                        dmx_output = line.split("=")[1]
+                    elif line.startswith("dmx_channel_count="):
+                        try:
+                            channel_count = int(line.split("=")[1])
+                        except ValueError:
+                            pass
+                    elif "=" in line and not line.startswith("defaults_mode="):
+                        key, val = line.split("=", 1)
+                        if key in DEFAULTS_PRESETS:
+                            preset_overrides[key] = val
+        # Write back with updated mode
         with open(CONFIG_FILE, 'w') as f:
             f.write(f"defaults_mode={mode_name}\n")
+            f.write(f"dmx_output_mode={dmx_output}\n")
+            f.write(f"dmx_channel_count={channel_count}\n")
+            for key, val in preset_overrides.items():
+                f.write(f"{key}={val}\n")
+    except Exception:
+        pass
+
+def save_dmx_output_mode(mode_idx):
+    """Save the DMX output mode to config file, preserving other settings."""
+    try:
+        output_mode = DMX_OUTPUT_MODES[mode_idx]
+        # Read existing config
+        defaults_mode = "LOW"
+        channel_count = DMX_CHANNEL_COUNT
+        preset_overrides = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("defaults_mode="):
+                        defaults_mode = line.split("=")[1]
+                    elif line.startswith("dmx_channel_count="):
+                        try:
+                            channel_count = int(line.split("=")[1])
+                        except ValueError:
+                            pass
+                    elif "=" in line and not line.startswith("dmx_output_mode="):
+                        key, val = line.split("=", 1)
+                        if key in DEFAULTS_PRESETS:
+                            preset_overrides[key] = val
+        # Write back with updated DMX output mode
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(f"defaults_mode={defaults_mode}\n")
+            f.write(f"dmx_output_mode={output_mode}\n")
+            f.write(f"dmx_channel_count={channel_count}\n")
+            for key, val in preset_overrides.items():
+                f.write(f"{key}={val}\n")
+    except Exception:
+        pass
+
+def save_dmx_channel_count(count):
+    """Save the DMX channel count to config file, preserving other settings."""
+    try:
+        # Read existing config
+        defaults_mode = "LOW"
+        output_mode = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
+        preset_overrides = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("defaults_mode="):
+                        defaults_mode = line.split("=")[1]
+                    elif line.startswith("dmx_output_mode="):
+                        output_mode = line.split("=")[1]
+                    elif "=" in line and not line.startswith("dmx_channel_count="):
+                        key, val = line.split("=", 1)
+                        if key in DEFAULTS_PRESETS:
+                            preset_overrides[key] = val
+        # Write back with updated channel count
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(f"defaults_mode={defaults_mode}\n")
+            f.write(f"dmx_output_mode={output_mode}\n")
+            f.write(f"dmx_channel_count={count}\n")
+            for key, val in preset_overrides.items():
+                f.write(f"{key}={val}\n")
+    except Exception:
+        pass
+
+def save_preset_values(mode_name, center_hz, thresh, decay_ms, q):
+    """Save custom preset values to config file."""
+    try:
+        # Read existing config
+        defaults_mode = "LOW"
+        dmx_output = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
+        channel_count = DMX_CHANNEL_COUNT
+        preset_overrides = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("defaults_mode="):
+                        defaults_mode = line.split("=")[1]
+                    elif line.startswith("dmx_output_mode="):
+                        dmx_output = line.split("=")[1]
+                    elif line.startswith("dmx_channel_count="):
+                        try:
+                            channel_count = int(line.split("=")[1])
+                        except ValueError:
+                            pass
+                    elif "=" in line:
+                        key, val = line.split("=", 1)
+                        if key in DEFAULTS_PRESETS:
+                            preset_overrides[key] = val
+        # Update the preset override
+        preset_overrides[mode_name] = f"{center_hz},{thresh},{decay_ms},{q}"
+        # Write back
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(f"defaults_mode={defaults_mode}\n")
+            f.write(f"dmx_output_mode={dmx_output}\n")
+            f.write(f"dmx_channel_count={channel_count}\n")
+            for key, val in preset_overrides.items():
+                f.write(f"{key}={val}\n")
     except Exception:
         pass
 
 DEFAULTS_MODE_INDEX = load_defaults_mode()  # Load from config or default to LOW
 
-# Q factor range: 0.5 (very wide) to 8.0 (very narrow)
-# Display: 0 = narrow (Q=8), 99 = wide (Q=0.5)
-Q_MIN = 0.5   # Widest (display 99)
-Q_MAX = 8.0   # Narrowest (display 0)
+# Q factor range: frequency-dependent minimum to 8.0 (very narrow)
+# Display: 0 = narrow (Q=8), 99 = wide (Q varies for consistent visual width)
+# Q_MIN is calculated to give ~55 pixel visual width on the 128px log-scale FFT display
+Q_MIN_LOW = 0.1    # Q_MIN at 120Hz (gives ~54px visual width)
+Q_MIN_HIGH = 0.65  # Q_MIN for frequencies >= 500Hz (gives ~55px visual width)
+Q_MAX = 8.0        # Narrowest (display 0)
+
+def get_q_min(center_hz):
+    """Return the minimum Q value (widest bandwidth) for consistent visual width.
+    
+    Calculated to give ~55 pixel visual width on the 128px log-scale FFT display
+    regardless of center frequency. This ensures display 99 looks the same at all frequencies.
+    
+    Uses logarithmic interpolation between Q_MIN_LOW (at 120Hz) and Q_MIN_HIGH (at 500Hz+).
+    """
+    import math
+    if center_hz >= 500:
+        return Q_MIN_HIGH
+    elif center_hz <= 120:
+        return Q_MIN_LOW
+    else:
+        # Logarithmic interpolation between 120Hz and 500Hz
+        # This gives a smooth transition that maintains ~55px visual width
+        t = math.log(center_hz / 120.0) / math.log(500.0 / 120.0)
+        return Q_MIN_LOW + t * (Q_MIN_HIGH - Q_MIN_LOW)
 
 THRESH_MIN = 0.001
 THRESH_MAX = 1.0
@@ -150,7 +323,24 @@ AGC_TARGET    = 0.020
 REFRACTORY_MS = 110.0
 WEIGHTING_ON  = False
 INPUT_GAIN    = 1.0
+INPUT_VOLUME  = 50  # 0-99, maps to INPUT_GAIN 0.0-4.0 (25 = 1x, 50 = 2x, 99 = 4x)
 BRIGHTNESS    = DEFAULT_BRIGHT
+
+# Threshold detection modes
+THRESH_MODES = ["fixed", "adapt"]
+THRESH_MODE_INDEX = 0  # Default to fixed threshold (current behavior)
+_recent_min = 1.0           # Tracks recent minimum for adaptive mode
+_effective_thresh = 0.3     # Effective threshold for display (varies by mode)
+
+# Release modes
+RELEASE_MODES = ["fixed", "react", "bright", "rand"]
+RELEASE_MODE_INDEX = 0  # Default to fixed (current behavior)
+_reactive_brightness_scale = 1.0  # For bright mode: scales brightness by level above threshold
+_effective_release_display = 0  # For displaying reactive release values (0-99)
+_effective_brightness_display = 50  # For displaying reactive brightness (0-99, 50 = default)
+_brightness_knob_last_turn = 0.0  # Timestamp of last brightness knob turn
+_release_knob_last_turn = 0.0  # Timestamp of last release knob turn
+REACTIVE_BUFFER_SECONDS = 2.0  # Seconds to wait after knob turn before reactivity kicks in
 
 # Program state
 PROGRAM      = 1
@@ -206,14 +396,42 @@ OLED_HEIGHT  = 64
 
 # ===================== Page System =====================
 
-PAGES = ["HOME", "ADV", "PRE", "COLOR", "SET"]
+# All available pages (COLOR comes after SET, only shown in DMX mode)
+_ALL_PAGES = ["HOME", "PRE", "SET", "COLOR"]
+_DIMMER_PAGES = ["HOME", "PRE", "SET"]  # No COLOR page for dimmer mode
+_MAX_PAGES = 4  # Always reserve space for 4 pages for consistent icon spacing
+
+def get_pages():
+    """Get available pages based on DMX output mode. COLOR page only available in DMX mode."""
+    if DMX_OUTPUT_MODE == 1:  # DMX mode
+        return _ALL_PAGES
+    return _DIMMER_PAGES
+
+# For backward compatibility, PAGES is now a function call
+PAGES = _DIMMER_PAGES  # Default, will be updated dynamically
+
 PAGE_POT_LABELS = {
     "HOME": ["Freq", "Thresh", "Rels"],      # Freq center, Threshold, Release
     "ADV": ["Q", "ThPre", "RelMd"],           # Q, Threshold Preset, Release Mode
-    "PRE": ["Preset", "Beats", "Mode"],       # Preset selection, Beat cycles, Cycle mode
+    "PRE": ["Preset", "Mode", "Beats"],       # Preset selection, Cycle mode, Beat cycles
     "COLOR": ["Light", "HSV", "Sat"],         # Light select, HSV, Saturation
-    "SET": ["Dflt", "--", "--"],              # Defaults mode, TBD, TBD
+    "SET": ["Reset", "Gain", "Setup"],        # Reset defaults, Input Gain, DMX Output Mode
 }
+
+# HOME page encoder toggle states (False = primary, True = alternate)
+_home_enc2_alt = False  # False = Freq, True = Q
+_home_enc3_alt = False  # False = Thresh, True = ThreshMode
+_home_enc4_alt = False  # False = Release, True = ReleaseMode
+
+# SET page encoder 4 toggle state (False = Output mode, True = Channel count)
+_setup_enc4_channels = False  # False = Dimmer/DMX mode, True = Channel count (4-24)
+
+# COLOR page state
+_color_light_selection = 0  # 0=all, 1=odd, 2=even, 3+=individual light (1-indexed)
+_color_hue = 50            # 0-99 hue value (maps to 0-360 degrees)
+_color_saturation = 99     # 0-99 saturation (0=white, 99=full color)
+_color_temperature = 50    # 0-99 temperature (0=cool white, 99=warm white)
+_color_enc3_temp_mode = False  # False=Hue mode, True=Temperature mode
 
 # Page icons - pixel art as coordinate lists (drawn in 9x9 space)
 PAGE_ICONS = {
@@ -264,7 +482,13 @@ PAGE_ICONS = {
 current_page = 0  # Index into PAGES
 
 # Program names for display
-PROGRAM_NAMES = ["ALL", "1+2/3+4", "1+3/2+4", "CHASE", "RANDOM", "AMBIENT"]
+# Program 1: ALL - all channels trigger together
+# Program 2: CHASE - sequential single channel cycling through all channels
+# Program 3: GROUPS - first half of channels alternate with second half
+# Program 4: ODD/EVEN - odd channels (1,3,5...) alternate with even (2,4,6...)
+# Program 5: RANDOM - random channel each trigger
+# Program 6: AMBIENT - non-audio-reactive random fading
+PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "ODD/EVEN", "RANDOM", "AMBIENT"]
 
 # ===================== FFT Display =====================
 
@@ -336,6 +560,19 @@ _enc_last_click_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time of last click per encod
 _enc_prev_click_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time of previous click (for velocity calc)
 _enc_velocity = [0.0, 0.0, 0.0, 0.0, 0.0]  # Smoothed velocity (clicks/sec) per encoder
 
+# Debounce timers for discrete controls (presets, modes, etc.)
+# These controls need one change per physical detent, not velocity-based
+_discrete_last_change = [0.0, 0.0, 0.0, 0.0, 0.0]  # Last change time per encoder
+DISCRETE_DEBOUNCE_MS = 120  # Minimum ms between discrete value changes
+
+# Long-press state for encoder 2 (save defaults on SET page)
+_enc2_press_time = 0.0       # When button was pressed
+_enc2_saving = False         # True while in 3-second hold on SET page
+_enc2_save_complete = 0.0    # Timestamp when save completed (for "Saved" display)
+
+# Preset toggle state for encoder 2 on PRE page (toggle to/from ambient)
+_last_preset_before_ambient = 1  # Stores the preset to return to when toggling from ambient
+
 # Simple velocity parameters - just max multiplier per parameter type
 # Velocity is calculated as clicks-per-second, then mapped logarithmically
 VELOCITY_MAX_FREQ = 25        # Frequency: large range, high acceleration
@@ -362,7 +599,7 @@ _display_thresh = DEFAULT_THRESH
 _display_q = DEFAULT_Q
 _display_bright = DEFAULT_BRIGHT
 _display_release = int((DEFAULT_DECAY_MS - 40.0) / 4960.0 * 99)  # Release display value
-_display_q_pct = round((Q_MAX - DEFAULT_Q) / (Q_MAX - Q_MIN) * 99)  # Q display value (0-99)
+_display_q_pct = 50  # Q display value (0-99), will be recalculated dynamically
 
 # DMX throttling
 DMX_RATE_HZ       = 25.0
@@ -394,26 +631,32 @@ def _set_run(val: bool):
 
 # ===================== Cycle logic =====================
 
-# Beat cycle options: 0 = off, then 4, 8, 16, 32, 64, 128, 256, 512
-CYCLE_STEPS_OPTIONS = [0, 4, 8, 16, 32, 64, 128, 256, 512]
+# Beat cycle options: 4, 8, 16, 32, 64, 128, 256, 512, 1024
+CYCLE_STEPS_OPTIONS = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
 CYCLE_STEPS         = 0
 CYCLE_TRIGGER_COUNT = 0
 CYCLE_PHASE         = 0
-CYCLE_STEPS_INDEX   = 0  # Index into CYCLE_STEPS_OPTIONS (0 = off)
+CYCLE_STEPS_INDEX   = 0  # Index into CYCLE_STEPS_OPTIONS (default 4)
+CYCLE_AMBIENT_START = 0  # Timestamp when ambient phase started (for rnd/amb mode)
 
-# Cycles between modes
-CYCLES_BETWEEN_MODES = ["x+1"]  # For now just one mode
-CYCLES_BETWEEN_INDEX = 0
+# Cycles between modes: off disables cycling, random/x+1/rnd/amb enable it
+CYCLES_BETWEEN_MODES = ["off", "random", "x+1", "rnd/amb"]
+CYCLES_BETWEEN_INDEX = 0  # Start with mode off
 
 # Number of presets (can be expanded later)
 NUM_PRESETS = 6
 
 def program_pair_for_base(base: int):
-    """Get the pair of programs for cycling: current and next (wrapping)."""
+    """Get the pair of programs for cycling: current and next (wrapping, excluding AMBIENT)."""
     # base is 1-indexed (1 to NUM_PRESETS)
     # Returns (current, next) where next wraps around
-    next_prog = (base % NUM_PRESETS) + 1  # 1->2, 2->3, 3->4, 4->1
-    return (base, next_prog)
+    # Note: AMBIENT (6) should never reach here since beats are disabled for it
+    if base == 6:  # AMBIENT - no cycling (fallback)
+        return (base, base)
+    elif base == 5:  # RANDOM wraps to ALL
+        return (base, 1)
+    else:  # 1-4 cycle to next
+        return (base, base + 1)
 
 def set_cycle_steps(steps: int):
     global CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE
@@ -459,9 +702,6 @@ class UartDmx(DmxBackendBase):
         )
         print(f"[DMX] Backend: uart ({device}) @ {DMX_UART_BAUD} 8N2")
 
-        self._buf = bytearray(1 + DMX_CHANS)
-        self._buf[0] = 0x00
-
     def _send_break(self):
         try:
             self.serial.baudrate = 9600
@@ -472,10 +712,13 @@ class UartDmx(DmxBackendBase):
             self.serial.baudrate = DMX_UART_BAUD
 
     def send(self, vals):
-        for i in range(DMX_CHANS):
-            self._buf[1 + i] = max(0, min(255, int(vals[i])))
+        # Build buffer dynamically based on vals length
+        buf = bytearray(1 + len(vals))
+        buf[0] = 0x00  # DMX start code
+        for i, v in enumerate(vals):
+            buf[1 + i] = max(0, min(255, int(v)))
         self._send_break()
-        self.serial.write(self._buf)
+        self.serial.write(buf)
 
     def close(self):
         try:
@@ -496,7 +739,8 @@ _dmx_lock      = threading.Lock()
 def send_dmx(vals):
     global _dmx_dirty
     with _dmx_lock:
-        for i in range(DMX_CHANS):
+        # Only copy the values we have (DMX_CHANNEL_COUNT)
+        for i in range(min(len(vals), DMX_CHANS)):
             _pending_vals[i] = max(0, min(255, int(vals[i])))
         _dmx_dirty = True
 
@@ -515,14 +759,17 @@ def dmx_sender_loop(dmx_backend: DmxBackendBase):
                     _last_dmx_send = now
             if do_send and vals is not None:
                 try:
-                    dmx_backend.send(vals)
+                    # Send only the configured number of channels
+                    dmx_backend.send(vals[:DMX_CHANNEL_COUNT])
                 except Exception as e:
                     APP_STATE = "error"
                     APP_ERROR = f"DMX send failed: {e}"
             time.sleep(0.002)
     finally:
         try:
-            dmx_backend.send([0] * DMX_CHANS)
+            # Send zeros on shutdown for configured channels
+            shutdown_vals = [0] * DMX_CHANNEL_COUNT
+            dmx_backend.send(shutdown_vals)
             time.sleep(0.05)
         except Exception:
             pass
@@ -530,6 +777,27 @@ def dmx_sender_loop(dmx_backend: DmxBackendBase):
             dmx_backend.close()
         except Exception:
             pass
+
+# ===================== Color Conversion =====================
+
+import colorsys
+
+def hsv_to_rgb(h, s, v):
+    """Convert HSV (0-1 range) to RGB (0-255 range)."""
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+def temp_to_rgb(temp, brightness=1.0):
+    """Convert color temperature (0-99) to RGB.
+    0=cool white (blueish), 99=warm white (orangeish)."""
+    # Map 0-99 to approximate color temperature range
+    # Cool white: more blue, less red
+    # Warm white: more red/yellow, less blue
+    t = temp / 99.0
+    r = int(255 * brightness * (0.8 + 0.2 * t))
+    g = int(255 * brightness * (0.85 + 0.1 * t - 0.05 * t * t))
+    b = int(255 * brightness * (1.0 - 0.4 * t))
+    return min(255, r), min(255, g), min(255, b)
 
 # ===================== Light envelopes =====================
 
@@ -566,11 +834,85 @@ def trigger_idxs(idxs, attack_ms, decay_ms):
     _runtime['attack_ms'] = attack_ms
     _runtime['decay_ms']  = decay_ms
 
+def _get_color_page_dmx_values():
+    """Generate DMX values for COLOR page direct control.
+    Each DMX channel is treated as an individual light/dimmer.
+    The brightness value is derived from HSV (hue + saturation -> grayscale intensity)
+    or from temperature mode."""
+    vals = [0] * DMX_CHANNEL_COUNT
+    
+    # Calculate brightness value for the channel(s)
+    # In color mode, we convert HSV to a single brightness value
+    # (since each channel is a single dimmer, not RGB)
+    if _color_enc3_temp_mode:
+        # Temperature mode: map 0-99 to brightness with slight warm/cool tint effect
+        # For single-channel dimmers, just use brightness directly
+        brightness_val = int(255 * BRIGHTNESS)
+    else:
+        # Hue mode: convert HSV to a brightness value
+        # Use full value (V=1) and let BRIGHTNESS control the output
+        h = _color_hue / 99.0
+        s = _color_saturation / 99.0
+        r, g, b = hsv_to_rgb(h, s, 1.0)
+        # Convert RGB to perceived brightness (luminance)
+        # Using standard luminance formula
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+        brightness_val = int(255 * luminance * BRIGHTNESS)
+    
+    # Apply to selected channels
+    for ch_idx in range(DMX_CHANNEL_COUNT):
+        apply = False
+        if _color_light_selection == 0:  # all
+            apply = True
+        elif _color_light_selection == 1:  # odd (1, 3, 5...)
+            apply = (ch_idx % 2 == 0)  # 0-indexed, so 0=ch1, 2=ch3
+        elif _color_light_selection == 2:  # even (2, 4, 6...)
+            apply = (ch_idx % 2 == 1)
+        else:  # specific channel (1-indexed in UI)
+            apply = (ch_idx == _color_light_selection - 3)
+        
+        if apply:
+            vals[ch_idx] = brightness_val
+    
+    return vals
+
 def update_lights(dt_ms):
+    global _reactive_brightness_scale, _effective_brightness_display, _effective_release_display
+    
+    # Check if COLOR page is active - use direct color control
+    pages = get_pages()
+    if len(pages) > current_page and pages[current_page] == "COLOR":
+        return _get_color_page_dmx_values()
+    
     a = max(1e-3, _runtime['attack_ms'])
     d = max(1e-3, _runtime['decay_ms'])
     vals = []
-    for s in states:
+    # Only process configured channels (DMX_CHANNEL_COUNT)
+    release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+    
+    # Calculate base release display value
+    base_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
+    base_release_display = max(0, min(99, base_release_display))
+    
+    # Calculate base brightness display value
+    base_brightness_display = int(BRIGHTNESS * 99)
+    
+    if release_mode == "bright":
+        # Bright mode: use the reactive brightness scale (set on each trigger, stays until next)
+        effective_brightness = _reactive_brightness_scale
+    else:
+        effective_brightness = BRIGHTNESS
+        # Reset reactive brightness to base when not in bright mode
+        _reactive_brightness_scale = BRIGHTNESS
+        _effective_brightness_display = base_brightness_display
+    
+    # React and rand modes: keep their values until next trigger
+    # Only reset display when switching away from these modes
+    if release_mode not in ("react", "rand"):
+        _effective_release_display = base_release_display
+    
+    for i in range(DMX_CHANNEL_COUNT):
+        s = states[i]
         if s.active:
             if s.t_ms < a:
                 s.env = min(1.0, s.env + dt_ms/a)
@@ -582,41 +924,66 @@ def update_lights(dt_ms):
         else:
             s.env = max(0.0, s.env - dt_ms/d)
         s.post = POST_EMA*s.env + (1.0-POST_EMA)*s.post
-        vals.append(int(255 * s.post * BRIGHTNESS))
+        vals.append(int(255 * s.post * effective_brightness))
     return vals
 
 def update_ambient_mode(dt_ms):
-    """Update ambient mode - non-audio-reactive random fading."""
+    """Update ambient mode - non-audio-reactive sequential fading.
+    
+    Strictly 1-2 channels on at a time. One channel fades in while another
+    fades out, creating a smooth rotation through all configured outputs.
+    """
     global ambient_targets, ambient_current, ambient_last_change
-    global ambient_speed, ambient_fade_time
+    global ambient_speed, ambient_fade_time, _ambient_next_time
     
     now = time.time()
     dt_sec = dt_ms / 1000.0
     
-    # Get speed and fade time from pots (when in ambient mode)
-    # Speed: 0.2x to 5x (controlled by what would be Freq pot)
-    # Fade time: 0.5s to 10s (controlled by what would be Release pot)
+    # Fade rate for both in and out
+    fade_rate = dt_sec / max(0.1, ambient_fade_time)
     
-    for i in range(4):
-        # Check if it's time to pick a new target for this channel
-        time_since_change = now - ambient_last_change[i]
-        # Random interval based on speed: faster speed = shorter intervals
-        interval = (2.0 + random.random() * 3.0) / ambient_speed
+    # Count channels that are on or turning on (current > 0.1 OR target == 1)
+    # Only consider configured channels (0 to DMX_CHANNEL_COUNT-1)
+    on_channels = [i for i in range(DMX_CHANNEL_COUNT) if ambient_current[i] > 0.1 or ambient_targets[i] == 1.0]
+    off_channels = [i for i in range(DMX_CHANNEL_COUNT) if ambient_current[i] < 0.05 and ambient_targets[i] == 0.0]
+    
+    # Time to switch?
+    if now >= _ambient_next_time:
+        # If we have 2+ channels on, fade one out
+        if len(on_channels) >= 2:
+            # Pick the one that's been on longest (earliest last_change time)
+            # This ensures fair rotation - the channel that started fading in first gets faded out first
+            on_channels_sorted = sorted(on_channels, key=lambda i: ambient_last_change[i])
+            ambient_targets[on_channels_sorted[0]] = 0.0
         
-        if time_since_change > interval:
-            # Pick a new random target (0.0 to 1.0)
-            ambient_targets[i] = random.random()
-            ambient_last_change[i] = now
+        # If we have less than 2 on and there are off channels, turn one on
+        if len(on_channels) < 2 and off_channels:
+            new_ch = random.choice(off_channels)
+            ambient_targets[new_ch] = 1.0
+            ambient_last_change[new_ch] = now  # Track when this channel started
         
-        # Smoothly fade current toward target
+        # If nothing is on at all, start one
+        if not on_channels:
+            new_ch = random.randint(0, DMX_CHANNEL_COUNT - 1)
+            ambient_targets[new_ch] = 1.0
+            ambient_last_change[new_ch] = now  # Track when this channel started
+        
+        # Schedule next switch - speed controls interval
+        base_interval = 0.5 + random.random() * 1.0  # 0.5-1.5 sec base
+        _ambient_next_time = now + (base_interval / ambient_speed)
+    
+    # Update all configured channels - fade toward targets
+    for i in range(DMX_CHANNEL_COUNT):
         diff = ambient_targets[i] - ambient_current[i]
-        fade_rate = dt_sec / max(0.1, ambient_fade_time)
+        
         if abs(diff) < fade_rate:
             ambient_current[i] = ambient_targets[i]
         else:
             ambient_current[i] += fade_rate if diff > 0 else -fade_rate
         
-        # Apply to state (bypass normal trigger system)
+        ambient_current[i] = max(0.0, min(1.0, ambient_current[i]))
+        
+        # Apply to state
         states[i].env = ambient_current[i]
         states[i].post = ambient_current[i]
 
@@ -633,7 +1000,8 @@ class BiquadBandpass:
         self.x1=self.x2=self.y1=self.y2=0.0
     def set_params(self, center_hz, q):
         self.center = max(MIN_CENTER_HZ, min(MAX_CENTER_HZ, float(center_hz)))
-        self.q      = max(0.3,           min(12.0,          float(q)))
+        q_min = get_q_min(self.center)
+        self.q      = max(q_min,         min(Q_MAX,         float(q)))
         self._design()
     def _design(self):
         w0 = 2.0*math.pi*self.center/self.sr
@@ -725,10 +1093,14 @@ DEVICE_INDEX, DEVICE_NAME = choose_input_device()
 
 def update_encoders():
     """Apply encoder deltas based on current page and handle brightness.
-    Uses per-parameter velocity sensitivity for acceleration."""
-    global BRIGHTNESS, BASE_PROGRAM, CYCLES_BETWEEN_INDEX
+    Uses per-parameter velocity sensitivity for acceleration.
+    Discrete controls (presets, modes) use debouncing for precise single-detent changes."""
+    global BRIGHTNESS, BASE_PROGRAM, CYCLES_BETWEEN_INDEX, THRESH_MODE_INDEX
     global ambient_speed, ambient_fade_time, DEFAULTS_MODE_INDEX
     global _enc_delta, _brightness_target, _brightness_fading
+    global _discrete_last_change
+    global current_page, encoder1_value
+    global RELEASE_MODE_INDEX
     
     if DEV_NO_HW:
         return
@@ -742,12 +1114,21 @@ def update_encoders():
     _enc_delta = [0, 0, 0, 0, 0]
     
     # Handle brightness encoder (Encoder 5) with its own velocity
+    # Direct update (no lerp) when turning - lerp only on click toggle
     if brightness_raw != 0 and not _brightness_off:
+        base_delta = 1 if brightness_raw > 0 else -1
         mult = _calc_velocity_multiplier(4, VELOCITY_MAX_BRIGHTNESS)
-        delta = brightness_raw * mult
-        # Small range (0-100%), ~0.3% per slow click
-        _brightness_target = max(0.0, min(0.99, _brightness_target + delta * 0.003))
-        _brightness_fading = True
+        delta = base_delta * mult
+        # Small range (0-100%), ~1% per slow click
+        BRIGHTNESS = max(0.0, min(0.99, BRIGHTNESS + delta * 0.01))
+        _brightness_target = BRIGHTNESS  # Keep target in sync
+        # In bright mode, snap reactive brightness back to base when knob is turned
+        # and set buffer timestamp to delay reactivity
+        global _reactive_brightness_scale, _effective_brightness_display, _brightness_knob_last_turn
+        if RELEASE_MODES[RELEASE_MODE_INDEX] == "bright":
+            _reactive_brightness_scale = BRIGHTNESS
+            _effective_brightness_display = int(BRIGHTNESS * 99)
+            _brightness_knob_last_turn = time.time()
     
     # Animate brightness fade
     if _brightness_fading:
@@ -759,99 +1140,263 @@ def update_encoders():
             BRIGHTNESS += BRIGHTNESS_FADE_SPEED if diff > 0 else -BRIGHTNESS_FADE_SPEED
     
     # Update parameters based on current page using encoder deltas with per-param velocity
-    page_name = PAGES[current_page]
+    pages = get_pages()
+    page_name = pages[current_page]
     
     if page_name == "HOME":
         # Check if we're in AMBIENT mode (preset 6) - different encoder behavior
         if BASE_PROGRAM == 6:
             # AMBIENT mode: Enc A = Speed, Enc B = nothing, Enc C = Fade time
             if raw_deltas[0] != 0:
+                global _ambient_next_time
+                base_delta = 1 if raw_deltas[0] > 0 else -1
                 mult = _calc_velocity_multiplier(1, VELOCITY_MAX_AMBIENT)
-                delta = raw_deltas[0] * mult
-                # Small range (0.2-5.0), fine control: 0.05x per slow click
-                ambient_speed = max(0.2, min(5.0, ambient_speed + delta * 0.05))
+                delta = base_delta * mult
+                # Range (0.2-8.0), fine control: 0.02x per slow click (~390 steps)
+                ambient_speed = max(0.2, min(8.0, ambient_speed + delta * 0.02))
+                # Reset timer so new speed takes effect immediately
+                _ambient_next_time = 0.0
             if raw_deltas[2] != 0:
+                base_delta = 1 if raw_deltas[2] > 0 else -1
                 mult = _calc_velocity_multiplier(3, VELOCITY_MAX_AMBIENT)
-                delta = raw_deltas[2] * mult
-                # Small range (0.5-10s), fine control: 0.1s per slow click
-                ambient_fade_time = max(0.5, min(10.0, ambient_fade_time + delta * 0.1))
+                delta = base_delta * mult
+                # Range (0.1-10s), fine control: 0.05s per slow click (~200 steps)
+                ambient_fade_time = max(0.1, min(10.0, ambient_fade_time + delta * 0.05))
         else:
             # Normal audio-reactive mode
-            # Enc A: Center frequency (log scale) - multiply/divide by factor per click
+            # Enc A: Center frequency OR Q (toggle with click)
             if raw_deltas[0] != 0:
-                mult = _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ)
-                delta = raw_deltas[0] * mult
-                # Large range (20Hz-20kHz), ~0.8% per slow click
-                factor = 1.008 ** delta
-                new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
-                print(f"[FREQ] delta={delta} mult={mult} factor={factor:.3f} {band.center:.0f}Hz -> {new_center:.0f}Hz")
-                band.center = new_center
-            # Enc B: Threshold (0-1, display 0-99)
+                # Clamp base delta to ±1, velocity multiplier handles acceleration
+                base_delta = 1 if raw_deltas[0] > 0 else -1
+                if _home_enc2_alt:
+                    # Q mode: Q factor - logarithmic scaling for perceptual linearity
+                    mult = _calc_velocity_multiplier(1, VELOCITY_MAX_Q)
+                    delta = base_delta * mult
+                    # Use logarithmic scaling: ~2% change per click for consistent feel across range
+                    # Negative delta = CW rotation = decrease Q (wider)
+                    factor = 1.02 ** (-delta)
+                    q_min = get_q_min(band.center)
+                    band.q = max(q_min, min(Q_MAX, band.q * factor))
+                else:
+                    # Freq mode: Center frequency (log scale)
+                    mult = _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ)
+                    delta = base_delta * mult
+                    # Large range (20Hz-20kHz), ~0.8% per slow click
+                    factor = 1.008 ** delta
+                    new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
+                    print(f"[FREQ] delta={delta} mult={mult} factor={factor:.3f} {band.center:.0f}Hz -> {new_center:.0f}Hz")
+                    band.center = new_center
+            # Enc B: Threshold OR ThreshMode (toggle with click)
             if raw_deltas[1] != 0:
-                mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
-                delta = raw_deltas[1] * mult
-                # Medium range (0-99), ~0.3 display unit per slow click
-                band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.003))
-            # Enc C: Release/Decay (40-5000ms, display 0-99)
+                if _home_enc3_alt:
+                    # ThreshMode: cycle through threshold detection modes
+                    now = time.time()
+                    elapsed_ms = (now - _discrete_last_change[2]) * 1000
+                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                        delta = 1 if raw_deltas[1] > 0 else -1
+                        new_idx = max(0, min(len(THRESH_MODES) - 1, THRESH_MODE_INDEX + delta))
+                        if new_idx != THRESH_MODE_INDEX:
+                            THRESH_MODE_INDEX = new_idx
+                            _discrete_last_change[2] = now
+                else:
+                    # Threshold mode: (0-1, display 0-99)
+                    # Clamp base delta to ±1, velocity multiplier handles acceleration
+                    base_delta = 1 if raw_deltas[1] > 0 else -1
+                    mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
+                    delta = base_delta * mult
+                    # Medium range (0-99), ~1 display unit per slow click
+                    band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
+            # Enc C: Release/Decay OR ReleaseMode (toggle with click)
             if raw_deltas[2] != 0:
-                mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY)
-                delta = raw_deltas[2] * mult
-                # Medium range, ~0.3 display unit per slow click (15ms step)
-                band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 15.0))
+                if _home_enc4_alt:
+                    # ReleaseMode: cycle through release modes (clamped, not wrapping)
+                    now = time.time()
+                    elapsed_ms = (now - _discrete_last_change[3]) * 1000
+                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                        delta = 1 if raw_deltas[2] > 0 else -1
+                        new_idx = max(0, min(len(RELEASE_MODES) - 1, RELEASE_MODE_INDEX + delta))
+                        if new_idx != RELEASE_MODE_INDEX:
+                            RELEASE_MODE_INDEX = new_idx
+                            _discrete_last_change[3] = now
+                else:
+                    # Release mode: (40-5000ms, display 0-99)
+                    # Clamp base delta to ±1, velocity multiplier handles acceleration
+                    base_delta = 1 if raw_deltas[2] > 0 else -1
+                    mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY)
+                    delta = base_delta * mult
+                    # Medium range, ~1 display unit per slow click (50ms step)
+                    band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
+                    # In react/rand mode, snap effective release back to base when knob is turned
+                    global _effective_release_display
+                    release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+                    if release_mode in ("react", "rand"):
+                        _effective_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
+                        _effective_release_display = max(0, min(99, _effective_release_display))
                 
     elif page_name == "ADV":
-        # Enc A: Q factor (0.5 to 8.0, display 0-99 inverted)
+        # Enc A: Q factor (display 0-99 inverted) - logarithmic scaling
         if raw_deltas[0] != 0:
+            base_delta = 1 if raw_deltas[0] > 0 else -1
             mult = _calc_velocity_multiplier(1, VELOCITY_MAX_Q)
-            delta = raw_deltas[0] * mult
-            # Medium range (0-99), ~0.3 display unit per slow click
-            band.q = max(Q_MIN, min(Q_MAX, band.q - delta * 0.025))
+            delta = base_delta * mult
+            # Use logarithmic scaling: ~6% change per click (3x HOME page) for consistent feel
+            # Negative delta = CW rotation = decrease Q (wider)
+            factor = 1.06 ** (-delta)
+            q_min = get_q_min(band.center)
+            band.q = max(q_min, min(Q_MAX, band.q * factor))
         # Enc C: Decay (40-5000ms, display 0-99)
         if raw_deltas[2] != 0:
+            base_delta = 1 if raw_deltas[2] > 0 else -1
             mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY)
-            delta = raw_deltas[2] * mult
+            delta = base_delta * mult
             # Medium range, ~1 display unit per slow click (50ms step)
             band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
             
     elif page_name == "PRE":
-        # Enc A: Preset selection (1-6) - NO acceleration, always 1 at a time
+        # Enc A: Preset selection (1-6) - debounced discrete control
         if raw_deltas[0] != 0:
-            mult = _calc_velocity_multiplier(1, VELOCITY_MAX_PRESET)
-            delta = raw_deltas[0] * mult
-            new_preset = max(1, min(NUM_PRESETS, BASE_PROGRAM + delta))
-            if new_preset != BASE_PROGRAM:
-                BASE_PROGRAM = new_preset
-                ui_flash(f"Preset: {PROGRAM_NAMES[new_preset-1]}", 0.8)
-        # Enc B: Beat Cycles index (0-8) - NO acceleration
+            now = time.time()
+            elapsed_ms = (now - _discrete_last_change[1]) * 1000
+            # #region agent log
+            open('/home/benglasser/.cursor/debug.log','a').write('{"hypothesisId":"H2","location":"update_enc:preset","message":"PRESET_RAW_DELTA","data":{"raw_delta":'+str(raw_deltas[0])+',"current_preset":'+str(BASE_PROGRAM)+',"elapsed_ms":'+str(int(elapsed_ms))+'},"timestamp":'+str(int(now*1000))+'}\n')
+            # #endregion
+            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                delta = 1 if raw_deltas[0] > 0 else -1
+                # Limit to presets 1-5 (AMBIENT only via button click)
+                current = BASE_PROGRAM if BASE_PROGRAM <= 5 else 1  # If on AMBIENT, start from 1
+                new_preset = max(1, min(5, current + delta))
+                if new_preset != BASE_PROGRAM:
+                    global CYCLE_TRIGGER_COUNT, CYCLE_PHASE
+                    BASE_PROGRAM = new_preset
+                    # Reset cycle state when preset changes
+                    CYCLE_TRIGGER_COUNT = 0
+                    CYCLE_PHASE = 0
+                    _discrete_last_change[1] = now
+                    ui_flash(f"Preset: {PROGRAM_NAMES[new_preset-1]}", 0.8)
+        # Enc B: Cycle mode - debounced discrete control
         if raw_deltas[1] != 0:
-            mult = _calc_velocity_multiplier(2, VELOCITY_MAX_PRESET)
-            delta = raw_deltas[1] * mult
-            new_idx = max(0, min(len(CYCLE_STEPS_OPTIONS) - 1, CYCLE_STEPS_INDEX + delta))
-            set_cycle_steps_by_index(new_idx)
-        # Enc C: Cycle mode - NO acceleration
-        if raw_deltas[2] != 0:
-            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_PRESET)
-            delta = raw_deltas[2] * mult
-            new_idx = max(0, min(len(CYCLES_BETWEEN_MODES) - 1, CYCLES_BETWEEN_INDEX + delta))
-            CYCLES_BETWEEN_INDEX = new_idx
+            now = time.time()
+            elapsed_ms = (now - _discrete_last_change[2]) * 1000
+            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                delta = 1 if raw_deltas[1] > 0 else -1
+                new_idx = max(0, min(len(CYCLES_BETWEEN_MODES) - 1, CYCLES_BETWEEN_INDEX + delta))
+                if new_idx != CYCLES_BETWEEN_INDEX:
+                    old_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+                    CYCLES_BETWEEN_INDEX = new_idx
+                    new_mode = CYCLES_BETWEEN_MODES[new_idx]
+                    _discrete_last_change[2] = now
+                    # When switching from off to a mode, set beats to 4 (index 0)
+                    if old_mode == "off" and new_mode != "off":
+                        set_cycle_steps_by_index(0)  # Default to 4 beats
+                        # If on AMBIENT, jump to ALL preset
+                        if BASE_PROGRAM == 6:
+                            BASE_PROGRAM = 1
+                            CYCLE_TRIGGER_COUNT = 0
+                            CYCLE_PHASE = 0
+                            ui_flash(f"Preset: ALL", 0.8)
+        # Enc C: Beat Cycles index - debounced discrete control (disabled for AMBIENT or mode off)
+        current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+        if raw_deltas[2] != 0 and BASE_PROGRAM != 6 and current_mode != "off":
+            now = time.time()
+            elapsed_ms = (now - _discrete_last_change[3]) * 1000
+            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                delta = 1 if raw_deltas[2] > 0 else -1
+                new_idx = max(0, min(len(CYCLE_STEPS_OPTIONS) - 1, CYCLE_STEPS_INDEX + delta))
+                if new_idx != CYCLE_STEPS_INDEX:
+                    _discrete_last_change[3] = now
+                    set_cycle_steps_by_index(new_idx)
             
     elif page_name == "SET":
-        # Enc A: Defaults mode (0-2 for LOW/MID/HIGH) - NO acceleration, only 3 options
+        # Enc A: Defaults mode (0-5 for LOW/MID/HIGH/USR1/USR2/USR3) - debounced discrete control
         if raw_deltas[0] != 0:
-            # Always 1 at a time for settings with few options
-            new_idx = max(0, min(2, DEFAULTS_MODE_INDEX + raw_deltas[0]))
-            if new_idx != DEFAULTS_MODE_INDEX:
-                DEFAULTS_MODE_INDEX = new_idx
-                # Apply the new defaults immediately
-                mode_name = DEFAULTS_MODES[new_idx]
-                center_hz, thresh, decay_ms, q_factor = DEFAULTS_PRESETS[mode_name]
-                band.center   = center_hz
-                band.thresh   = thresh
-                band.decay_ms = decay_ms
-                band.q        = q_factor
-                # Save to config file for persistence
-                save_defaults_mode(new_idx)
-                ui_flash(f"Defaults: {mode_name}", 0.8)
+            now = time.time()
+            elapsed_ms = (now - _discrete_last_change[1]) * 1000
+            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                delta = 1 if raw_deltas[0] > 0 else -1
+                new_idx = max(0, min(5, DEFAULTS_MODE_INDEX + delta))
+                if new_idx != DEFAULTS_MODE_INDEX:
+                    DEFAULTS_MODE_INDEX = new_idx
+                    _discrete_last_change[1] = now
+                    mode_name = DEFAULTS_MODES[new_idx]
+                    preset = DEFAULTS_PRESETS[mode_name]
+                    # Apply the defaults immediately (only if preset has values)
+                    if preset is not None:
+                        center_hz, thresh, decay_ms, q_factor = preset
+                        band.center   = center_hz
+                        band.thresh   = thresh
+                        band.decay_ms = decay_ms
+                        band.q        = q_factor
+                    # Save to config file for persistence
+                    save_defaults_mode(new_idx)
+                    ui_flash(f"Defaults: {mode_name}", 0.8)
+        
+        # Enc B: Input Volume (0-99)
+        if raw_deltas[1] != 0:
+            global INPUT_VOLUME, INPUT_GAIN
+            new_vol = max(0, min(99, INPUT_VOLUME + raw_deltas[1]))
+            if new_vol != INPUT_VOLUME:
+                INPUT_VOLUME = new_vol
+                INPUT_GAIN = (new_vol / 25.0)  # Map 0-99: 0=0x, 25=1x, 50=2x, 99=4x
+                ui_flash(f"Input Vol: {INPUT_VOLUME}", 0.8)
+        
+        # Enc C: DMX Output Mode OR Channel Count (toggle with click) - debounced discrete control
+        if raw_deltas[2] != 0:
+            global DMX_OUTPUT_MODE, DMX_CHANNEL_COUNT
+            now = time.time()
+            elapsed_ms = (now - _discrete_last_change[3]) * 1000
+            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                delta = 1 if raw_deltas[2] > 0 else -1
+                if _setup_enc4_channels:
+                    # Channel count mode: 4-24 channels
+                    new_count = max(4, min(24, DMX_CHANNEL_COUNT + delta))
+                    if new_count != DMX_CHANNEL_COUNT:
+                        DMX_CHANNEL_COUNT = new_count
+                        _discrete_last_change[3] = now
+                        save_dmx_channel_count(new_count)
+                        ui_flash(f"Channels: {new_count}", 0.8)
+                else:
+                    # Output mode: Dimmer / (DMX) - can scroll to see both options
+                    # (DMX) is shown in parentheses to indicate it's not fully implemented yet
+                    new_mode = max(0, min(1, DMX_OUTPUT_MODE + delta))
+                    if new_mode != DMX_OUTPUT_MODE:
+                        DMX_OUTPUT_MODE = new_mode
+                        _discrete_last_change[3] = now
+                        save_dmx_output_mode(new_mode)
+                        ui_flash(f"Output: {DMX_OUTPUT_MODES[new_mode]}", 0.8)
+
+    elif page_name == "COLOR":
+        global _color_light_selection, _color_hue, _color_saturation, _color_temperature
+        
+        # Enc A: Light selection (all, odd, even, 1, 2, 3, ... n)
+        # Each channel is treated as an individual light
+        if raw_deltas[0] != 0:
+            now = time.time()
+            elapsed_ms = (now - _discrete_last_change[1]) * 1000
+            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                delta = 1 if raw_deltas[0] > 0 else -1
+                # all(0), odd(1), even(2), then 1..DMX_CHANNEL_COUNT
+                max_selection = 2 + DMX_CHANNEL_COUNT
+                new_sel = max(0, min(max_selection, _color_light_selection + delta))
+                if new_sel != _color_light_selection:
+                    _color_light_selection = new_sel
+                    _discrete_last_change[1] = now
+        
+        # Enc B: Hue (0-99) or Temperature (0-99) based on toggle
+        if raw_deltas[1] != 0:
+            base_delta = 1 if raw_deltas[1] > 0 else -1
+            mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
+            delta = base_delta * mult
+            if _color_enc3_temp_mode:
+                _color_temperature = max(0, min(99, _color_temperature + delta))
+            else:
+                _color_hue = max(0, min(99, _color_hue + delta))
+        
+        # Enc C: Saturation (0-99)
+        if raw_deltas[2] != 0:
+            base_delta = 1 if raw_deltas[2] > 0 else -1
+            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_THRESH)
+            delta = base_delta * mult
+            _color_saturation = max(0, min(99, _color_saturation + delta))
 
 def toggle_brightness():
     """Toggle brightness between current value and zero with fade animation."""
@@ -879,7 +1424,14 @@ def reset_to_defaults():
     
     # Get values from current defaults mode
     mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-    center_hz, thresh, decay_ms, q_factor = DEFAULTS_PRESETS[mode_name]
+    preset = DEFAULTS_PRESETS[mode_name]
+    
+    if preset is None:
+        # User preset is empty - nothing to reset to
+        ui_flash(f"{mode_name} is empty", 1.0)
+        return
+    
+    center_hz, thresh, decay_ms, q_factor = preset
     
     # Reset HOME page parameters to the current defaults mode
     band.center   = center_hz
@@ -889,6 +1441,14 @@ def reset_to_defaults():
     
     IGNORE_KNOBS_UNTIL = time.time() + 0.3
     ui_flash(f"Reset to {mode_name}", 1.0)
+
+def save_current_as_default():
+    """Save current band params as the selected default preset."""
+    mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+    # Update in-memory preset
+    DEFAULTS_PRESETS[mode_name] = (band.center, band.thresh, band.decay_ms, band.q)
+    # Persist to config file
+    save_preset_values(mode_name, band.center, band.thresh, band.decay_ms, band.q)
 
 def setup_gpio_inputs():
     if DEV_NO_HW:
@@ -930,55 +1490,60 @@ def setup_gpio_inputs():
     # Reset button
     GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
+_enc_last_update_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time when delta was last consumed
+_enc_update_velocity = [0.0, 0.0, 0.0, 0.0, 0.0]   # Smoothed velocity based on update intervals
+
 def _calc_velocity_multiplier(enc_idx, max_mult=10):
-    """Calculate velocity multiplier using exponential smoothing.
+    """Calculate velocity multiplier based on time between update_encoders() calls.
     
-    Uses a rolling average of clicks-per-second with logarithmic scaling
-    for natural-feeling acceleration. Much simpler and more robust than
-    threshold-based approaches.
+    This measures the time between when deltas are CONSUMED (physical detent rate),
+    not the internal click rate which is much faster.
     
     Args:
         enc_idx: Encoder index for tracking timing
         max_mult: Maximum multiplier for fast spinning
     
     Returns 1 for slow turning, up to max_mult for fast spinning."""
-    global _enc_last_click_time, _enc_prev_click_time, _enc_velocity
+    global _enc_last_update_time, _enc_update_velocity
     import math
     
-    current_click = _enc_last_click_time[enc_idx]
-    prev_click = _enc_prev_click_time[enc_idx]
     now = time.time()
+    last_update = _enc_last_update_time[enc_idx]
     
-    # First click or no history - return 1x
-    if prev_click == 0 or current_click == 0:
-        _enc_velocity[enc_idx] = 0
+    # First update or no history - return 1x
+    if last_update == 0:
+        _enc_last_update_time[enc_idx] = now
+        _enc_update_velocity[enc_idx] = 0
         return 1
     
-    # If it's been a while since last click, decay the velocity
-    time_since_last = now - current_click
-    if time_since_last > 0.2:  # 200ms pause = reset velocity
-        _enc_velocity[enc_idx] = 0
+    # Calculate time since last update with non-zero delta
+    delta_s = now - last_update
+    _enc_last_update_time[enc_idx] = now
+    
+    # If it's been a while since last update, reset velocity
+    if delta_s > 0.8:  # 800ms pause = reset velocity, return 1x
+        _enc_update_velocity[enc_idx] = 0
         return 1
     
-    # Calculate instantaneous velocity (clicks per second)
-    delta_s = current_click - prev_click
+    # Calculate updates per second (physical detent rate)
     if delta_s <= 0:
         return 1
     
-    clicks_per_sec = 1.0 / delta_s
+    updates_per_sec = 1.0 / delta_s
     
     # Exponential smoothing: blend new reading with history
-    # alpha=0.4 gives responsive but stable feel
-    alpha = 0.4
-    _enc_velocity[enc_idx] = alpha * clicks_per_sec + (1 - alpha) * _enc_velocity[enc_idx]
+    alpha = 0.5
+    _enc_update_velocity[enc_idx] = alpha * updates_per_sec + (1 - alpha) * _enc_update_velocity[enc_idx]
     
-    velocity = _enc_velocity[enc_idx]
+    velocity = _enc_update_velocity[enc_idx]
     
     # Map velocity to multiplier with logarithmic scaling
-    # ~15 clicks/sec (67ms between) = slow (1x)
-    # ~100 clicks/sec (10ms between) = fast (max_mult)
-    SLOW_VELOCITY = 15.0   # clicks/sec - below this = 1x
-    FAST_VELOCITY = 100.0  # clicks/sec - above this = max
+    # Based on PHYSICAL detent rate (updates per second), not internal clicks
+    # 800ms between detents = 1.25/sec = slow (1x)
+    # 200ms between detents = 5/sec = moderate 
+    # 50ms between detents = 20/sec = fast (max_mult)
+    SLOW_VELOCITY = 1.5    # updates/sec - below this = 1x (>660ms between physical detents)
+    FAST_VELOCITY = 15.0   # updates/sec - above this = max (<67ms between physical detents)
     
     if velocity <= SLOW_VELOCITY:
         mult = 1
@@ -1037,8 +1602,8 @@ def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
     if direction != 0:
         _enc_count[enc_idx] += direction
         
-        # Using threshold of 2 for more responsive feel
-        # Most encoders have 4 state changes per detent, but 2 feels better
+        # Using threshold of 2 for responsive velocity-based controls
+        # Discrete controls use debouncing in update_encoders() instead
         if _enc_count[enc_idx] >= 2:
             _enc_count[enc_idx] = 0
             # Record click times for velocity calculation
@@ -1057,34 +1622,57 @@ def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
     return 0  # Not enough transitions yet
 
 
-# Page encoder uses a simpler "detent detection" approach
-# Triggers once per click when returning to rest position (both signals high)
-_page_enc_last_clk = 1
-_page_enc_direction = 0  # Stores detected direction until rest position
+# Page encoder state (quadrature with debouncing)
+# Uses full quadrature state machine for reliable direction detection
+_page_enc_state = 3  # Initial state (both high = rest)
+_page_enc_count = 0  # Raw quadrature count (4 counts per detent)
+_page_enc_clk_buffer = [1, 1, 1]  # Debounce buffer for CLK
+_page_enc_dt_buffer = [1, 1, 1]   # Debounce buffer for DT
+
+# Quadrature transition table: [old_state][new_state] -> direction
+# State encoding: (CLK << 1) | DT
+# State 0 = both low, State 1 = CLK low/DT high, State 2 = CLK high/DT low, State 3 = both high (rest)
+_PAGE_QUAD_TRANSITION = [
+    [  0, -1,  1,  0],  # old = 0 (both low)
+    [  1,  0,  0, -1],  # old = 1 (CLK low, DT high)
+    [ -1,  0,  0,  1],  # old = 2 (CLK high, DT low)
+    [  0,  1, -1,  0],  # old = 3 (both high - rest/detent)
+]
 
 def _read_page_encoder(clk_pin, dt_pin):
-    """Read page encoder with detent-based detection.
-    Returns direction only when encoder reaches rest position (click completed).
-    This ensures exactly one page change per physical click."""
-    global _page_enc_last_clk, _page_enc_direction
+    """Read page encoder with debounced quadrature state machine.
+    Returns -1, 0, or 1 for exactly one page change per physical detent.
     
-    clk = GPIO.input(clk_pin)
-    dt = GPIO.input(dt_pin)
+    Uses 3-sample majority voting to filter electrical noise and a full
+    quadrature state machine for reliable direction detection."""
+    global _page_enc_state, _page_enc_count
+    global _page_enc_clk_buffer, _page_enc_dt_buffer
     
-    # Detect falling edge of CLK to determine direction
-    if clk == 0 and _page_enc_last_clk == 1:
-        # CLK just went low - check DT to determine direction
-        # DT high = CCW (left), DT low = CW (right)
-        _page_enc_direction = 1 if dt == 1 else -1
+    # Read and debounce using majority voting (2 of 3 samples)
+    _page_enc_clk_buffer.pop(0)
+    _page_enc_clk_buffer.append(GPIO.input(clk_pin))
+    _page_enc_dt_buffer.pop(0)
+    _page_enc_dt_buffer.append(GPIO.input(dt_pin))
     
-    _page_enc_last_clk = clk
+    clk = 1 if sum(_page_enc_clk_buffer) >= 2 else 0
+    dt = 1 if sum(_page_enc_dt_buffer) >= 2 else 0
     
-    # Only return direction when both signals are high (rest/detent position)
-    # This is the "click" position where the encoder settles
-    if clk == 1 and dt == 1 and _page_enc_direction != 0:
-        direction = _page_enc_direction
-        _page_enc_direction = 0  # Reset for next click
-        return direction
+    new_state = (clk << 1) | dt
+    old_state = _page_enc_state
+    
+    if new_state != old_state:
+        _page_enc_state = new_state
+        direction = _PAGE_QUAD_TRANSITION[old_state][new_state]
+        _page_enc_count += direction
+        
+        # 4 quadrature transitions = 1 physical detent
+        # Using threshold of 2 for responsive feel (half-detent)
+        if _page_enc_count >= 2:
+            _page_enc_count = 0
+            return 1
+        elif _page_enc_count <= -2:
+            _page_enc_count = 0
+            return -1
     
     return 0
 
@@ -1098,6 +1686,8 @@ def encoder_reader():
     global current_page
     global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state
     global _enc_state, _enc_count, _enc_last_click_time, _enc_velocity_mult
+    global _home_enc2_alt, _home_enc3_alt, _home_enc4_alt
+    global _enc2_press_time, _enc2_saving, _enc2_save_complete
     
     if DEV_NO_HW:
         return
@@ -1143,10 +1733,15 @@ def encoder_reader():
                 # ===== Encoder 1 - Page selection (uses detent-based detection) =====
                 direction = _read_page_encoder(ENC1_CLK, ENC1_DT)
                 if direction != 0:
+                    pages = get_pages()
                     encoder1_value += direction
-                    encoder1_value = max(0, min(len(PAGES) - 1, encoder1_value))
+                    encoder1_value = max(0, min(len(pages) - 1, encoder1_value))
                     if current_page != encoder1_value:
                         current_page = encoder1_value
+                        # Reset HOME page encoder toggles when changing pages
+                        _home_enc2_alt = False
+                        _home_enc3_alt = False
+                        _home_enc4_alt = False
                 
                 enc1_sw = GPIO.input(ENC1_SW)
                 if enc1_sw == 0 and _enc_last_sw[0] == 1:
@@ -1162,9 +1757,48 @@ def encoder_reader():
                 
                 enc2_sw = GPIO.input(ENC2_SW)
                 if enc2_sw == 0 and _enc_last_sw[1] == 1:
-                    time.sleep(0.02)
+                    # Button just pressed - start timing
+                    time.sleep(0.02)  # Debounce
                     if GPIO.input(ENC2_SW) == 0:
-                        pass  # Reserved for future use
+                        _enc2_press_time = time.time()
+                        if get_pages()[current_page] == "SET":
+                            _enc2_saving = True  # Start showing loader
+                elif enc2_sw == 1 and _enc_last_sw[1] == 0:
+                    # Button released
+                    press_duration = time.time() - _enc2_press_time
+                    if _enc2_saving:
+                        # Was in save mode but released early - cancel
+                        _enc2_saving = False
+                    elif press_duration < 3.0:
+                        # Short press - toggle Freq/Q mode on HOME page
+                        pages = get_pages()
+                        if pages[current_page] == "HOME":
+                            _home_enc2_alt = not _home_enc2_alt
+                        # Short press - toggle to/from ambient on PRE page
+                        elif pages[current_page] == "PRE":
+                            global _last_preset_before_ambient, BASE_PROGRAM, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLES_BETWEEN_INDEX
+                            if BASE_PROGRAM == 6:
+                                # Currently on ambient - jump back to last preset (mode stays off)
+                                BASE_PROGRAM = _last_preset_before_ambient
+                                # Reset cycle state when preset changes
+                                CYCLE_TRIGGER_COUNT = 0
+                                CYCLE_PHASE = 0
+                                ui_flash(f"Preset: {PROGRAM_NAMES[BASE_PROGRAM-1]}", 0.8)
+                            else:
+                                # Not on ambient - save current and jump to ambient
+                                _last_preset_before_ambient = BASE_PROGRAM
+                                BASE_PROGRAM = 6
+                                # Reset cycle state and set mode to off
+                                CYCLE_TRIGGER_COUNT = 0
+                                CYCLE_PHASE = 0
+                                CYCLES_BETWEEN_INDEX = 0  # Set mode to "off"
+                                ui_flash("Preset: AMBIENT", 0.8)
+                elif enc2_sw == 0 and _enc2_saving:
+                    # Button still held on SET page - check if 3 seconds reached
+                    if time.time() - _enc2_press_time >= 3.0:
+                        _enc2_saving = False
+                        save_current_as_default()  # Save and show "Saved"
+                        _enc2_save_complete = time.time()
                 _enc_last_sw[1] = enc2_sw
                 
                 # ===== Encoder 3 - Param B (Thresh/Beats) =====
@@ -1176,7 +1810,29 @@ def encoder_reader():
                 if enc3_sw == 0 and _enc_last_sw[2] == 1:
                     time.sleep(0.02)
                     if GPIO.input(ENC3_SW) == 0:
-                        pass  # Reserved for future use
+                        # Toggle Thresh/ThreshMode on HOME page
+                        pages = get_pages()
+                        if pages[current_page] == "HOME":
+                            _home_enc3_alt = not _home_enc3_alt
+                        # Turn Mode OFF on PRE page
+                        elif pages[current_page] == "PRE":
+                            if CYCLES_BETWEEN_INDEX != 0:
+                                CYCLES_BETWEEN_INDEX = 0
+                                ui_flash("Mode: off", 0.8)
+                        # Reset Input Volume to 50 on SET page
+                        elif pages[current_page] == "SET":
+                            global INPUT_VOLUME, INPUT_GAIN
+                            INPUT_VOLUME = 50
+                            INPUT_GAIN = 1.0
+                            ui_flash("Input Vol: 50", 0.8)
+                        # Toggle Hue/Temp mode on COLOR page
+                        elif pages[current_page] == "COLOR":
+                            global _color_enc3_temp_mode
+                            _color_enc3_temp_mode = not _color_enc3_temp_mode
+                            if _color_enc3_temp_mode:
+                                ui_flash("Mode: Temp", 0.8)
+                            else:
+                                ui_flash("Mode: Hue", 0.8)
                 _enc_last_sw[2] = enc3_sw
                 
                 # ===== Encoder 4 - Param C (Release/Mode) =====
@@ -1188,7 +1844,19 @@ def encoder_reader():
                 if enc4_sw == 0 and _enc_last_sw[3] == 1:
                     time.sleep(0.02)
                     if GPIO.input(ENC4_SW) == 0:
-                        pass  # Reserved for future use
+                        # Toggle Release/ReleaseMode on HOME page
+                        pages = get_pages()
+                        if pages[current_page] == "HOME":
+                            _home_enc4_alt = not _home_enc4_alt
+                        # Toggle Output/Channels mode on SET page
+                        elif pages[current_page] == "SET":
+                            global _setup_enc4_channels
+                            _setup_enc4_channels = not _setup_enc4_channels
+                            if _setup_enc4_channels:
+                                ui_flash(f"Channels: {DMX_CHANNEL_COUNT}", 0.8)
+                            else:
+                                ui_flash(f"Output: {DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]}", 0.8)
+                        # No action on PRE page for encoder 4 button
                 _enc_last_sw[3] = enc4_sw
                 
                 # ===== Encoder 5 - Brightness =====
@@ -1248,14 +1916,16 @@ live_threshold  = band.thresh
 input_rms       = 0.0
 last_trigger_ts = 0.0
 chase_idx       = 0
-group34_phase   = 0
+group34_phase   = 0  # For 1+4/2+3 (program 3)
+group12_phase   = 0  # For 1+2/3+4 (program 4)
 
-# Ambient mode state
-ambient_targets = [0.0, 0.0, 0.0, 0.0]  # Target brightness for each channel
-ambient_current = [0.0, 0.0, 0.0, 0.0]  # Current brightness for each channel
-ambient_last_change = [0.0, 0.0, 0.0, 0.0]  # Time of last target change
-ambient_speed = 1.0  # Speed multiplier (controlled by Freq pot in ambient mode)
-ambient_fade_time = 2.0  # Fade in/out time in seconds (controlled by Release pot)
+# Ambient mode state (sized for max 24 channels)
+ambient_targets = [0.0] * 24  # Target brightness for each channel (0=off, 1=on)
+ambient_current = [0.0] * 24  # Current brightness for each channel
+ambient_last_change = [0.0] * 24  # Time of last target change
+ambient_speed = 1.0  # Speed multiplier - default 1x (range 0.2x to 8x)
+ambient_fade_time = 1.0  # Fade time in seconds - default 1s (range 0.1s to 10s)
+_ambient_next_time = 0.0  # Time when next channel switch happens
 
 # Trigger indicator for UI
 trigger_flash = 0.0  # Decays over time, >0 means recently triggered
@@ -1289,8 +1959,8 @@ def get_band_energy(fft_magnitudes, freqs, low_hz, high_hz):
 
 def audio_loop():
     global bp, envd, live_band_env, live_threshold, input_rms
-    global last_trigger_ts, chase_idx, group34_phase
-    global PROGRAM, BASE_PROGRAM, CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE
+    global last_trigger_ts, chase_idx, group34_phase, group12_phase
+    global PROGRAM, BASE_PROGRAM, CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLE_AMBIENT_START
     global APP_STATE, APP_ERROR
     global fft_bands, fft_peaks, fft_peak_times, fft_recent_max
 
@@ -1304,14 +1974,17 @@ def audio_loop():
     def cb(indata, frames, time_info, status):
         nonlocal was_above
         global live_band_env, live_threshold, input_rms
-        global last_trigger_ts, chase_idx, group34_phase
-        global PROGRAM, BASE_PROGRAM, CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE
+        global last_trigger_ts, chase_idx, group34_phase, group12_phase
+        global PROGRAM, BASE_PROGRAM, CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLE_AMBIENT_START
         global fft_bands, fft_peaks, fft_peak_times, fft_recent_max
+        global _recent_min, _effective_thresh
+        global _reactive_brightness_scale, _effective_release_display, _effective_brightness_display
 
         if not RUNNING:
             return
 
         x = indata[:, 0].astype(np.float32)
+        x = x * INPUT_GAIN  # Apply input volume control
         input_rms = float(np.sqrt(np.mean(x*x)) + 1e-12)
 
         # FFT analysis for display
@@ -1376,13 +2049,28 @@ def audio_loop():
         live_band_env = v
         live_threshold = band.thresh
 
+        # Update tracking variable for adaptive threshold mode
+        _recent_min = min(_recent_min * 1.005, live_band_env)  # Slowly rise back up
+
         above = (live_band_env >= band.thresh)
         can_fire = ((now - last_trigger_ts)*1000.0 >= REFRACTORY_MS)
 
-        if CYCLE_STEPS > 0:
+        current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+        if current_mode == "x+1":
+            # x+1 mode: toggle between base and neighbor preset
             p_base, p_neighbor = program_pair_for_base(BASE_PROGRAM)
             active_prog = p_base if CYCLE_PHASE == 0 else p_neighbor
+        elif current_mode == "random":
+            # Random mode: BASE_PROGRAM is the active program (changes on beat)
+            active_prog = BASE_PROGRAM
+        elif current_mode == "rnd/amb":
+            # rnd/amb mode: alternate between random preset and ambient
+            if CYCLE_PHASE == 0:
+                active_prog = BASE_PROGRAM  # Random preset phase
+            else:
+                active_prog = 6  # Ambient phase
         else:
+            # Mode off - no cycling
             active_prog = BASE_PROGRAM
 
         PROGRAM = active_prog
@@ -1392,42 +2080,133 @@ def audio_loop():
         trigger_flash = trigger_flash * TRIGGER_FLASH_DECAY
         _brightness_click_flash = _brightness_click_flash * 0.9  # Decay click indicator
 
-        if above and not was_above and can_fire and active_prog in (1, 2, 3, 4):
+        # Determine trigger based on threshold mode
+        thresh_mode = THRESH_MODES[THRESH_MODE_INDEX]
+        should_trigger = False
+
+        if thresh_mode == "fixed":
+            # Fixed: edge-triggered (must drop below to retrigger)
+            _effective_thresh = band.thresh
+            should_trigger = above and not was_above and can_fire
+        elif thresh_mode == "adapt":
+            # Adaptive: trigger on rise above recent minimum
+            # Scale threshold: 0=very sensitive (0.02 rise), 99=less sensitive (0.6 rise)
+            adapt_thresh = 0.02 + band.thresh * 0.58
+            relative_rise = live_band_env - _recent_min
+            _effective_thresh = min(1.0, _recent_min + adapt_thresh)  # Show where trigger point is
+            should_trigger = relative_rise >= adapt_thresh and can_fire
+            if should_trigger:
+                _recent_min = live_band_env  # Reset after trigger
+
+        if should_trigger and active_prog in (1, 2, 3, 4, 5):
             last_trigger_ts = now
             trigger_flash = 1.0  # Flash on trigger
             if TRIG_DEBUG:
-                print(f"[TRIG] env={live_band_env:.5f} thr={band.thresh:.5f} prog={active_prog}")
+                print(f"[TRIG] mode={thresh_mode} env={live_band_env:.5f} thr={band.thresh:.5f} prog={active_prog}")
+
+            # Calculate effective decay based on release mode
+            release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+            effective_decay = band.decay_ms
+            
+            # Calculate boost amount based on threshold mode
+            # Use the signal level directly - stronger signal = more boost
+            # For fixed mode: normalize by how much above threshold (as ratio of remaining headroom)
+            # For adapt mode: use signal level directly
+            if thresh_mode == "fixed":
+                # Fixed: boost based on how far above threshold as ratio of headroom
+                # e.g., if thresh=0.3 and env=0.6, that's 0.3/0.7 = 43% of headroom
+                headroom = max(0.01, 1.0 - band.thresh)
+                excess = max(0, live_band_env - band.thresh)
+                boost_amount = excess / headroom  # 0 to 1 range
+            else:
+                # Adaptive: boost based on peak level (louder = more boost)
+                boost_amount = live_band_env
+            
+            if release_mode == "react":
+                # Reactive: release scales up from set value based on signal strength
+                # Proportional boost - stronger = longer release (up to 2x)
+                scale = 1.0 + boost_amount * 1.0  # 1x to 2x
+                effective_decay = band.decay_ms * scale
+                # Update display value (0-99 scale)
+                _effective_release_display = int((effective_decay - 40.0) / 4960.0 * 99)
+                _effective_release_display = max(0, min(99, _effective_release_display))
+            elif release_mode == "bright":
+                # Reactive brightness: brightness scales up from set value based on signal strength
+                # Proportional boost - stronger = brighter (can go to 100%)
+                # boost_amount is 0-1, so add it directly to brightness
+                _reactive_brightness_scale = min(1.0, BRIGHTNESS + boost_amount * (1.0 - BRIGHTNESS))
+                # Update display value (0-99 scale)
+                _effective_brightness_display = int(_reactive_brightness_scale * 99)
+                _effective_brightness_display = max(0, min(99, _effective_brightness_display))
+            elif release_mode == "rand":
+                # Random: add/subtract random value between -20 and +20 from current release
+                # Calculate base release display value (0-99)
+                base_release = int((band.decay_ms - 40.0) / 4960.0 * 99)
+                base_release = max(0, min(99, base_release))
+                # Add random offset between -20 and +20
+                rand_offset = random.randint(-20, 20)
+                new_release_display = max(0, min(99, base_release + rand_offset))
+                # Convert back to decay_ms
+                effective_decay = 40.0 + (new_release_display / 99.0) * 4960.0
+                # Update display value
+                _effective_release_display = new_release_display
 
             if active_prog == 1:
-                trigger_idxs([0, 1, 2, 3], band.attack_ms, band.decay_ms)
+                # ALL - trigger all configured channels
+                trigger_idxs(list(range(DMX_CHANNEL_COUNT)), band.attack_ms, effective_decay)
             elif active_prog == 2:
-                trigger_idxs([chase_idx], band.attack_ms, band.decay_ms)
-                chase_idx = (chase_idx + 1) % 4
+                # CHASE - cycle through all channels sequentially
+                trigger_idxs([chase_idx], band.attack_ms, effective_decay)
+                chase_idx = (chase_idx + 1) % DMX_CHANNEL_COUNT
             elif active_prog == 3:
-                if group34_phase == 0:
-                    trigger_idxs([0, 3], band.attack_ms, band.decay_ms)
-                    group34_phase = 1
+                # GROUPS - first half alternate with second half
+                half = DMX_CHANNEL_COUNT // 2
+                if group12_phase == 0:
+                    trigger_idxs(list(range(0, half)), band.attack_ms, effective_decay)
+                    group12_phase = 1
                 else:
-                    trigger_idxs([1, 2], band.attack_ms, band.decay_ms)
-                    group34_phase = 0
+                    trigger_idxs(list(range(half, DMX_CHANNEL_COUNT)), band.attack_ms, effective_decay)
+                    group12_phase = 0
             elif active_prog == 4:
+                # ODD/EVEN - odd indices (0,2,4...) alternate with even indices (1,3,5...)
                 if group34_phase == 0:
-                    trigger_idxs([0, 1], band.attack_ms, band.decay_ms)
+                    trigger_idxs(list(range(0, DMX_CHANNEL_COUNT, 2)), band.attack_ms, effective_decay)
                     group34_phase = 1
                 else:
-                    trigger_idxs([2, 3], band.attack_ms, band.decay_ms)
+                    trigger_idxs(list(range(1, DMX_CHANNEL_COUNT, 2)), band.attack_ms, effective_decay)
                     group34_phase = 0
             elif active_prog == 5:
-                # RANDOM - trigger a random channel each time
-                random_idx = random.randint(0, 3)
-                trigger_idxs([random_idx], band.attack_ms, band.decay_ms)
+                # RANDOM - trigger a random channel from all configured
+                random_idx = random.randint(0, DMX_CHANNEL_COUNT - 1)
+                trigger_idxs([random_idx], band.attack_ms, effective_decay)
             # Note: active_prog == 6 (AMBIENT) doesn't trigger here - it's handled separately
 
-            if CYCLE_STEPS > 0:
+            # Count beats and cycle presets based on mode
+            if current_mode == "x+1":
                 CYCLE_TRIGGER_COUNT += 1
                 if CYCLE_TRIGGER_COUNT >= CYCLE_STEPS:
                     CYCLE_TRIGGER_COUNT = 0
                     CYCLE_PHASE = 1 - CYCLE_PHASE
+            elif current_mode == "random":
+                CYCLE_TRIGGER_COUNT += 1
+                if CYCLE_TRIGGER_COUNT >= CYCLE_STEPS:
+                    CYCLE_TRIGGER_COUNT = 0
+                    # Randomly select preset 1-5 (excluding AMBIENT)
+                    BASE_PROGRAM = random.randint(1, 5)
+            elif current_mode == "rnd/amb" and CYCLE_PHASE == 0:
+                # rnd/amb preset phase - count beats
+                CYCLE_TRIGGER_COUNT += 1
+                if CYCLE_TRIGGER_COUNT >= CYCLE_STEPS:
+                    CYCLE_TRIGGER_COUNT = 0
+                    CYCLE_PHASE = 1  # Switch to ambient phase
+                    CYCLE_AMBIENT_START = time.time()
+
+        # Handle rnd/amb ambient phase timing
+        if current_mode == "rnd/amb" and CYCLE_PHASE == 1:
+            elapsed_seconds = now - CYCLE_AMBIENT_START
+            if elapsed_seconds >= CYCLE_STEPS:
+                CYCLE_PHASE = 0  # Switch back to preset phase
+                BASE_PROGRAM = random.randint(1, 5)  # Pick new random preset
 
         # Handle AMBIENT mode separately (non-audio-reactive)
         if active_prog == 6:
@@ -1502,6 +2281,26 @@ class OledUI:
         except Exception:
             pass
 
+    def _draw_text_kerned(self, draw, pos, text, font, fill=1, kerning=1):
+        """Draw text with custom letter spacing (kerning).
+        
+        Args:
+            draw: ImageDraw object
+            pos: (x, y) tuple for starting position
+            text: String to draw
+            font: Font to use
+            fill: Fill color (1 for white on OLED)
+            kerning: Extra pixels between each character (can be negative)
+        """
+        x, y = pos
+        for char in text:
+            draw.text((x, y), char, font=font, fill=fill)
+            # Get character width and add kerning
+            bbox = font.getbbox(char)
+            char_width = bbox[2] - bbox[0] if bbox else 5
+            x += char_width + kerning
+        return x  # Return final x position
+
     def _freq_to_x(self, freq, x_start, width):
         """Convert frequency to x position (log scale)."""
         if freq <= FFT_MIN_FREQ:
@@ -1531,7 +2330,8 @@ class OledUI:
         
         low_x = self._freq_to_x(low_freq, x, width)
         high_x = self._freq_to_x(high_freq, x, width)
-        thresh_y = y + height - int(band.thresh * height)
+        # Use effective threshold for display (varies by threshold mode)
+        thresh_y = y + height - int(_effective_thresh * height)
         
         # Calculate bar positions with 1px gap
         total_gaps = num_bands - 1
@@ -1615,13 +2415,39 @@ class OledUI:
 
     def _draw_global_controls(self, draw, x, y):
         """Draw program number and brightness percentage."""
-        # Program number (1-4)
-        draw.text((x, y), f"P{BASE_PROGRAM}", font=self._font_small, fill=1)
+        # Program number - show cycling state if active
+        current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+        if current_mode == "x+1" and CYCLE_PHASE == 1:
+            _, neighbor = program_pair_for_base(BASE_PROGRAM)
+            draw.text((x, y), f"(P{neighbor})", font=self._font_small, fill=1)
+        elif current_mode == "rnd/amb" and CYCLE_PHASE == 1:
+            # Show (P6) when in rnd/amb ambient phase
+            draw.text((x, y), f"(P6)", font=self._font_small, fill=1)
+        else:
+            draw.text((x, y), f"P{BASE_PROGRAM}", font=self._font_small, fill=1)
         
         # Sun icon + brightness percentage (use smoothed display value)
         self._draw_sun_icon(draw, x, y + 10, size=7)
-        brt_pct = int(_display_bright * 100)
-        draw.text((x + 9, y + 11), f"{brt_pct:2d}", font=self._font_small, fill=1)
+        release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+        base_brt = int(_display_bright * 100)
+        if release_mode == "bright" and _effective_brightness_display > base_brt:
+            # Show effective brightness when boosted in bright mode
+            brt_pct = _effective_brightness_display
+            draw.text((x + 9, y + 11), f"{brt_pct:2d}", font=self._font_small, fill=1)
+        else:
+            draw.text((x + 9, y + 11), f"{base_brt:2d}", font=self._font_small, fill=1)
+    
+    def _draw_brightness_inline(self, draw, x, y):
+        """Draw sun icon + brightness percentage inline."""
+        self._draw_sun_icon(draw, x, y, size=7)
+        release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+        base_brt = int(_display_bright * 100)
+        if release_mode == "bright" and _effective_brightness_display > base_brt:
+            # Show effective brightness when boosted in bright mode
+            brt_pct = _effective_brightness_display
+            draw.text((x + 9, y + 1), f"{brt_pct:2d}", font=self._font_small, fill=1)
+        else:
+            draw.text((x + 9, y + 1), f"{base_brt:2d}", font=self._font_small, fill=1)
     
     def _draw_trigger_indicator(self, draw, x, y):
         """Draw trigger indicator dot at specified position."""
@@ -1653,20 +2479,23 @@ class OledUI:
         """Draw page tabs as icons (fixed size)."""
         icon_box_size = 11
         spacing = 2
+        pages = get_pages()
         
-        for i, page in enumerate(PAGES):
+        for i, page in enumerate(pages):
             ix = x + i * (icon_box_size + spacing)
             self._draw_page_icon(draw, ix, y, page, i == current_page)
     
-    def _draw_page_tabs_wide(self, draw, x, y, total_width):
-        """Draw page tabs as icons, expanded to fill total_width."""
-        num_pages = len(PAGES)
-        # Calculate tab width to fill the space evenly
-        tab_width = total_width // num_pages
+    def _draw_page_tabs_wide(self, draw, x, y, total_width, reserved_right=0):
+        """Draw page tabs as icons, expanded to fill total_width minus reserved space.
+        Always uses _MAX_PAGES for consistent spacing regardless of current mode."""
+        tabs_area_width = total_width - reserved_right
+        pages = get_pages()
+        # Always use _MAX_PAGES for consistent tab width
+        tab_width = tabs_area_width // _MAX_PAGES
         icon_size = 9  # The actual icon is 9x9
         box_height = 11
         
-        for i, page in enumerate(PAGES):
+        for i, page in enumerate(pages):
             tab_x = x + i * tab_width
             tab_end_x = tab_x + tab_width - 2  # -2 for 1px gap between tabs
             
@@ -1692,14 +2521,36 @@ class OledUI:
     def _draw_pot_values(self, draw, x, y, width):
         """Draw pot values for current page with appropriate formatting.
         Uses locked display values when pots are stable."""
-        global _display_freq, _display_thresh, _display_q, _display_bright
+        global _display_freq, _display_thresh, _display_q, _display_bright, _display_q_pct, _display_release
         
-        page_name = PAGES[current_page]
+        pages = get_pages()
+        page_name = pages[current_page]
         labels = PAGE_POT_LABELS[page_name]
         
         # Override labels for HOME page when in AMBIENT mode
         if page_name == "HOME" and BASE_PROGRAM == 6:
             labels = ["Speed", "--", "Fade"]
+        # Override labels for HOME page based on encoder toggle states
+        elif page_name == "HOME":
+            labels = [
+                "Q" if _home_enc2_alt else "Freq",
+                "Th-Mode" if _home_enc3_alt else "Thresh",
+                "R-Mode" if _home_enc4_alt else "Release"
+            ]
+        # Override labels for SET page based on encoder 4 toggle state
+        elif page_name == "SET":
+            labels = [
+                labels[0],  # Default
+                labels[1],  # Gain
+                "Chans" if _setup_enc4_channels else "Setup"
+            ]
+        # Override labels for COLOR page based on encoder 3 toggle state
+        elif page_name == "COLOR":
+            labels = [
+                "Lights",
+                "Temp" if _color_enc3_temp_mode else "Hue",
+                "Sat"
+            ]
         
         # Use actual values directly - pot smoothing handles stability
         _display_freq = band.center
@@ -1712,9 +2563,17 @@ class OledUI:
         spacing = 2  # Extra pixels between columns
         col_width = (width - spacing * 2) // 3
         
+        # Kerning value for letter spacing (1 = 1 extra pixel between chars)
+        # Use tighter kerning (0) for longer labels/values to fit on screen
+        # Use extra tight kerning (-1) for very long values
+        tight_labels = {"Th-Mode", "R-Mode"}  # Labels that need tighter kerning
+        tight_values = {"rnd/amb", "random", "ODD/EVEN"}  # Values that need tighter kerning (kern=0)
+        extra_tight_values = set()  # Values that need extra tight kerning (kern=-1)
+        
         for i in range(3):
             px = x + i * (col_width + spacing)
-            draw.text((px, y), f"{labels[i]}", font=self._font_small, fill=1)
+            label_kern = 0 if labels[i] in tight_labels else 1
+            self._draw_text_kerned(draw, (px, y), labels[i], self._font_small, fill=1, kerning=label_kern)
             
             # Format value based on page and pot (using smoothed display values)
             if page_name == "HOME":
@@ -1728,34 +2587,63 @@ class OledUI:
                         val_str = f"{ambient_fade_time:.1f}s"
                 else:
                     # Normal audio-reactive mode
-                    if i == 0:  # Frequency - show in Hz (with tenths for kHz)
-                        freq_hz = _display_freq
-                        if freq_hz >= 1000:
-                            # Show to tenths place for kHz (e.g., "1.2k", "10.5k")
-                            freq_khz = freq_hz / 1000.0
-                            if freq_khz >= 10:
-                                val_str = f"{freq_khz:.1f}k"
-                            else:
-                                val_str = f"{freq_khz:.1f}k"
+                    if i == 0:  # Frequency or Q (based on toggle)
+                        if _home_enc2_alt:
+                            # Q mode - display as 0-99 (inverted: higher = wider range)
+                            # Use logarithmic mapping for perceptual linearity
+                            # Q_MAX (8.0) -> 0, Q_MIN (frequency-dependent) -> 99
+                            q_min = get_q_min(_display_freq)
+                            q_ratio = math.log(Q_MAX / max(q_min, _display_q)) / math.log(Q_MAX / q_min)
+                            q_pct = round(q_ratio * 99)
+                            q_pct = max(0, min(99, q_pct))
+                            if abs(q_pct - _display_q_pct) > 1:
+                                _display_q_pct = q_pct
+                            val_str = f"{_display_q_pct}"
                         else:
-                            val_str = f"{int(freq_hz)}"
-                    elif i == 1:  # Threshold - 0-99
-                        val_str = f"{int(_display_thresh * 99)}"
-                    else:  # Release - 0-99 (based on decay_ms: 40-5000ms range)
-                        global _display_release
-                        # Convert decay_ms back to 0-99 scale
-                        release_pct = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                        release_pct = max(0, min(99, release_pct))
-                        # Only update display if changed by more than 1
-                        if abs(release_pct - _display_release) > 1:
-                            _display_release = release_pct
-                        val_str = f"{_display_release}"
+                            # Freq mode - show in Hz (with tenths for kHz)
+                            freq_hz = _display_freq
+                            if freq_hz >= 1000:
+                                # Show to tenths place for kHz (e.g., "1.2k", "10.5k")
+                                freq_khz = freq_hz / 1000.0
+                                if freq_khz >= 10:
+                                    val_str = f"{freq_khz:.1f}k"
+                                else:
+                                    val_str = f"{freq_khz:.1f}k"
+                            else:
+                                val_str = f"{int(freq_hz)}"
+                    elif i == 1:  # Threshold or ThreshMode (based on toggle)
+                        if _home_enc3_alt:
+                            # ThreshMode - show current mode name
+                            val_str = THRESH_MODES[THRESH_MODE_INDEX]
+                        else:
+                            # Threshold - 0-99
+                            val_str = f"{int(_display_thresh * 99)}"
+                    else:  # Release or ReleaseMode (based on toggle)
+                        if _home_enc4_alt:
+                            # ReleaseMode - show current mode name
+                            val_str = RELEASE_MODES[RELEASE_MODE_INDEX]
+                        else:
+                            # Release - 0-99 (based on decay_ms: 40-5000ms range)
+                            # Convert decay_ms back to 0-99 scale
+                            release_pct = int((band.decay_ms - 40.0) / 4960.0 * 99)
+                            release_pct = max(0, min(99, release_pct))
+                            # Only update display if changed by more than 1
+                            if abs(release_pct - _display_release) > 1:
+                                _display_release = release_pct
+                            
+                            # Show effective value for react/rand modes, base value otherwise
+                            release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+                            if release_mode in ("react", "rand"):
+                                val_str = f"{_effective_release_display}"
+                            else:
+                                val_str = f"{_display_release}"
             elif page_name == "ADV":
                 if i == 0:  # Q factor - display as 0-99 (inverted: higher = wider range)
-                    global _display_q_pct
-                    # Q ranges from Q_MAX (narrow) to Q_MIN (wide)
-                    # Convert to 0-99 where 99 = widest (Q_MIN), 0 = narrowest (Q_MAX)
-                    q_pct = round((Q_MAX - _display_q) / (Q_MAX - Q_MIN) * 99)
+                    # Q ranges from Q_MAX (narrow) to Q_MIN (wide, frequency-dependent)
+                    # Use logarithmic mapping for perceptual linearity
+                    q_min = get_q_min(_display_freq)
+                    q_ratio = math.log(Q_MAX / max(q_min, _display_q)) / math.log(Q_MAX / q_min)
+                    q_pct = round(q_ratio * 99)
                     q_pct = max(0, min(99, q_pct))
                     # Only update display if changed by more than 1 (hysteresis)
                     if abs(q_pct - _display_q_pct) > 1:
@@ -1767,25 +2655,71 @@ class OledUI:
                     val_str = "--"
             elif page_name == "PRE":
                 if i == 0:  # Preset - show preset name
-                    val_str = PROGRAM_NAMES[BASE_PROGRAM - 1]
-                elif i == 1:  # Beat Cycles - show actual value (0=OFF, 4, 8, 16, etc)
-                    steps = CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]
-                    val_str = "OFF" if steps == 0 else f"{steps}"
-                else:  # Mode - Cycles Between mode
+                    current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+                    if current_mode == "x+1" and CYCLE_PHASE == 1 and BASE_PROGRAM != 6:
+                        # Show neighbor preset in parentheses when cycling (only for x+1 mode)
+                        _, neighbor = program_pair_for_base(BASE_PROGRAM)
+                        val_str = f"({PROGRAM_NAMES[neighbor - 1]})"
+                    elif current_mode == "rnd/amb" and CYCLE_PHASE == 1:
+                        # Show AMBIENT in parentheses when in rnd/amb ambient phase
+                        val_str = "(AMBIENT)"
+                    else:
+                        val_str = PROGRAM_NAMES[BASE_PROGRAM - 1]
+                elif i == 1:  # Mode - Cycles Between mode
                     val_str = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+                else:  # Beat Cycles - show value or -- if mode is off
+                    current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+                    if BASE_PROGRAM == 6 or current_mode == "off":
+                        val_str = "--"
+                    else:
+                        steps = CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]
+                        val_str = f"{steps}"
             elif page_name == "SET":
                 if i == 0:  # Defaults mode
-                    val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                else:  # TBD
-                    val_str = "--"
+                    if _enc2_saving:
+                        # Show loader based on elapsed time (animate dots)
+                        elapsed = time.time() - _enc2_press_time
+                        dots = int(elapsed) % 4
+                        val_str = "." * (dots + 1)  # 1-4 dots
+                    elif time.time() - _enc2_save_complete < 1.0:
+                        val_str = "Saved"
+                    else:
+                        val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+                elif i == 1:  # Input Volume
+                    val_str = str(INPUT_VOLUME)
+                else:  # DMX Output Mode or Channel Count (based on toggle)
+                    if _setup_enc4_channels:
+                        val_str = str(DMX_CHANNEL_COUNT)
+                    else:
+                        val_str = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
             elif page_name == "COLOR":
-                # COLOR page - not yet implemented
-                val_str = "--"
+                if i == 0:  # Light/channel selection
+                    if _color_light_selection == 0:
+                        val_str = "all"
+                    elif _color_light_selection == 1:
+                        val_str = "odd"
+                    elif _color_light_selection == 2:
+                        val_str = "even"
+                    else:
+                        val_str = str(_color_light_selection - 2)  # 1, 2, 3, ... n
+                elif i == 1:  # Hue or Temperature
+                    if _color_enc3_temp_mode:
+                        val_str = str(_color_temperature)
+                    else:
+                        val_str = str(_color_hue)
+                else:  # Saturation
+                    val_str = str(_color_saturation)
             else:
                 # Fallback for any unhandled pages
                 val_str = "--"
             
-            draw.text((px, y + 9), val_str, font=self._font_small, fill=1)
+            if val_str in extra_tight_values:
+                val_kern = -1
+            elif val_str in tight_values:
+                val_kern = 0
+            else:
+                val_kern = 1
+            self._draw_text_kerned(draw, (px, y + 9), val_str, self._font_small, fill=1, kerning=val_kern)
 
     def render_once(self):
         if not self.enabled or self.device is None:
@@ -1802,27 +2736,17 @@ class OledUI:
             # FFT Spectrum (top half, full width)
             self._draw_fft_spectrum(draw, 0, 0, W, 32)
             
-            # Bottom half layout - two columns:
-            # Column 1 (wide): [Page tabs] + [Pot values below]
-            # Column 2 (narrow): [Preset #] + [Brightness]
+            # Bottom half layout:
+            # Row 1: [Page tabs] [Brightness]
+            # Row 2: [Enc2,3,4 values - full width]
             
-            # Column 2 width - just enough for "P1" and brightness
-            global_width = 22
-            separator_x = W - global_width - 2
+            # Row 1: Page tabs + brightness (inline)
+            brightness_width = 25  # sun icon (7) + space (2) + 2-digit number (~16)
+            self._draw_page_tabs_wide(draw, 0, 33, W, reserved_right=brightness_width)
+            self._draw_brightness_inline(draw, W - brightness_width + 2, 34)
             
-            # Column 1: Page tabs and pot values (takes remaining space)
-            tabs_width = separator_x - 1
-            self._draw_page_tabs_wide(draw, 0, 33, tabs_width)
-            
-            # Pot values below tabs
-            self._draw_pot_values(draw, 0, 46, tabs_width)
-            
-            # Vertical separator between columns
-            draw.line((separator_x, 33, separator_x, 63), fill=1)
-            
-            # Column 2: Global controls (Preset + Brightness)
-            global_x = separator_x + 2
-            self._draw_global_controls(draw, global_x, 34)
+            # Row 2: Pot values (full width)
+            self._draw_pot_values(draw, 0, 46, W)
 
         try:
             self.device.display(image)
@@ -1895,7 +2819,7 @@ def tui(stdscr):
         bar_width = max(20, min(65, w - 2))
 
         safe_addstr(stdscr, 0, 0,
-            f"Page={PAGES[current_page]}  Preset={BASE_PROGRAM}  P{PROGRAM}  RUN={'ON' if RUNNING else 'PAUSE'}  "
+            f"Page={get_pages()[current_page]}  Preset={BASE_PROGRAM}  P{PROGRAM}  RUN={'ON' if RUNNING else 'PAUSE'}  "
             f"Device={DEVICE_NAME}  DMX={DMX_BACKEND}"
         )
         safe_addstr(stdscr, 1, 0,
