@@ -30,7 +30,7 @@ A fully standalone, audio-reactive DMX lighting controller for Raspberry Pi with
 - Persistent settings saved to config file
 
 ### Boot & Startup
-- 5-second splash screen on OLED at boot
+- 4-second splash screen on OLED at boot
 - Auto-start on power-up via systemd
 - Development mode toggle (`dmx-dev` command)
 - Fast boot optimizations
@@ -39,7 +39,9 @@ A fully standalone, audio-reactive DMX lighting controller for Raspberry Pi with
 
 ## Quick Start Guide
 
-This guide will take you from a blank SD card to a fully working DMX controller.
+**For a comprehensive step-by-step guide with complete wiring diagrams, see [docs/QUICKSTART.md](docs/QUICKSTART.md)**
+
+This section provides a brief overview. The full quickstart guide covers everything from flashing the SD card to testing your DMX output.
 
 ### What You'll Need
 

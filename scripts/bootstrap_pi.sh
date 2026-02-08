@@ -35,7 +35,7 @@ elif ! grep -q '^dtparam=i2s=on' "$CFG"; then
 fi
 
 echo "[5/7] Python venv (with system packages so OLA Python is visible)"
-cd ~/pi-dmx-controller
+cd ~/pi-dmx-controller-v2
 rm -rf .venv
 python3 -m venv .venv --system-site-packages
 # shellcheck disable=SC1091
