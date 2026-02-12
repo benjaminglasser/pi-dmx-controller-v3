@@ -41,6 +41,7 @@
 
 import os, sys, time, math, threading, curses, re, random
 from dataclasses import dataclass
+from collections import deque
 
 import numpy as np
 import sounddevice as sd
@@ -311,7 +312,7 @@ def get_q_min(center_hz):
         t = math.log(center_hz / 120.0) / math.log(500.0 / 120.0)
         return Q_MIN_LOW + t * (Q_MIN_HIGH - Q_MIN_LOW)
 
-THRESH_MIN = 0.001
+THRESH_MIN = 0.0  # Was 0.001, set to 0 for debugging
 THRESH_MAX = 1.0
 MIN_CENTER_HZ = 80.0
 MAX_CENTER_HZ = 12000.0
@@ -322,6 +323,7 @@ APP_ERROR = ""
 # Audio
 SR  = 44100
 HOP = 512  # Smaller for more responsive FFT
+_HANNING_WINDOW = None  # Pre-computed, initialized on first use
 
 # Detection / logic
 ENV_EMA       = 0.55
@@ -329,8 +331,8 @@ AGC_ON        = True
 AGC_TARGET    = 0.020
 REFRACTORY_MS = 110.0
 WEIGHTING_ON  = False
-INPUT_GAIN    = 1.0
-INPUT_VOLUME  = 50  # 0-99, maps to INPUT_GAIN 0.0-4.0 (25 = 1x, 50 = 2x, 99 = 4x)
+INPUT_GAIN    = 0.64  # Default gain for 3-band mode (was 0.16, now 4x higher as new center)
+INPUT_VOLUME  = 50  # 0-99, centered at 50=0.64x gain (exponential: 0=0.04x, 50=0.64x, 99=10x)
 BRIGHTNESS    = DEFAULT_BRIGHT
 
 # Threshold detection modes
@@ -353,6 +355,33 @@ TRIGGER_SPEED_FAST_MS = 200.0  # Triggers faster than this = min multiplier (0.3
 TRIGGER_SPEED_SLOW_MS = 1000.0  # Triggers slower than this = max multiplier (2.0x)
 TRIGGER_SPEED_MIN_MULT = 0.3  # Minimum multiplier for fast triggers (dampens effect)
 TRIGGER_SPEED_MAX_MULT = 2.0  # Maximum multiplier for slow triggers
+
+# Detection modes for FFT analysis
+# - "level": Uses absolute energy level (original behavior)
+# - "flux": Uses spectral flux (onset detection, better for drums/transients)
+# - "hybrid": Combines level with flux boost (default, best of both)
+DETECT_MODES = ["level", "flux", "hybrid"]
+DETECT_MODE_INDEX = 2  # Default to hybrid mode
+
+# Beat detection method: 0 = FFT_STANDARD (existing Q-band), 1 = 3BAND_DETECT (new)
+# Now always using 3BAND mode
+BEAT_DETECT_METHOD = 1
+BEAT_DETECT_METHODS = ["FFT", "3BAND"]
+
+# 3-Band detector state
+THREEBAND_SELECTED = 0  # Selected band for DMX trigger (0=LOW, 1=MID, 2=HIGH)
+THREEBAND_NAMES = ["LOW", "MID", "HIGH"]
+
+# 3-Band view mode: 0 = FFT spectrum view, 1 = Three rectangles view, 2 = Selected band detail view
+THREEBAND_VIEW_MODE = 0
+
+# Encoder mode toggles for 3BAND_DETECT (HOME page only)
+_3band_enc2_range_mode = False  # False=band select, True=range/width adjust
+_3band_enc3_gain_mode = False   # False=threshold, True=gain adjust
+
+# 3-band detector update rate
+_last_3band_update = 0.0
+THREEBAND_UPDATE_HZ = 50  # Run detector at 50 Hz (reduced from 100 for Pi performance)
 
 # Program state
 PROGRAM      = 1
@@ -435,8 +464,9 @@ _home_enc2_alt = False  # False = Freq, True = Q
 _home_enc3_alt = False  # False = Thresh, True = ThreshMode
 _home_enc4_alt = False  # False = Release, True = ReleaseMode
 
-# SET page encoder 4 toggle state (False = Output mode, True = Channel count)
+# SET page encoder toggle states
 _setup_enc4_channels = False  # False = Dimmer/DMX mode, True = Channel count (4-24)
+_setup_enc3_detect = False    # False = Input Volume, True = Detection Mode
 
 # COLOR page state
 _color_light_selection = 0  # 0=all, 1=odd, 2=even, 3+=individual light (1-indexed)
@@ -507,7 +537,8 @@ PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "ODD/EVEN", "RANDOM", "AMBIENT"]
 # FFT settings - 32 bands, 100Hz to 10kHz
 FFT_MIN_FREQ = 100
 FFT_MAX_FREQ = 10000
-FFT_NUM_BANDS = 32
+FFT_NUM_BANDS = 64
+FFT_SIZE = 2048  # Zero-pad to 2048 for ~21Hz resolution (4x better than 512 samples)
 
 def generate_log_bands(num_bands, min_freq, max_freq):
     """Generate logarithmically spaced frequency bands."""
@@ -538,13 +569,103 @@ def calculate_freq_compensation():
 
 FFT_COMPENSATION = calculate_freq_compensation()
 
-# FFT state
-fft_bands = [0.0] * len(FFT_BANDS)
-fft_peaks = [0.0] * len(FFT_BANDS)
-fft_peak_times = [0.0] * len(FFT_BANDS)
+# Pre-compute FFT bin indices for each band (PERFORMANCE OPTIMIZATION)
+# This avoids creating numpy masks on every audio callback
+_FFT_BIN_INDICES = None  # Will be computed on first use with actual freqs array
+
+def _precompute_bin_indices(freqs):
+    """Pre-compute start/end bin indices for each FFT band."""
+    global _FFT_BIN_INDICES
+    indices = []
+    for low_hz, high_hz in FFT_BANDS:
+        # Find bin indices for this band
+        start_idx = np.searchsorted(freqs, low_hz)
+        end_idx = np.searchsorted(freqs, high_hz)
+        if end_idx <= start_idx:
+            end_idx = start_idx + 1  # At least one bin
+        indices.append((start_idx, min(end_idx, len(freqs))))
+    _FFT_BIN_INDICES = indices
+    return indices
+
+def get_band_energy_fast(fft_magnitudes, band_idx):
+    """Fast band energy using pre-computed bin indices."""
+    start, end = _FFT_BIN_INDICES[band_idx]
+    if end > start:
+        return float(np.mean(fft_magnitudes[start:end]))
+    return float(fft_magnitudes[start]) if start < len(fft_magnitudes) else 0.0
+
+# Visual gain for FFT display (makes bars appear taller within fixed view)
+FFT_VISUAL_GAIN = 1.0
+
+# FFT state (numpy arrays for faster vectorized operations)
+fft_bands = np.zeros(len(FFT_BANDS), dtype=np.float32)
+fft_peaks = np.zeros(len(FFT_BANDS), dtype=np.float32)
+fft_peak_times = np.zeros(len(FFT_BANDS), dtype=np.float64)
 PEAK_HOLD_TIME = 0.4
 fft_recent_max = 0.3
 fft_max_decay = 0.995
+
+# Spectral flux state for onset/transient detection
+prev_band_energies = [0.0] * len(FFT_BANDS)
+fft_flux = [0.0] * len(FFT_BANDS)  # Per-band spectral flux values
+
+# Per-band normalization state (spectral whitening)
+band_running_mean = [0.01] * len(FFT_BANDS)
+band_running_max = [0.1] * len(FFT_BANDS)
+BAND_NORM_DECAY = 0.995
+
+def get_spectral_flux(current_energies, prev_energies):
+    """Calculate half-wave rectified spectral flux per band.
+    Returns only positive changes (onsets), which helps detect transients."""
+    flux = []
+    for curr, prev in zip(current_energies, prev_energies):
+        diff = curr - prev
+        flux.append(max(0, diff))  # Only positive changes (onsets)
+    return flux
+
+def normalize_band(energy, band_idx):
+    """Normalize band energy relative to its own history (spectral whitening).
+    This compensates for the natural spectral slope of music."""
+    global band_running_mean, band_running_max
+    
+    # Update running statistics
+    band_running_mean[band_idx] = (BAND_NORM_DECAY * band_running_mean[band_idx] + 
+                                    (1 - BAND_NORM_DECAY) * energy)
+    if energy > band_running_max[band_idx]:
+        band_running_max[band_idx] = energy
+    else:
+        band_running_max[band_idx] *= BAND_NORM_DECAY
+    
+    # Normalize: subtract mean, divide by range
+    range_val = band_running_max[band_idx] - band_running_mean[band_idx] + 1e-10
+    normalized = (energy - band_running_mean[band_idx]) / range_val
+    return max(0, min(1, normalized))
+
+def get_band_energy_with_q(fft_mag, freqs, center_hz, q):
+    """Get energy using a Q-shaped Gaussian frequency response curve.
+    This creates a smooth bell-curve response centered on the target frequency,
+    with Q controlling the width for better frequency isolation."""
+    bandwidth = center_hz / max(0.1, q)
+    sigma = bandwidth / 2.355  # Convert FWHM to Gaussian sigma
+    
+    # Create Gaussian weighting centered on target frequency
+    weights = np.exp(-0.5 * ((freqs - center_hz) / sigma) ** 2)
+    
+    # Weighted sum of FFT magnitudes
+    weight_sum = np.sum(weights) + 1e-10
+    energy = np.sum(fft_mag * weights) / weight_sum
+    return float(energy)
+
+def get_envelope_times(center_hz):
+    """Return (attack_ms, release_ms) based on frequency.
+    Low frequencies need slower attack to avoid false triggers from transient leakage,
+    while highs need faster response."""
+    if center_hz < 200:      # Lows
+        return (12.0, 100.0)  # Slower attack, longer release
+    elif center_hz < 2000:   # Mids
+        return (8.0, 80.0)    # Default
+    else:                    # Highs
+        return (4.0, 50.0)    # Fast attack, quick release
 
 # ===================== Encoder / Pot State =====================
 
@@ -617,8 +738,8 @@ _display_bright = DEFAULT_BRIGHT
 _display_release = int((DEFAULT_DECAY_MS - 40.0) / 4960.0 * 99)  # Release display value
 _display_q_pct = 50  # Q display value (0-99), will be recalculated dynamically
 
-# DMX throttling
-DMX_RATE_HZ       = 25.0
+# DMX throttling (44Hz is near max for DMX512 protocol)
+DMX_RATE_HZ       = 44.0
 _DMX_MIN_INTERVAL = 1.0 / DMX_RATE_HZ
 
 # --- Plug & Play Audio Selection ---
@@ -1079,6 +1200,403 @@ class Agc:
         self.gain=self.tau*self.gain+(1.0-self.tau)*desired
         return self.gain
 
+# ===================== 3-Band Onset Detector =====================
+
+@dataclass
+class BandConfig:
+    """Configuration for a single frequency band in the 3-band detector.
+    
+    TouchDesigner-style signal chain: Analyze -> Lag -> Slope -> Gain+Limit -> Trigger
+    """
+    name: str              # Band name: "LOW", "MID", "HIGH"
+    f_lo: float            # Low frequency bound (Hz)
+    f_hi: float            # High frequency bound (Hz)
+    trigger_thresh: float  # Trigger threshold (0-1) - level slope must cross to fire
+    cooldown_ms: float     # Cooldown between triggers (ms)
+    lag_attack: float      # Lag attack rate (0-1, higher = faster attack)
+    lag_decay: float       # Lag decay rate (0-1, higher = faster decay)
+    gain: float = 1.0      # Per-band gain multiplier (scales slope before triggering)
+
+
+class ThreeBandOnsetDetector:
+    """3-band onset detector using TouchDesigner-style signal chain.
+    
+    Signal chain (like TouchDesigner):
+    1. Analyze: Extract band energy from FFT
+    2. Lag: Asymmetric smoothing (fast attack, slow decay) - creates sawtooth envelope
+    3. Slope: Derivative of lagged signal - only spikes on rising edges
+    4. Gain+Limit: Normalize slope to 0-1 range
+    5. Trigger: Fire when normalized slope crosses trigger threshold
+    """
+    
+    # Guardrail constants - enforce safe band ranges
+    MIN_WIDTH_HZ = {"LOW": 40, "MID": 200, "HIGH": 500}
+    MAX_WIDTH_HZ = {"LOW": 600, "MID": 3000, "HIGH": 8000}
+    # Trigger threshold range for UI (0-1)
+    TRIGGER_RANGE = (0.05, 0.95)
+    
+    def __init__(self, sample_rate, n_fft=2048):
+        self.sr = sample_rate
+        self.sample_rate = sample_rate  # Alias for compatibility
+        self.n_fft = n_fft
+        self.nyquist = sample_rate / 2
+        
+        # Ring buffer for audio samples (kept for legacy update() method)
+        self.ring_buffer = np.zeros(n_fft, dtype=np.float32)
+        self.ring_idx = 0
+        
+        # Precompute window
+        self.window = np.hanning(n_fft).astype(np.float32)
+        
+        # ========== TOUCHDESIGNER-STYLE BAND CONFIG ==========
+        # BandConfig(name, f_lo, f_hi, trigger_thresh, cooldown_ms, lag_attack, lag_decay, gain)
+        #
+        # trigger_thresh: Level (0-1) that normalized slope must cross to trigger
+        # cooldown_ms: Minimum time between triggers (like Trigger CHOP re-trigger delay)
+        # lag_attack: How fast to follow rising signal (higher = faster, ~0.3 for kicks)
+        # lag_decay: How fast to decay (lower = slower decay, ~0.02 for sawtooth shape)
+        # gain: Boost slope signal before limiting (higher = more sensitive)
+        #
+        self.bands = [
+            # LOW: Kick - fast attack, slow decay for clean sawtooth
+            # trigger_thresh 0.068 = very sensitive (UI shows 50 at this value)
+            # lag_attack 0.4 = follow rising signal at 40% per frame
+            # lag_decay 0.015 = slow decay (1.5% per frame) for sawtooth shape
+            # gain 6.3 = +16dB boost (UI shows 0dB at this value as new center)
+            BandConfig("LOW", 40, 150, 0.068, 200, 0.4, 0.015, 6.3),
+            # MID: Snare - similar tuning
+            BandConfig("MID", 1000, 4000, 0.068, 120, 0.35, 0.02, 6.3),
+            # HIGH: Hats - similar tuning
+            BandConfig("HIGH", 6000, 16000, 0.068, 50, 0.5, 0.03, 6.3),
+        ]
+        
+        # Cross-band suppression: when one band triggers, suppress others briefly
+        self.suppression_time = [0.0, 0.0, 0.0]  # Time when suppression started
+        self.SUPPRESSION_MS = 30  # How long to suppress other bands after a trigger
+        
+        # ===== TouchDesigner-style signal chain state =====
+        # Stage 1: Raw band energy
+        self.energy = [0.0, 0.0, 0.0]           # Current band energy from FFT
+        
+        # Stage 2: Lagged energy (asymmetric smoothing like Lag CHOP)
+        self.lagged_energy = [0.0, 0.0, 0.0]    # Smoothed energy (fast attack, slow decay)
+        self.prev_lagged = [0.0, 0.0, 0.0]      # Previous lagged value for slope calc
+        
+        # Stage 3: Slope (derivative like Slope CHOP)
+        self.slope = [0.0, 0.0, 0.0]            # Rate of change of lagged energy
+        
+        # Stage 4: Normalized slope (after gain + limit)
+        self.normalized_slope = [0.0, 0.0, 0.0] # Slope after gain and 0-1 clamping
+        
+        # Stage 5: Trigger state
+        self.trigger = [False, False, False]
+        self.trigger_flash = [0.0, 0.0, 0.0]
+        self.last_trigger_time = [0.0, 0.0, 0.0]
+        
+        # Display values for UI
+        self.display_flux = [0.0, 0.0, 0.0]     # Normalized slope for display (0-1)
+        self.display_thresh = [0.068, 0.068, 0.068]  # Trigger threshold for display (new center)
+        self.scaled_onset = [0.0, 0.0, 0.0]     # Alias for display_flux (UI compat)
+        
+        # Legacy aliases for UI compatibility
+        self.flux = [0.0, 0.0, 0.0]             # Alias for slope
+        self.prev_flux = [0.0, 0.0, 0.0]        # Previous slope
+        self.flux_mean = [0.01, 0.01, 0.01]     # Not used in new approach but kept
+        self.onset = [0.0, 0.0, 0.0]            # Alias for normalized_slope
+        self.lagged = [0.0, 0.0, 0.0]           # Alias for lagged_energy
+        self.lagged_prev = [0.0, 0.0, 0.0]      # Alias for prev_lagged
+        self.prev_energy = [0.0, 0.0, 0.0]      # Not used but kept for compat
+        self.armed = [True, True, True]         # Not used but kept for compat
+        
+        # History buffers for UI (deque is faster than list slicing)
+        self.onset_history = [deque([0.0] * 64, maxlen=64) for _ in range(3)]
+        self.trigger_history = [deque([False] * 64, maxlen=64) for _ in range(3)]
+        
+        # AGC disabled
+        self.agc_enabled = False
+        self.agc_gain = 1.0
+    
+    def push_samples(self, samples):
+        """Add samples to ring buffer - NO processing, just store."""
+        if len(samples) == 0:
+            return
+        
+        # Store in ring buffer
+        n = len(samples)
+        if n >= self.n_fft:
+            # If we have more samples than buffer, just take the last n_fft
+            self.ring_buffer[:] = samples[-self.n_fft:]
+            self.ring_idx = 0
+        else:
+            # Wrap around if needed
+            end_idx = self.ring_idx + n
+            if end_idx <= self.n_fft:
+                self.ring_buffer[self.ring_idx:end_idx] = samples
+                self.ring_idx = end_idx % self.n_fft
+            else:
+                # Split across buffer end
+                first_part = self.n_fft - self.ring_idx
+                self.ring_buffer[self.ring_idx:] = samples[:first_part]
+                self.ring_buffer[:n - first_part] = samples[first_part:]
+                self.ring_idx = n - first_part
+    
+    def update_from_fft_bands(self, fft_bands, fft_band_freqs, dt):
+        """
+        TouchDesigner-style onset detection using signal chain:
+        Analyze -> Lag -> Slope -> Gain+Limit -> Trigger
+        
+        This produces clean, consistent trigger pulses like TouchDesigner's chan4 output.
+        
+        Pipeline:
+        1. Analyze: Get band energy from normalized fft_bands (0-1)
+        2. Lag: Asymmetric smoothing (fast attack, slow decay) - creates sawtooth envelope
+        3. Slope: Derivative of lagged signal (half-wave rectified) - only spikes on rising edges
+        4. Gain+Limit: Normalize slope to 0-1 range
+        5. Trigger: Fire when normalized slope crosses trigger threshold
+        """
+        now = time.time()
+        
+        # First pass: compute normalized slope for all bands
+        for i, band in enumerate(self.bands):
+            # ===== Stage 1: ANALYZE - Get band energy =====
+            band_energy = 0.0
+            band_count = 0
+            for j, (band_lo, band_hi) in enumerate(fft_band_freqs):
+                band_center = (band_lo + band_hi) / 2
+                if band.f_lo <= band_center <= band.f_hi:
+                    band_energy += fft_bands[j]
+                    band_count += 1
+            if band_count > 0:
+                band_energy /= band_count
+            self.energy[i] = float(band_energy)
+            
+            # ===== Stage 2: LAG - Asymmetric smoothing (like Lag CHOP) =====
+            # Fast attack: follow rising signal quickly
+            # Slow decay: hold and decay slowly (creates sawtooth shape)
+            if self.energy[i] > self.lagged_energy[i]:
+                # Rising - fast attack
+                self.lagged_energy[i] += (self.energy[i] - self.lagged_energy[i]) * band.lag_attack
+            else:
+                # Falling - slow decay
+                self.lagged_energy[i] += (self.energy[i] - self.lagged_energy[i]) * band.lag_decay
+            
+            # ===== Stage 3: SLOPE - Derivative (like Slope CHOP) =====
+            # Half-wave rectified: only positive slopes (rising edges)
+            # This is what makes kicks stand out - they have the fastest rise
+            raw_slope = max(0.0, self.lagged_energy[i] - self.prev_lagged[i])
+            self.slope[i] = raw_slope
+            self.prev_lagged[i] = self.lagged_energy[i]
+            
+            # ===== Stage 4: GAIN + LIMIT (like Math CHOP + Limit CHOP) =====
+            # Apply gain to boost slope to usable range, then clamp to 0-1
+            self.normalized_slope[i] = min(1.0, raw_slope * band.gain)
+            
+            # Store for legacy compatibility
+            self.flux[i] = self.slope[i]
+            self.prev_flux[i] = self.slope[i]
+        
+        # Second pass: trigger decision with cross-band suppression
+        # Find which band has the strongest normalized slope
+        slope_values = [self.normalized_slope[i] for i in range(3)]
+        dominant_band = slope_values.index(max(slope_values)) if max(slope_values) > 0 else -1
+        
+        for i, band in enumerate(self.bands):
+            # Check if this band is suppressed by another band's recent trigger
+            suppressed = False
+            for j in range(3):
+                if j != i and (now - self.suppression_time[j]) * 1000 < self.SUPPRESSION_MS:
+                    suppressed = True
+                    break
+            
+            # ===== Stage 5: TRIGGER (like Trigger CHOP) =====
+            # Simple threshold crossing on normalized slope
+            above_threshold = self.normalized_slope[i] > band.trigger_thresh
+            cooldown_ok = (now - self.last_trigger_time[i]) * 1000 >= band.cooldown_ms
+            
+            # Cross-band isolation: prefer dominant band
+            is_dominant = (i == dominant_band)
+            significantly_above = (self.normalized_slope[i] > band.trigger_thresh * 1.5)
+            
+            if above_threshold and cooldown_ok and not suppressed and (is_dominant or significantly_above):
+                self.trigger[i] = True
+                self.trigger_flash[i] = 1.0
+                self.last_trigger_time[i] = now
+                self.suppression_time[i] = now  # Start suppressing other bands
+            else:
+                self.trigger[i] = False
+            
+            # #region agent log
+            # Log kick detection details (band 0 = LOW)
+            if i == 0 and (self.normalized_slope[i] > 0.05 or self.trigger[i]):
+                import json as _json
+                with open("/home/benglasser/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({
+                        "ts": int(now*1000), "type": "TD_KICK",
+                        "energy": round(float(self.energy[i]), 4),
+                        "lagged": round(float(self.lagged_energy[i]), 4),
+                        "slope": round(float(self.slope[i]), 4),
+                        "norm_slope": round(float(self.normalized_slope[i]), 3),
+                        "thresh": round(float(band.trigger_thresh), 2),
+                        "cooldown_ok": cooldown_ok,
+                        "trig": self.trigger[i]
+                    }) + "\n")
+            # #endregion
+            
+            # Update display values for UI
+            # normalized_slope is already 0-1, perfect for display
+            self.display_flux[i] = self.normalized_slope[i]
+            self.scaled_onset[i] = self.normalized_slope[i]
+            
+            # Threshold line position is directly the trigger_thresh (0-1)
+            self.display_thresh[i] = band.trigger_thresh
+            
+            # Update aliases for UI compatibility
+            self.onset[i] = self.normalized_slope[i]
+            self.lagged[i] = self.lagged_energy[i]
+            self.lagged_prev[i] = self.prev_lagged[i]
+            
+            # Decay flash for UI (~100ms visible at 50Hz update rate)
+            if not self.trigger[i]:
+                self.trigger_flash[i] *= 0.78
+            
+            # Update history for UI graphs
+            self.onset_history[i].append(self.scaled_onset[i])
+            self.trigger_history[i].append(self.trigger[i])
+        
+        return [(self.energy[i], self.flux[i], self.scaled_onset[i], self.trigger[i]) 
+                for i in range(3)]
+    
+    def update(self, dt):
+        """Legacy method - computes own FFT. Use update_from_fft_bands for normalized input.
+        
+        Now uses spectral flux approach for consistency with update_from_fft_bands.
+        """
+        now = time.time()
+        
+        buf = np.concatenate([
+            self.ring_buffer[self.ring_idx:],
+            self.ring_buffer[:self.ring_idx]
+        ])
+        windowed = buf * self.window
+        fft_mag = np.abs(np.fft.rfft(windowed)) / self.n_fft
+        freqs = np.fft.rfftfreq(self.n_fft, 1.0 / self.sr)
+        
+        for i, band in enumerate(self.bands):
+            # Stage 1: Get band energy
+            mask = (freqs >= band.f_lo) & (freqs < band.f_hi)
+            if np.any(mask):
+                self.energy[i] = float(np.mean(fft_mag[mask]))
+            else:
+                self.energy[i] = 0.0
+            
+            # Stage 2: Asymmetric Lag (fast attack, slow decay)
+            if self.energy[i] > self.lagged_energy[i]:
+                self.lagged_energy[i] += (self.energy[i] - self.lagged_energy[i]) * band.lag_attack
+            else:
+                self.lagged_energy[i] += (self.energy[i] - self.lagged_energy[i]) * band.lag_decay
+            
+            # Stage 3: Slope (derivative, half-wave rectified)
+            self.slope[i] = max(0.0, self.lagged_energy[i] - self.prev_lagged[i])
+            self.prev_lagged[i] = self.lagged_energy[i]
+            
+            # Stage 4: Gain + Limit
+            self.normalized_slope[i] = min(1.0, self.slope[i] * band.gain)
+            
+            # Stage 5: Trigger
+            above_threshold = self.normalized_slope[i] > band.trigger_thresh
+            cooldown_ok = (now - self.last_trigger_time[i]) * 1000 >= band.cooldown_ms
+            
+            if above_threshold and cooldown_ok:
+                self.trigger[i] = True
+                self.trigger_flash[i] = 1.0
+                self.last_trigger_time[i] = now
+            else:
+                self.trigger[i] = False
+            
+            # Update display values
+            self.display_flux[i] = self.normalized_slope[i]
+            self.scaled_onset[i] = self.normalized_slope[i]
+            self.display_thresh[i] = band.trigger_thresh
+            
+            # Update aliases for UI
+            self.flux[i] = self.slope[i]
+            self.onset[i] = self.normalized_slope[i]
+            self.lagged[i] = self.lagged_energy[i]
+            self.lagged_prev[i] = self.prev_lagged[i]
+            
+            # Decay flash for UI (~100ms visible at 50Hz update rate)
+            if not self.trigger[i]:
+                self.trigger_flash[i] *= 0.78
+            
+            self.onset_history[i].append(self.scaled_onset[i])
+            self.trigger_history[i].append(self.trigger[i])
+        
+        return [(self.energy[i], self.flux[i], self.scaled_onset[i], self.trigger[i]) 
+                for i in range(3)]
+    
+    def get_adaptive_threshold(self, band_idx):
+        """Get the current trigger threshold for a band (for UI display)."""
+        band = self.bands[band_idx]
+        return band.trigger_thresh
+    
+    def adjust_width(self, band_idx, delta_pct):
+        """Adjust band width with band-specific cropping behavior.
+        
+        - LOW: Crops from right only (anchored at low end) - adjust how high kicks reach
+        - MID: Crops from both sides uniformly (centered) - adjust snare width symmetrically
+        - HIGH: Crops from left only (anchored at high end) - adjust how low hats reach
+        """
+        band = self.bands[band_idx]
+        width = band.f_hi - band.f_lo
+        
+        # Apply percentage change to width
+        new_width = width * (1 + delta_pct / 100.0)
+        
+        # Enforce min/max width
+        min_w = self.MIN_WIDTH_HZ[band.name]
+        max_w = self.MAX_WIDTH_HZ[band.name]
+        new_width = max(min_w, min(max_w, new_width))
+        
+        # Compute new bounds based on band type
+        if band.name == "LOW":
+            # Anchor at low end, adjust high end only
+            new_lo = band.f_lo
+            new_hi = band.f_lo + new_width
+        elif band.name == "HIGH":
+            # Anchor at high end, adjust low end only
+            new_hi = band.f_hi
+            new_lo = band.f_hi - new_width
+        else:  # MID
+            # Symmetric around center (original behavior)
+            center = (band.f_lo + band.f_hi) / 2
+            new_lo = center - new_width / 2
+            new_hi = center + new_width / 2
+        
+        # Clamp to valid frequency range
+        if new_lo < 20:
+            new_lo = 20
+            if band.name == "LOW":
+                new_hi = new_lo + new_width
+        if new_hi > self.nyquist - 100:
+            new_hi = self.nyquist - 100
+            if band.name == "HIGH":
+                new_lo = new_hi - new_width
+        
+        # Ensure f_lo < f_hi
+        if new_lo >= new_hi:
+            new_lo = new_hi - min_w
+        
+        band.f_lo = max(20, new_lo)
+        band.f_hi = min(self.nyquist - 100, new_hi)
+    
+    def get_trigger_for_selected(self, selected_idx):
+        """Return trigger state for DMX integration."""
+        return self.trigger[selected_idx]
+
+
+# Global 3-band detector instance (initialized in audio_loop)
+three_band_detector = None
+
 # ===================== Input device pick =====================
 
 def pick_input_device():
@@ -1125,6 +1643,8 @@ def update_encoders():
     global _discrete_last_change
     global current_page, encoder1_value
     global RELEASE_MODE_INDEX
+    global _effective_release_display, _release_knob_last_turn
+    global THREEBAND_SELECTED, _3band_enc2_range_mode, _3band_enc3_gain_mode
     
     if DEV_NO_HW:
         return
@@ -1186,8 +1706,68 @@ def update_encoders():
                 delta = base_delta * mult
                 # Range (0.1-10s), fine control: 0.05s per slow click (~200 steps)
                 ambient_fade_time = max(0.1, min(10.0, ambient_fade_time + delta * 0.05))
+        elif BEAT_DETECT_METHOD == 1:
+            # ===== 3BAND_DETECT mode =====
+            # Enc A: Band select OR Range/width adjust (toggle with click)
+            if raw_deltas[0] != 0:
+                if _3band_enc2_range_mode:
+                    # Range/width adjust for selected band
+                    if three_band_detector is not None:
+                        # 5% width change per detent
+                        three_band_detector.adjust_width(THREEBAND_SELECTED, raw_deltas[0] * 5)
+                else:
+                    # Band select (cycle through LOW/MID/HIGH)
+                    now = time.time()
+                    elapsed_ms = (now - _discrete_last_change[1]) * 1000
+                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                        delta = 1 if raw_deltas[0] > 0 else -1
+                        THREEBAND_SELECTED = (THREEBAND_SELECTED + delta) % 3
+                        _discrete_last_change[1] = now
+                        ui_flash(f"Band: {THREEBAND_NAMES[THREEBAND_SELECTED]}", 0.5)
+            
+            # Enc B: Threshold OR Gain adjust (toggle with click)
+            if raw_deltas[1] != 0:
+                if three_band_detector is not None:
+                    band_cfg = three_band_detector.bands[THREEBAND_SELECTED]
+                    base_delta = 1 if raw_deltas[1] > 0 else -1
+                    mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
+                    delta = base_delta * mult
+                    
+                    if _3band_enc3_gain_mode:
+                        # Gain adjust: per-band gain multiplier (0.63 to 63.0, center at 6.3)
+                        # This gives +/- 20dB range from center
+                        band_cfg.gain = max(0.63, min(63.0, band_cfg.gain * (1.05 ** delta)))
+                    else:
+                        # Trigger threshold adjust (0.01 to 0.5, center at 0.068)
+                        # Lower value = more sensitive, higher = less sensitive
+                        # Right (positive delta) = more sensitive (lower thresh), Left = less sensitive
+                        band_cfg.trigger_thresh = max(0.01, min(0.5, band_cfg.trigger_thresh - delta * 0.01))
+            
+            # Enc C: Release (global, same as FFT mode) OR ReleaseMode (toggle with click)
+            if raw_deltas[2] != 0:
+                if _home_enc4_alt:
+                    # ReleaseMode: cycle through release modes (clamped, not wrapping)
+                    now = time.time()
+                    elapsed_ms = (now - _discrete_last_change[3]) * 1000
+                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                        delta = 1 if raw_deltas[2] > 0 else -1
+                        new_idx = max(0, min(len(RELEASE_MODES) - 1, RELEASE_MODE_INDEX + delta))
+                        if new_idx != RELEASE_MODE_INDEX:
+                            RELEASE_MODE_INDEX = new_idx
+                            _discrete_last_change[3] = now
+                else:
+                    # Release mode: (40-5000ms, display 0-99)
+                    base_delta = 1 if raw_deltas[2] > 0 else -1
+                    mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
+                    delta = base_delta * mult
+                    band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
+                    release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+                    if release_mode in ("react", "rand", "both"):
+                        _effective_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
+                        _effective_release_display = max(0, min(99, _effective_release_display))
+                        _release_knob_last_turn = time.time()
         else:
-            # Normal audio-reactive mode
+            # ===== FFT_STANDARD mode (existing behavior) =====
             # Enc A: Center frequency OR Q (toggle with click)
             if raw_deltas[0] != 0:
                 # Clamp base delta to ±1, velocity multiplier handles acceleration
@@ -1253,7 +1833,6 @@ def update_encoders():
                     band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
                     # In react/rand/both mode, snap effective release back to base when knob is turned
                     # and set buffer timestamp to delay reactivity
-                    global _effective_release_display, _release_knob_last_turn
                     release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
                     if release_mode in ("react", "rand", "both"):
                         _effective_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
@@ -1285,9 +1864,6 @@ def update_encoders():
         if raw_deltas[0] != 0:
             now = time.time()
             elapsed_ms = (now - _discrete_last_change[1]) * 1000
-            # #region agent log
-            open('/home/benglasser/.cursor/debug.log','a').write('{"hypothesisId":"H2","location":"update_enc:preset","message":"PRESET_RAW_DELTA","data":{"raw_delta":'+str(raw_deltas[0])+',"current_preset":'+str(BASE_PROGRAM)+',"elapsed_ms":'+str(int(elapsed_ms))+'},"timestamp":'+str(int(now*1000))+'}\n')
-            # #endregion
             if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
                 delta = 1 if raw_deltas[0] > 0 else -1
                 # Limit to presets 1-5 (AMBIENT only via button click)
@@ -1363,14 +1939,30 @@ def update_encoders():
                     save_defaults_mode(new_idx)
                     ui_flash(f"Defaults: {mode_name}", 0.8)
         
-        # Enc B: Input Volume (0-99)
+        # Enc B: Input Volume (0-99) OR Detection Mode (toggle with click)
         if raw_deltas[1] != 0:
-            global INPUT_VOLUME, INPUT_GAIN
-            new_vol = max(0, min(99, INPUT_VOLUME + raw_deltas[1]))
-            if new_vol != INPUT_VOLUME:
-                INPUT_VOLUME = new_vol
-                INPUT_GAIN = (new_vol / 25.0)  # Map 0-99: 0=0x, 25=1x, 50=2x, 99=4x
-                ui_flash(f"Input Vol: {INPUT_VOLUME}", 0.8)
+            if _setup_enc3_detect:
+                # Detection Mode: cycle through level/flux/hybrid
+                global DETECT_MODE_INDEX
+                now = time.time()
+                elapsed_ms = (now - _discrete_last_change[2]) * 1000
+                if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                    delta = 1 if raw_deltas[1] > 0 else -1
+                    new_idx = max(0, min(len(DETECT_MODES) - 1, DETECT_MODE_INDEX + delta))
+                    if new_idx != DETECT_MODE_INDEX:
+                        DETECT_MODE_INDEX = new_idx
+                        _discrete_last_change[2] = now
+                        ui_flash(f"Detect: {DETECT_MODES[new_idx]}", 0.8)
+            else:
+                # Input Volume mode
+                global INPUT_VOLUME, INPUT_GAIN
+                new_vol = max(0, min(99, INPUT_VOLUME + raw_deltas[1]))
+                if new_vol != INPUT_VOLUME:
+                    INPUT_VOLUME = new_vol
+                    # Exponential mapping centered at 50=0.64x (recalibrated for 3-band mode)
+                    # 0=0.04x, 50=0.64x, 99=10x (4 octaves each direction from center)
+                    INPUT_GAIN = 0.64 * (16 ** ((new_vol - 50) / 49.5))
+                    ui_flash(f"Input Vol: {INPUT_VOLUME}", 0.8)
         
         # Enc C: DMX Output Mode OR Channel Count (toggle with click) - debounced discrete control
         if raw_deltas[2] != 0:
@@ -1452,34 +2044,13 @@ def toggle_brightness():
 # ===================== GPIO / Rotary Encoders =====================
 
 def reset_to_defaults():
-    """Reset HOME page parameters (Freq, Threshold, Release, Q) and modes to current defaults."""
-    global IGNORE_KNOBS_UNTIL, THRESH_MODE_INDEX, RELEASE_MODE_INDEX
+    """Toggle between FFT and 3BAND audio analysis modes."""
+    global BEAT_DETECT_METHOD
     
-    # Get values from current defaults mode
-    mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-    preset = DEFAULTS_PRESETS[mode_name]
-    
-    if preset is None:
-        # User preset is empty - nothing to reset to
-        ui_flash(f"{mode_name} is empty", 1.0)
-        return
-    
-    # Handle both old 4-value and new 6-value preset formats
-    if len(preset) >= 6:
-        center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
-        THRESH_MODE_INDEX = thresh_mode
-        RELEASE_MODE_INDEX = release_mode
-    else:
-        center_hz, thresh, decay_ms, q_factor = preset[:4]
-    
-    # Reset HOME page parameters to the current defaults mode
-    band.center   = center_hz
-    band.thresh   = thresh
-    band.decay_ms = decay_ms
-    band.q        = q_factor
-    
-    IGNORE_KNOBS_UNTIL = time.time() + 0.3
-    ui_flash(f"Reset to {mode_name}", 1.0)
+    # Toggle between FFT (0) and 3BAND (1) modes
+    BEAT_DETECT_METHOD = 1 - BEAT_DETECT_METHOD
+    mode_name = BEAT_DETECT_METHODS[BEAT_DETECT_METHOD]
+    ui_flash(f"Mode: {mode_name}", 1.0)
 
 def save_current_as_default():
     """Save current band params and modes as the selected default preset."""
@@ -1739,6 +2310,7 @@ def encoder_reader():
     global _enc_state, _enc_count, _enc_last_click_time, _enc_velocity_mult
     global _home_enc2_alt, _home_enc3_alt, _home_enc4_alt
     global _enc2_press_time, _enc2_saving, _enc2_save_complete
+    global _3band_enc2_range_mode, _3band_enc3_gain_mode, THREEBAND_VIEW_MODE
     
     if DEV_NO_HW:
         return
@@ -1798,7 +2370,11 @@ def encoder_reader():
                 if enc1_sw == 0 and _enc_last_sw[0] == 1:
                     time.sleep(0.02)  # Debounce
                     if GPIO.input(ENC1_SW) == 0:
-                        reset_to_defaults()
+                        # Cycle through 3-band view modes (0 -> 1 -> 2 -> 0)
+                        global THREEBAND_VIEW_MODE
+                        THREEBAND_VIEW_MODE = (THREEBAND_VIEW_MODE + 1) % 3
+                        view_names = ["Spectrum", "Bands", "Detail"]
+                        ui_flash(f"View: {view_names[THREEBAND_VIEW_MODE]}", 0.5)
                 _enc_last_sw[0] = enc1_sw
                 
                 # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
@@ -1821,10 +2397,19 @@ def encoder_reader():
                         # Was in save mode but released early - cancel
                         _enc2_saving = False
                     elif press_duration < 3.0:
-                        # Short press - toggle Freq/Q mode on HOME page
+                        # Short press - toggle Freq/Q mode on HOME page (or range mode in 3BAND)
                         pages = get_pages()
                         if pages[current_page] == "HOME":
-                            _home_enc2_alt = not _home_enc2_alt
+                            if BEAT_DETECT_METHOD == 1:
+                                # 3BAND mode: toggle range/width adjust mode
+                                _3band_enc2_range_mode = not _3band_enc2_range_mode
+                                if _3band_enc2_range_mode:
+                                    ui_flash("Mode: Range", 0.5)
+                                else:
+                                    ui_flash("Mode: Band", 0.5)
+                            else:
+                                # FFT mode: toggle Freq/Q
+                                _home_enc2_alt = not _home_enc2_alt
                         # Short press - toggle to/from ambient on PRE page
                         elif pages[current_page] == "PRE":
                             global _last_preset_before_ambient, BASE_PROGRAM, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLES_BETWEEN_INDEX
@@ -1861,21 +2446,32 @@ def encoder_reader():
                 if enc3_sw == 0 and _enc_last_sw[2] == 1:
                     time.sleep(0.02)
                     if GPIO.input(ENC3_SW) == 0:
-                        # Toggle Thresh/ThreshMode on HOME page
+                        # Toggle Thresh/ThreshMode on HOME page (or gain mode in 3BAND)
                         pages = get_pages()
                         if pages[current_page] == "HOME":
-                            _home_enc3_alt = not _home_enc3_alt
+                            if BEAT_DETECT_METHOD == 1:
+                                # 3BAND mode: toggle gain adjust mode
+                                _3band_enc3_gain_mode = not _3band_enc3_gain_mode
+                                if _3band_enc3_gain_mode:
+                                    ui_flash("Mode: Gain", 0.5)
+                                else:
+                                    ui_flash("Mode: Thresh", 0.5)
+                            else:
+                                # FFT mode: toggle Thresh/ThreshMode
+                                _home_enc3_alt = not _home_enc3_alt
                         # Turn Mode OFF on PRE page
                         elif pages[current_page] == "PRE":
                             if CYCLES_BETWEEN_INDEX != 0:
                                 CYCLES_BETWEEN_INDEX = 0
                                 ui_flash("Mode: off", 0.8)
-                        # Reset Input Volume to 50 on SET page
+                        # Toggle Input Volume / Detection Mode on SET page
                         elif pages[current_page] == "SET":
-                            global INPUT_VOLUME, INPUT_GAIN
-                            INPUT_VOLUME = 50
-                            INPUT_GAIN = 1.0
-                            ui_flash("Input Vol: 50", 0.8)
+                            global _setup_enc3_detect
+                            _setup_enc3_detect = not _setup_enc3_detect
+                            if _setup_enc3_detect:
+                                ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.8)
+                            else:
+                                ui_flash(f"Input Vol: {INPUT_VOLUME}", 0.8)
                         # Toggle Hue/Temp mode on COLOR page
                         elif pages[current_page] == "COLOR":
                             global _color_enc3_temp_mode
@@ -1935,21 +2531,12 @@ def encoder_reader():
                     _enc_last_sw[4] = enc5_sw
                 
                 # ===== Reset button (GPIO 25) =====
-                # Short press = reset to defaults
-                # Long press (>1s) = toggle brightness
+                # Press = toggle between FFT and 3BAND audio analysis modes
                 reset_btn = GPIO.input(RESET_PIN)
                 if reset_btn == 0 and _reset_last_state == 1:
-                    # Button just pressed - start timing
-                    _reset_press_time = time.time()
-                elif reset_btn == 1 and _reset_last_state == 0:
-                    # Button just released - check duration
-                    press_duration = time.time() - _reset_press_time
-                    if press_duration >= 1.0:
-                        # Long press - toggle brightness
-                        toggle_brightness()
-                    else:
-                        # Short press - reset to defaults
-                        time.sleep(0.02)  # Debounce
+                    # Button just pressed
+                    time.sleep(0.02)  # Debounce
+                    if GPIO.input(RESET_PIN) == 0:
                         reset_to_defaults()
                 _reset_last_state = reset_btn
                 
@@ -1980,7 +2567,7 @@ _ambient_next_time = 0.0  # Time when next channel switch happens
 
 # Trigger indicator for UI
 trigger_flash = 0.0  # Decays over time, >0 means recently triggered
-TRIGGER_FLASH_DECAY = 0.85
+TRIGGER_FLASH_DECAY = 0.86  # Decay rate for ~100ms visible at 86Hz audio callback rate
 
 bp   = None
 envd = None
@@ -2014,13 +2601,21 @@ def audio_loop():
     global PROGRAM, BASE_PROGRAM, CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLE_AMBIENT_START
     global APP_STATE, APP_ERROR
     global fft_bands, fft_peaks, fft_peak_times, fft_recent_max
+    global three_band_detector, _last_3band_update
 
     bp   = BiquadBandpass(SR, band.center, band.q)
     envd = EnvDetector(SR, attack_ms=8.0, release_ms=80.0)
+    
+    # Initialize 3-band onset detector
+    three_band_detector = ThreeBandOnsetDetector(SR, n_fft=FFT_SIZE)
 
     band.attack_ms = DEFAULT_ATTACK_MS
     frame_dt_ms = (HOP / SR) * 1000.0
     was_above = False
+
+    # #region agent log
+    _cb_slow_count = [0]
+    # #endregion
 
     def cb(indata, frames, time_info, status):
         nonlocal was_above
@@ -2031,26 +2626,42 @@ def audio_loop():
         global _recent_min, _effective_thresh
         global _reactive_brightness_scale, _effective_release_display, _effective_brightness_display
         global _trigger_speed_multiplier
+        global prev_band_energies, fft_flux, band_running_mean, band_running_max
 
         if not RUNNING:
             return
 
-        x = indata[:, 0].astype(np.float32)
+        # #region agent log
+        _cb_start = time.time()
+        # #endregion
+
+        # Use channel 1 (Input 2 on Scarlett Solo - the line input on back)
+        # Change to indata[:, 0] for Input 1 (front XLR/inst jack)
+        x = indata[:, 1].astype(np.float32)
         x = x * INPUT_GAIN  # Apply input volume control
         input_rms = float(np.sqrt(np.mean(x*x)) + 1e-12)
 
-        # FFT analysis for display
-        window = np.hanning(len(x))
-        fft = np.fft.rfft(x * window)
-        fft_mag = np.abs(fft) / len(x)
-        freqs = np.fft.rfftfreq(len(x), 1.0 / SR)
+        # FFT analysis for display - zero-padded for better frequency resolution
+        global _HANNING_WINDOW
+        if _HANNING_WINDOW is None or len(_HANNING_WINDOW) != len(x):
+            _HANNING_WINDOW = np.hanning(len(x)).astype(np.float32)
+        padded = np.zeros(FFT_SIZE, dtype=np.float32)
+        padded[:len(x)] = x * _HANNING_WINDOW
+        fft = np.fft.rfft(padded)
+        fft_mag = np.abs(fft) / len(x)  # Normalize by original length
+        
+        # Pre-compute bin indices on first call (once only)
+        global _FFT_BIN_INDICES
+        if _FFT_BIN_INDICES is None:
+            freqs = np.fft.rfftfreq(FFT_SIZE, 1.0 / SR)
+            _precompute_bin_indices(freqs)
         
         now = time.time()
         
-        # Calculate FFT band energies with compensation
+        # Calculate FFT band energies with compensation (OPTIMIZED)
         raw_levels = []
-        for i, (low, high) in enumerate(FFT_BANDS):
-            energy = get_band_energy(fft_mag, freqs, low, high)
+        for i in range(len(FFT_BANDS)):
+            energy = get_band_energy_fast(fft_mag, i)
             energy *= FFT_COMPENSATION[i]
             if energy > 1e-10:
                 db = 20 * math.log10(energy + 1e-10)
@@ -2059,45 +2670,103 @@ def audio_loop():
                 normalized = 0
             raw_levels.append(normalized)
         
-        # Auto-normalize FFT
-        current_max = max(raw_levels) if raw_levels else 0
+        # Calculate spectral flux (onset detection) before updating prev_band_energies
+        fft_flux = get_spectral_flux(raw_levels, prev_band_energies)
+        prev_band_energies = raw_levels.copy()
+        
+        # ===== 3-Band Onset Detector =====
+        # Use the SAME normalized fft_bands that the display uses
+        # This ensures the VU meter matches what you see on the FFT
+        global _last_3band_update
+        if three_band_detector is not None:
+            # Run detector at THREEBAND_UPDATE_HZ (100 Hz)
+            dt = now - _last_3band_update
+            if dt >= 1.0 / THREEBAND_UPDATE_HZ:
+                # Use normalized fft_bands (0-1 scale) instead of raw FFT
+                # #region agent log
+                _3band_start = time.time()
+                # #endregion
+                three_band_detector.update_from_fft_bands(fft_bands, FFT_BANDS, dt)
+                _last_3band_update = now
+                # #region agent log
+                _3band_elapsed = time.time() - _3band_start
+                if _3band_elapsed > 0.005:  # >5ms is slow for this operation
+                    import json as _json
+                    with open("/home/benglasser/.cursor/debug.log", "a") as _f:
+                        _f.write(_json.dumps({"ts": int(now*1000), "type": "SLOW_3BAND", "ms": int(_3band_elapsed*1000)}) + "\n")
+                # #endregion
+        
+        # Apply per-band normalization (spectral whitening) - SKIPPED for performance
+        # The raw_levels are already compensated and work well enough
+        whitened_levels = raw_levels  # Use raw levels directly
+        
+        # Auto-normalize FFT (vectorized for performance)
+        raw_arr = np.array(raw_levels, dtype=np.float32)
+        current_max = float(np.max(raw_arr)) if len(raw_arr) > 0 else 0
         if current_max > fft_recent_max:
             fft_recent_max = current_max
         else:
             fft_recent_max = fft_recent_max * fft_max_decay
         
         norm_factor = max(0.1, fft_recent_max)
+        normalized = np.minimum(1.0, raw_arr / norm_factor)
         
-        for i, raw in enumerate(raw_levels):
-            normalized = min(1.0, raw / norm_factor)
-            if normalized > fft_bands[i]:
-                fft_bands[i] = 0.4 * normalized + 0.6 * fft_bands[i]
-            else:
-                fft_bands[i] = 0.95 * fft_bands[i]
-            
-            if fft_bands[i] > fft_peaks[i]:
-                fft_peaks[i] = fft_bands[i]
-                fft_peak_times[i] = now
-            elif now - fft_peak_times[i] > PEAK_HOLD_TIME:
-                fft_peaks[i] = max(fft_peaks[i] * 0.98, fft_bands[i])
+        # Vectorized attack/decay
+        attack_mask = normalized > fft_bands
+        fft_bands[attack_mask] = 0.7 * normalized[attack_mask] + 0.3 * fft_bands[attack_mask]
+        fft_bands[~attack_mask] = 0.88 * fft_bands[~attack_mask]
+        
+        # Vectorized peak tracking
+        new_peak_mask = fft_bands > fft_peaks
+        fft_peaks[new_peak_mask] = fft_bands[new_peak_mask]
+        fft_peak_times[new_peak_mask] = now
+        
+        decay_mask = (~new_peak_mask) & ((now - fft_peak_times) > PEAK_HOLD_TIME)
+        fft_peaks[decay_mask] = np.maximum(fft_peaks[decay_mask] * 0.98, fft_bands[decay_mask])
 
-        # Use FFT bands within Q range for trigger detection
-        # This makes the trigger match what you see on the display
+        # Calculate Q range for frequency targeting
         clamped_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center))
         bandwidth = clamped_center / max(0.1, band.q)
         low_freq = max(FFT_MIN_FREQ, clamped_center - bandwidth / 2)
         high_freq = min(FFT_MAX_FREQ, clamped_center + bandwidth / 2)
         
-        # Find max level of FFT bands within Q range
-        q_band_max = 0.0
+        # Use the SAME fft_bands values that are displayed on screen
+        # This ensures the trigger matches exactly what you see
+        display_max_in_q = 0.0
+        q_flux_max = 0.0
         for i, (band_low, band_high) in enumerate(FFT_BANDS):
             band_center_freq = math.sqrt(band_low * band_high)
             if low_freq <= band_center_freq <= high_freq:
-                q_band_max = max(q_band_max, fft_bands[i])
+                display_max_in_q = max(display_max_in_q, fft_bands[i])
+                q_flux_max = max(q_flux_max, fft_flux[i])
         
-        # Smooth the trigger envelope
-        v, a = live_band_env, ENV_EMA
-        v = a * v + (1.0 - a) * q_band_max
+        # Combine level and flux based on detection mode
+        detect_mode = DETECT_MODES[DETECT_MODE_INDEX]
+        
+        if detect_mode == "level":
+            # Pure level mode - use display values directly (what you see = what triggers)
+            q_band_max = display_max_in_q
+        elif detect_mode == "flux":
+            # Pure flux mode - uses spectral flux for onset/transient detection
+            # Better for drums and percussive sounds
+            q_band_max = min(1.0, q_flux_max * 3.0)  # Scale flux to usable range
+        else:  # "hybrid" (default)
+            # Hybrid mode - use display level but boost with flux for transients
+            flux_boost = min(0.15, q_flux_max * 1.5)  # Flux adds up to 0.15 boost
+            q_band_max = min(1.0, display_max_in_q + flux_boost)
+        
+        # Get frequency-dependent envelope smoothing
+        attack_ms, release_ms = get_envelope_times(clamped_center)
+        # Calculate EMA coefficient based on attack time (faster attack = lower coefficient)
+        freq_ema = math.exp(-1.0 / (max(1e-3, attack_ms) * 1e-3 * SR / HOP))
+        
+        # Smooth the trigger envelope with frequency-appropriate response
+        if q_band_max > live_band_env:
+            # Attack: use frequency-dependent faster response
+            v = freq_ema * live_band_env + (1.0 - freq_ema) * q_band_max
+        else:
+            # Release: use standard smoothing
+            v = ENV_EMA * live_band_env + (1.0 - ENV_EMA) * q_band_max
         live_band_env = v
         live_threshold = band.thresh
 
@@ -2132,16 +2801,22 @@ def audio_loop():
         trigger_flash = trigger_flash * TRIGGER_FLASH_DECAY
         _brightness_click_flash = _brightness_click_flash * 0.9  # Decay click indicator
 
-        # Determine trigger based on threshold mode
+        # Determine trigger based on detection method and threshold mode
         thresh_mode = THRESH_MODES[THRESH_MODE_INDEX]
         should_trigger = False
-
-        if thresh_mode == "fixed":
-            # Fixed: level-triggered (retriggers while above threshold after refractory period)
+        
+        # Check if using 3BAND detection mode
+        if BEAT_DETECT_METHOD == 1 and three_band_detector is not None:
+            # 3BAND_DETECT mode: use trigger from selected band
+            should_trigger = three_band_detector.trigger[THREEBAND_SELECTED]
+            # Use the selected band's adaptive threshold for display
+            _effective_thresh = three_band_detector.get_adaptive_threshold(THREEBAND_SELECTED)
+        elif thresh_mode == "fixed":
+            # FFT_STANDARD: Fixed edge-triggered (only triggers once when crossing above threshold)
             _effective_thresh = band.thresh
-            should_trigger = above and can_fire
+            should_trigger = above and not was_above and can_fire
         elif thresh_mode == "adapt":
-            # Adaptive: trigger on rise above recent minimum
+            # FFT_STANDARD: Adaptive - trigger on rise above recent minimum
             # Scale threshold: 0=very sensitive (0.02 rise), 99=less sensitive (0.6 rise)
             adapt_thresh = 0.02 + band.thresh * 0.58
             relative_rise = live_band_env - _recent_min
@@ -2304,8 +2979,17 @@ def audio_loop():
         send_dmx(update_lights(frame_dt_ms))
         was_above = above
 
+        # #region agent log
+        _cb_elapsed = time.time() - _cb_start
+        if _cb_elapsed > 0.012 and _cb_slow_count[0] < 30:  # >12ms is slow (buffer is 11.6ms)
+            _cb_slow_count[0] += 1
+            import json as _json
+            with open("/home/benglasser/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"ts": int(_cb_start*1000), "type": "SLOW_CB", "ms": int(_cb_elapsed*1000)}) + "\n")
+        # #endregion
+
     try:
-        with sd.InputStream(device=DEVICE_INDEX, channels=1, samplerate=SR, blocksize=HOP, callback=cb):
+        with sd.InputStream(device=DEVICE_INDEX, channels=2, samplerate=SR, blocksize=HOP, callback=cb):
             APP_STATE = "ready"
             if AUDIO_DEBUG:
                 print(f"[AUDIO] Using device {DEVICE_INDEX}: {DEVICE_NAME}")
@@ -2342,7 +3026,7 @@ class OledUI:
             serial = luma_spi(
                 device=OLED_SPI_DEV,
                 port=0,
-                bus_speed_hz=2000000,  # 2MHz - tested stable on PCB v2
+                bus_speed_hz=4000000,  # 4MHz - faster OLED updates
                 gpio_DC=OLED_DC_PIN,
                 gpio_RST=OLED_RST_PIN,
             )
@@ -2404,11 +3088,43 @@ class OledUI:
 
     def _draw_fft_spectrum(self, draw, x, y, width, height):
         """Draw FFT spectrum with Q band highlighting.
+        - Left: Vertical meter showing band envelope vs threshold
         - Bars inside Q range above threshold: crosshatch/dashed (triggering zone)
         - Bars inside Q range below threshold: solid fill
         - Bars outside Q range: single-pixel outline
         - Q range boundaries: vertical lines
         - Threshold line: horizontal within Q range"""
+        
+        # === Left side: Band envelope meter (10px wide) ===
+        meter_width = 10
+        meter_x = x + 1
+        meter_height = height - 2
+        meter_y = y + 1
+        
+        # Draw meter outline
+        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=1)
+        
+        # Draw band envelope level (filled from bottom)
+        env_height = int(min(1.0, live_band_env) * (meter_height - 2))
+        if env_height > 0:
+            fill_y = meter_y + meter_height - 1 - env_height
+            triggered = trigger_flash > 0.2
+            if triggered:
+                # Solid fill with horizontal lines when triggered
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+                for py in range(fill_y, meter_y + meter_height - 1, 3):
+                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=0)
+            else:
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+        
+        # Draw threshold line on meter
+        thresh_meter_y = meter_y + meter_height - 1 - int(_effective_thresh * (meter_height - 2))
+        draw.line((meter_x, thresh_meter_y, meter_x + meter_width - 1, thresh_meter_y), fill=1)
+        
+        # === Right side: FFT spectrum ===
+        fft_x = meter_x + meter_width + 3
+        fft_width = width - meter_width - 4
+        
         num_bands = len(fft_bands)
         
         # Calculate Q bandwidth for highlighting
@@ -2417,28 +3133,29 @@ class OledUI:
         low_freq = max(FFT_MIN_FREQ, clamped_center - bandwidth / 2)
         high_freq = min(FFT_MAX_FREQ, clamped_center + bandwidth / 2)
         
-        low_x = self._freq_to_x(low_freq, x, width)
-        high_x = self._freq_to_x(high_freq, x, width)
+        low_x = self._freq_to_x(low_freq, fft_x, fft_width)
+        high_x = self._freq_to_x(high_freq, fft_x, fft_width)
         # Use effective threshold for display (varies by threshold mode)
         thresh_y = y + height - int(_effective_thresh * height)
         
-        # Calculate bar positions with 1px gap
-        total_gaps = num_bands - 1
-        total_bar_width = width - total_gaps
-        bar_width = max(1, total_bar_width // num_bands)
+        # Calculate bar positions to fill the entire width (no gaps)
+        bar_step = fft_width / num_bands
         
         for i, level in enumerate(fft_bands):
-            bx_start = x + i * (bar_width + 1)
-            bx_end = bx_start + bar_width - 1
+            bx_start = fft_x + int(i * bar_step)
+            bx_end = fft_x + int((i + 1) * bar_step) - 1
             
-            if bx_end >= x + width:
-                bx_end = x + width - 1
-            if bx_start >= x + width:
+            if bx_end >= fft_x + fft_width:
+                bx_end = fft_x + fft_width - 1
+            if bx_start >= fft_x + fft_width:
                 continue
             
-            bar_h = int(level * height)
+            bar_h = int(level * height * FFT_VISUAL_GAIN)
             if bar_h <= 0:
                 continue
+            
+            # Clip to view height (bars can exceed view with visual gain)
+            bar_h = min(bar_h, height)
             
             # Get the center frequency of this band
             band_low, band_high = FFT_BANDS[i]
@@ -2488,6 +3205,277 @@ class OledUI:
         if trigger_flash > 0.2:
             flash_height = 3
             draw.rectangle((low_x + 1, y, high_x - 1, y + flash_height), fill=1)
+
+    def _format_freq_range(self, f_lo, f_hi):
+        """Format frequency range for display (e.g., '2.5k-4.5k')."""
+        def fmt(f):
+            if f >= 1000:
+                val = f"{f/1000:.1f}k"
+                # Remove trailing .0 but keep other decimals
+                if val.endswith('.0k'):
+                    val = val[:-3] + 'k'
+                return val
+            return str(int(f))
+        return f"{fmt(f_lo)}-{fmt(f_hi)}"
+
+    def _draw_3band_vu(self, draw, x, y, width, height):
+        """Draw 3-band visualization.
+        
+        View 0 (Spectrum): FFT with selected band highlighted
+        View 1 (Bands): Three rectangles with LOW/MID/HIGH text, trigger border
+        View 2 (Detail): Selected band detail with all parameters
+        """
+        if three_band_detector is None:
+            return
+        
+        if THREEBAND_VIEW_MODE == 0:
+            self._draw_3band_spectrum_view(draw, x, y, width, height)
+        elif THREEBAND_VIEW_MODE == 1:
+            self._draw_3band_rectangles_view(draw, x, y, width, height)
+        else:
+            self._draw_3band_detail_view(draw, x, y, width, height)
+    
+    def _draw_3band_spectrum_view(self, draw, x, y, width, height):
+        """FFT spectrum with selected band highlighted, plus onset meter showing what triggers.
+        
+        Layout:
+        - Left: Small onset meter (shows actual trigger signal with threshold)
+        - Right: FFT spectrum with selected band range highlighted
+        """
+        # Get selected band info
+        sel = THREEBAND_SELECTED
+        sel_f_lo = three_band_detector.bands[sel].f_lo
+        sel_f_hi = three_band_detector.bands[sel].f_hi
+        # Use display_thresh which moves with threshold adjustment
+        threshold = three_band_detector.display_thresh[sel]
+        onset = three_band_detector.display_flux[sel]  # Use display_flux to match threshold scale
+        triggered = three_band_detector.trigger_flash[sel] > 0.3
+        
+        # === Left side: Small onset meter (10px wide) ===
+        meter_width = 10
+        meter_x = x + 1
+        meter_height = height - 2
+        meter_y = y + 1
+        
+        # Draw meter outline
+        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=1)
+        
+        # Draw onset level (filled from bottom) - this is what actually triggers
+        onset_height = int(min(1.0, onset) * (meter_height - 2))
+        if onset_height > 0:
+            fill_y = meter_y + meter_height - 1 - onset_height
+            if triggered:
+                # Solid fill with inverted top portion when triggered (faster than checkerboard)
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+                # Add horizontal lines for visual distinction
+                for py in range(fill_y, meter_y + meter_height - 1, 3):
+                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=0)
+            else:
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+        
+        # No threshold line in 3-band mode (TouchDesigner-style detection doesn't use visual threshold)
+        
+        # === Right side: FFT spectrum ===
+        fft_x = meter_x + meter_width + 3
+        fft_width = width - meter_width - 4  # Use more of the available width
+        fft_height = height
+        num_bands = len(fft_bands)
+        
+        # Calculate bar positions to fill the entire width (no gaps)
+        bar_step = fft_width / num_bands
+        
+        # Get x positions for selected band boundaries (relative to fft_x)
+        sel_low_x = self._freq_to_x(sel_f_lo, fft_x, fft_width)
+        sel_high_x = self._freq_to_x(sel_f_hi, fft_x, fft_width)
+        
+        # Draw FFT bars
+        for i, level in enumerate(fft_bands):
+            bx_start = fft_x + int(i * bar_step)
+            bx_end = fft_x + int((i + 1) * bar_step) - 1
+            
+            if bx_end >= fft_x + fft_width:
+                bx_end = fft_x + fft_width - 1
+            if bx_start >= fft_x + fft_width:
+                continue
+            
+            bar_h = int(level * fft_height * FFT_VISUAL_GAIN)
+            if bar_h <= 0:
+                continue
+            
+            # Clip to view height (bars can exceed view with visual gain)
+            bar_h = min(bar_h, fft_height)
+            
+            # Get the center frequency of this FFT band
+            band_low, band_high = FFT_BANDS[i]
+            band_center = math.sqrt(band_low * band_high)
+            
+            # Check if this FFT band is within the selected 3-band range
+            in_selected_range = (band_center >= sel_f_lo and band_center <= sel_f_hi)
+            
+            bar_top = y + fft_height - bar_h
+            bar_bottom = y + fft_height - 1
+            
+            if in_selected_range:
+                # Solid fill for bars in selected range (no threshold crosshatch in 3-band mode)
+                draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=1)
+            else:
+                # Outline only for bars outside selected range
+                draw.line((bx_start, bar_top, bx_end, bar_top), fill=1)
+                if bar_h > 1:
+                    draw.line((bx_start, bar_top, bx_start, bar_bottom), fill=1)
+                    draw.line((bx_end, bar_top, bx_end, bar_bottom), fill=1)
+        
+        # Draw vertical lines at band boundaries
+        draw.line((sel_low_x, y, sel_low_x, y + fft_height - 1), fill=1)
+        draw.line((sel_high_x, y, sel_high_x, y + fft_height - 1), fill=1)
+        
+        # No threshold line in 3-band mode
+        
+        # Draw trigger flash at top of selected range
+        if triggered:
+            flash_height = 3
+            draw.rectangle((sel_low_x + 1, y, sel_high_x - 1, y + flash_height), fill=1)
+    
+    def _draw_3band_rectangles_view(self, draw, x, y, width, height):
+        """Three rectangles with LOW/MID/HIGH text, selected has border, trigger fills inside."""
+        band_names = ["LOW", "MID", "HIGH"]
+        
+        # Calculate rectangle dimensions with padding for selection border
+        padding = 2  # Space for selection border on edges
+        gap = 3  # Gap between rectangles
+        usable_width = width - padding * 2  # Leave room for selection border on left/right
+        rect_width = (usable_width - gap * 2) // 3
+        rect_height = height - 6  # Leave margin for selection border top/bottom
+        rect_y = y + 3
+        
+        for i in range(3):
+            rect_x = x + padding + i * (rect_width + gap)
+            is_selected = (i == THREEBAND_SELECTED)
+            triggered = three_band_detector.trigger_flash[i] > 0.3
+            
+            # Selected band: double border (outer indicator)
+            if is_selected:
+                draw.rectangle((rect_x - 2, rect_y - 2, rect_x + rect_width + 1, rect_y + rect_height + 1), outline=1)
+                draw.rectangle((rect_x, rect_y, rect_x + rect_width - 1, rect_y + rect_height - 1), outline=1)
+            else:
+                # Non-selected: single outline
+                draw.rectangle((rect_x, rect_y, rect_x + rect_width - 1, rect_y + rect_height - 1), outline=1)
+            
+            # Trigger: fill inside the rectangle
+            if triggered:
+                draw.rectangle((rect_x + 2, rect_y + 2, rect_x + rect_width - 3, rect_y + rect_height - 3), fill=1)
+            
+            # Draw band name centered in rectangle
+            label = band_names[i]
+            text_width = len(label) * 5
+            text_x = rect_x + (rect_width - text_width) // 2
+            text_y = rect_y + (rect_height - 8) // 2
+            
+            # Invert text color when triggered (so it's visible on filled background)
+            fill_color = 0 if triggered else 1
+            draw.text((text_x, text_y), label, font=self._font_small, fill=fill_color)
+    
+    def _draw_3band_detail_view(self, draw, x, y, width, height):
+        """Selected band detail view with VU meter, info, and running line graph.
+        
+        Layout:
+        - Left: VU meter (onset level)
+        - Middle: Info (band name, freq range)
+        - Right: Running line graph showing onset over time with trigger markers
+        """
+        band_names = ["LOW", "MID", "HIGH"]
+        sel = THREEBAND_SELECTED
+        band_cfg = three_band_detector.bands[sel]
+        
+        # Get display values
+        onset = three_band_detector.display_flux[sel]
+        f_lo = band_cfg.f_lo
+        f_hi = band_cfg.f_hi
+        triggered = three_band_detector.trigger_flash[sel] > 0.3
+        
+        # === Left side: VU meter (12px wide) ===
+        meter_width = 12
+        meter_x = x + 2
+        meter_height = height - 2
+        meter_y = y + 1
+        
+        # Draw meter outline
+        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=1)
+        
+        # Draw onset level (filled from bottom)
+        onset_height = int(min(1.0, onset) * (meter_height - 2))
+        if onset_height > 0:
+            fill_y = meter_y + meter_height - 1 - onset_height
+            if triggered:
+                # Solid fill with horizontal lines when triggered (faster than checkerboard)
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+                for py in range(fill_y, meter_y + meter_height - 1, 3):
+                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=0)
+            else:
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+        
+        # No threshold line in 3-band mode (TouchDesigner-style detection doesn't use visual threshold)
+        
+        # === Middle: Info ===
+        info_x = meter_x + meter_width + 4
+        
+        # Row 1: Band name + trigger indicator
+        draw.text((info_x, y), band_names[sel], font=self._font_small, fill=1)
+        trig_box_x = info_x + 22
+        trig_box_size = 6
+        if triggered:
+            draw.rectangle((trig_box_x, y, trig_box_x + trig_box_size, y + trig_box_size), fill=1)
+        else:
+            draw.rectangle((trig_box_x, y, trig_box_x + trig_box_size, y + trig_box_size), outline=1)
+        
+        # Row 2: Frequency range
+        range_str = self._format_freq_range(f_lo, f_hi)
+        draw.text((info_x, y + 9), range_str, font=self._font_small, fill=1)
+        
+        # === Right side: Running line graph ===
+        graph_width = 64  # Wider graph
+        graph_x = x + width - graph_width - 2
+        graph_y = y + 1
+        graph_height = height - 2
+        
+        # Draw graph outline
+        draw.rectangle((graph_x, graph_y, graph_x + graph_width - 1, graph_y + graph_height - 1), outline=1)
+        
+        # No threshold line in 3-band mode (TouchDesigner-style detection doesn't use visual threshold)
+        
+        # Get history data (convert deque to list for faster indexed access)
+        onset_history = list(three_band_detector.onset_history[sel])
+        trigger_history = list(three_band_detector.trigger_history[sel])
+        
+        # Calculate how many samples to show (fit to graph width)
+        num_samples = min(len(onset_history), graph_width - 2)
+        start_idx = len(onset_history) - num_samples
+        
+        # Pre-calculate y-scale factor
+        y_scale = graph_height - 3
+        base_y = graph_y + graph_height - 2
+        trig_top = graph_y + 1
+        
+        # Draw the onset line graph
+        prev_px, prev_py = None, None
+        for i in range(num_samples):
+            hist_idx = start_idx + i
+            onset_val = onset_history[hist_idx]
+            if onset_val > 1.0:
+                onset_val = 1.0
+            
+            px = graph_x + 1 + i
+            py = base_y - int(onset_val * y_scale)
+            
+            # Draw line segment from previous point
+            if prev_px is not None:
+                draw.line((prev_px, prev_py, px, py), fill=1)
+            
+            # Draw trigger marker (vertical line from bottom when triggered)
+            if trigger_history[hist_idx]:
+                draw.line((px, base_y, px, trig_top), fill=1)
+            
+            prev_px, prev_py = px, py
 
     def _draw_sun_icon(self, draw, x, y, size=7):
         """Draw sun icon for brightness."""
@@ -2619,18 +3607,25 @@ class OledUI:
         # Override labels for HOME page when in AMBIENT mode
         if page_name == "HOME" and BASE_PROGRAM == 6:
             labels = ["Speed", "--", "Fade"]
-        # Override labels for HOME page based on encoder toggle states
+        # Override labels for HOME page in 3BAND mode
+        elif page_name == "HOME" and BEAT_DETECT_METHOD == 1:
+            labels = [
+                "Range" if _3band_enc2_range_mode else "Band",
+                "Gain" if _3band_enc3_gain_mode else "Trigger",
+                "R-Mode" if _home_enc4_alt else "Release"
+            ]
+        # Override labels for HOME page based on encoder toggle states (FFT mode)
         elif page_name == "HOME":
             labels = [
                 "Q" if _home_enc2_alt else "Freq",
                 "Th-Mode" if _home_enc3_alt else "Thresh",
                 "R-Mode" if _home_enc4_alt else "Release"
             ]
-        # Override labels for SET page based on encoder 4 toggle state
+        # Override labels for SET page based on encoder toggle states
         elif page_name == "SET":
             labels = [
                 labels[0],  # Default
-                labels[1],  # Gain
+                "Detect" if _setup_enc3_detect else "Gain",
                 "Chans" if _setup_enc4_channels else "Setup"
             ]
         # Override labels for COLOR page based on encoder 3 toggle state
@@ -2674,8 +3669,52 @@ class OledUI:
                         val_str = "--"
                     else:  # Fade time - show in seconds
                         val_str = f"{ambient_fade_time:.1f}s"
+                elif BEAT_DETECT_METHOD == 1 and three_band_detector is not None:
+                    # 3BAND mode
+                    band_cfg = three_band_detector.bands[THREEBAND_SELECTED]
+                    if i == 0:  # Band name or Range (based on toggle)
+                        if _3band_enc2_range_mode:
+                            # Range mode - show frequency range
+                            val_str = self._format_freq_range(band_cfg.f_lo, band_cfg.f_hi)
+                        else:
+                            # Band select mode - show band name
+                            val_str = THREEBAND_NAMES[THREEBAND_SELECTED]
+                    elif i == 1:  # Sensitivity or Gain (based on toggle)
+                        if _3band_enc3_gain_mode:
+                            # Gain mode - show in dB relative to new center (6.3x = 0dB)
+                            # gain 6.3 = 0dB (center), gain 0.63 = -20dB, gain 63 = +20dB
+                            gain_db = 20 * math.log10(max(0.001, band_cfg.gain / 6.3))
+                            val_str = f"{gain_db:+.1f}dB"
+                        else:
+                            # Show trigger threshold as 0-99 (centered at 50 = 0.068)
+                            # trigger_thresh 0.068 = 50 (center), lower thresh = higher display
+                            # Range: 0.01 (very sensitive, display 99) to 0.5 (less sensitive, display 0)
+                            # Linear mapping: 50 at 0.068, 99 at ~0.01, 0 at ~0.5
+                            if band_cfg.trigger_thresh <= 0.068:
+                                # More sensitive than center: 50-99
+                                trig_pct = 50 + int((0.068 - band_cfg.trigger_thresh) / 0.058 * 49)
+                            else:
+                                # Less sensitive than center: 0-50
+                                trig_pct = 50 - int((band_cfg.trigger_thresh - 0.068) / 0.432 * 50)
+                            trig_pct = max(0, min(99, trig_pct))
+                            val_str = f"{trig_pct}"
+                    else:  # Release or ReleaseMode (based on toggle)
+                        if _home_enc4_alt:
+                            # ReleaseMode - show current mode name
+                            val_str = RELEASE_MODES[RELEASE_MODE_INDEX]
+                        else:
+                            # Release - 0-99 (based on decay_ms: 40-5000ms range)
+                            release_pct = int((band.decay_ms - 40.0) / 4960.0 * 99)
+                            release_pct = max(0, min(99, release_pct))
+                            if abs(release_pct - _display_release) > 1:
+                                _display_release = release_pct
+                            release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+                            if release_mode in ("react", "rand", "both"):
+                                val_str = f"{_effective_release_display}"
+                            else:
+                                val_str = f"{_display_release}"
                 else:
-                    # Normal audio-reactive mode
+                    # FFT_STANDARD mode
                     if i == 0:  # Frequency or Q (based on toggle)
                         if _home_enc2_alt:
                             # Q mode - display as 0-99 (inverted: higher = wider range)
@@ -2774,8 +3813,11 @@ class OledUI:
                         val_str = "Saved"
                     else:
                         val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                elif i == 1:  # Input Volume
-                    val_str = str(INPUT_VOLUME)
+                elif i == 1:  # Input Volume or Detection Mode (based on toggle)
+                    if _setup_enc3_detect:
+                        val_str = DETECT_MODES[DETECT_MODE_INDEX]
+                    else:
+                        val_str = str(INPUT_VOLUME)
                 else:  # DMX Output Mode or Channel Count (based on toggle)
                     if _setup_enc4_channels:
                         val_str = str(DMX_CHANNEL_COUNT)
@@ -2822,8 +3864,13 @@ class OledUI:
             draw.text((0, 0), "ERROR", font=self._font, fill=1)
             draw.text((0, 14), (APP_ERROR or "See logs")[:20], font=self._font, fill=1)
         else:
-            # FFT Spectrum (top half, full width)
-            self._draw_fft_spectrum(draw, 0, 0, W, 32)
+            # Top half: Visualization based on detection mode
+            if BEAT_DETECT_METHOD == 1:
+                # 3BAND mode: show 3-band visualization
+                self._draw_3band_vu(draw, 0, 0, W, 32)
+            else:
+                # FFT mode: show FFT spectrum with Q-band and threshold
+                self._draw_fft_spectrum(draw, 0, 0, W, 32)
             
             # Bottom half layout:
             # Row 1: [Page tabs] [Brightness]
@@ -2844,8 +3891,11 @@ class OledUI:
             pass
 
     def loop(self):
-        target_fps = 15
+        target_fps = 12  # Reduced from 15 for smoother Pi performance
         frame_time = 1.0 / target_fps
+        # #region agent log
+        _oled_slow_count = [0]
+        # #endregion
         
         while not STOP_THREADS:
             start = time.time()
@@ -2853,6 +3903,13 @@ class OledUI:
             self.render_once()
             
             elapsed = time.time() - start
+            # #region agent log
+            if elapsed > 0.12 and _oled_slow_count[0] < 30:  # >120ms is a freeze
+                _oled_slow_count[0] += 1
+                import json as _json
+                with open("/home/benglasser/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"ts": int(start*1000), "type": "SLOW_OLED", "ms": int(elapsed*1000)}) + "\n")
+            # #endregion
             sleep_time = frame_time - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
