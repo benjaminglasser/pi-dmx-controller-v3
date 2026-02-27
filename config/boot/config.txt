@@ -1,0 +1,97 @@
+###############################################################################
+# Raspberry Pi Firmware Configuration
+# PI-DMX CONTROLLER v2
+#
+# This is the complete /boot/firmware/config.txt for the DMX controller.
+# Copy this file to /boot/firmware/config.txt after a fresh OS install.
+#
+# Hardware:
+# - HiFiBerry DAC+ ADC Pro (audio input/output)
+# - SPI OLED display (SSD1309 128x64)
+# - RS485 DMX output via UART (/dev/serial0)
+# - 5 rotary encoders (GPIO)
+# - Bluetooth disabled to free UART for DMX
+###############################################################################
+
+# -----------------------
+# Enable required buses
+# -----------------------
+
+# SPI for OLED display (spidev0.0 / spidev0.1)
+dtparam=spi=on
+
+# I2C for HiFiBerry codec control
+dtparam=i2c_arm=on
+
+# Enable UART (for DMX over RS485)
+enable_uart=1
+
+# Disable Bluetooth to free primary UART for DMX
+dtoverlay=disable-bt
+
+
+# -----------------------
+# Audio
+# -----------------------
+
+# HiFiBerry DAC+ ADC Pro (replaces onboard audio)
+# Provides high-quality stereo ADC input and DAC output
+# NOTE: Use "hifiberry-dacplusadcpro" NOT "hifiberry-dacplusadc"
+dtoverlay=hifiberry-dacplusadcpro
+
+# Disable onboard audio (conflicts with HiFiBerry HAT)
+dtparam=audio=off
+
+
+# -----------------------
+# Display / GPU
+# -----------------------
+
+# Enable DRM / KMS graphics
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+
+# Let kernel decide video mode
+disable_fw_kms_setup=1
+
+# Disable overscan compensation
+disable_overscan=1
+
+
+# -----------------------
+# Camera / display autodetect
+# -----------------------
+
+camera_auto_detect=1
+display_auto_detect=1
+
+
+# -----------------------
+# Initramfs
+# -----------------------
+
+auto_initramfs=1
+
+
+# -----------------------
+# Performance
+# -----------------------
+
+arm_boost=1
+
+
+# -----------------------
+# Compute Module support
+# -----------------------
+
+[cm4]
+otg_mode=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[all]
+
+# Use only 1 chip select (CE1) to free GPIO8 for encoder 5 switch
+# This is REQUIRED for the 5-encoder setup
+dtoverlay=spi0-2cs,cs0_pin=0

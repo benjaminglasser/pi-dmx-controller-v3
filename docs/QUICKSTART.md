@@ -38,7 +38,7 @@ This guide walks you through building a complete audio-reactive DMX lighting con
 
 | Option | Notes |
 |--------|-------|
-| HiFiBerry DAC+ADC | Best quality, stacks on Pi GPIO |
+| HiFiBerry DAC+ ADC Pro | Best quality, stacks on Pi GPIO |
 | USB Audio Interface | Scarlett, Behringer, etc. |
 | USB Sound Card | Budget option with line input |
 
@@ -58,7 +58,7 @@ Any DMX512-compatible fixtures. The controller supports 4-24 channels.
    - **Device**: Your Pi model
    - **OS**: Raspberry Pi OS (32-bit) - Bookworm
    - **Storage**: Your MicroSD card
-4. Click the gear icon (⚙️) for advanced options:
+4. Click the gear icon for advanced options:
    - Enable SSH
    - Set username: `benglasser` (or your preferred username)
    - Set password
@@ -103,9 +103,9 @@ The Raspberry Pi uses BCM (Broadcom) pin numbering. Here's the complete pinout:
           (SCL) GPIO 3  (5) (6)  GND
                GPIO 4  (7) (8)  GPIO 14 (TXD) --> DMX
                   GND  (9) (10) GPIO 15 (RXD)
-    [Enc1 CLK] GPIO 17 (11) (12) GPIO 18 [Enc5 DT]
-    [Enc1 DT]  GPIO 27 (13) (14) GND
-    [Enc1 SW]  GPIO 22 (15) (16) GPIO 23 [Enc3 SW]
+    [Enc2 CLK] GPIO 17 (11) (12) GPIO 18 [Enc5 DT]
+    [Enc2 DT]  GPIO 27 (13) (14) GND
+    [Enc2 SW]  GPIO 22 (15) (16) GPIO 23 [Enc3 SW]
                  3.3V (17) (18) GPIO 24 [OLED DC]
    [SPI MOSI] GPIO 10 (19) (20) GND
    [SPI MISO]  GPIO 9 (21) (22) GPIO 25 [Reset Button]
@@ -215,14 +215,10 @@ The Pi uses internal pull-up resistors. Pressing the button pulls GPIO 25 LOW.
 
 ### 3.5 Audio Input
 
-**Option A: HiFiBerry DAC+ADC**
+**Option A: HiFiBerry DAC+ ADC Pro**
 - Simply stack the HiFiBerry board on top of the Pi's GPIO header
 - No additional wiring needed
-- Add to `/boot/firmware/config.txt`:
-  ```
-  dtparam=audio=off
-  dtoverlay=hifiberry-dacplusadc
-  ```
+- The config files in `config/boot/config.txt` already include the correct overlay
 
 **Option B: USB Audio Interface**
 - Plug into any USB port
@@ -267,7 +263,28 @@ git clone https://github.com/benjaminglasser/pi-dmx-controller-v2.git
 cd pi-dmx-controller-v2
 ```
 
-### 4.2 Run the Bootstrap Script
+### 4.2 Option A: Full Restore (Recommended)
+
+If starting from a fresh OS install, use the full restore script:
+
+```bash
+sudo scripts/full_restore.sh
+sudo reboot
+```
+
+This script:
+- Updates system packages
+- Installs all dependencies
+- Enables SPI and I2C
+- Copies boot config (`config/boot/config.txt` → `/boot/firmware/config.txt`)
+- Copies ALSA config (`config/alsa/asound.conf` → `/etc/asound.conf`)
+- Creates Python virtual environment
+- Installs systemd services
+- Verifies installation
+
+### 4.2 Option B: Bootstrap Script
+
+If you prefer step-by-step installation:
 
 ```bash
 bash scripts/bootstrap_pi.sh
@@ -301,7 +318,21 @@ This installs:
 - **dmx_audio_react.service** - Main controller (auto-starts)
 - **dmx-dev** command - Development mode toggle
 
-### 4.4 Verify Installation
+### 4.4 Install Configuration Files
+
+If the config files weren't installed by the restore script:
+
+```bash
+# Boot configuration (HiFiBerry, UART, SPI settings)
+sudo cp config/boot/config.txt /boot/firmware/config.txt
+
+# ALSA configuration (sets HiFiBerry as default audio)
+sudo cp config/alsa/asound.conf /etc/asound.conf
+
+sudo reboot
+```
+
+### 4.5 Verify Installation
 
 ```bash
 # Check services are enabled
@@ -310,6 +341,9 @@ systemctl is-enabled dmx_audio_react.service
 
 # Check dmx-dev command
 dmx-dev status
+
+# Check audio device
+arecord -l
 ```
 
 ---
@@ -507,9 +541,16 @@ dmx-dev status
 2. If using HiFiBerry, check config:
    ```bash
    grep hifiberry /boot/firmware/config.txt
+   # Should show: dtoverlay=hifiberry-dacplusadcpro
    ```
 
-3. For USB audio, try different USB port
+3. Check ALSA config exists:
+   ```bash
+   cat /etc/asound.conf
+   # Should reference sndrpihifiberry
+   ```
+
+4. For USB audio, try different USB port
 
 ### DMX Not Working
 
@@ -518,11 +559,16 @@ dmx-dev status
    ls /dev/serial0
    ```
 
-2. Verify RS485 wiring (DE and RE should be HIGH)
+2. Verify Bluetooth is disabled:
+   ```bash
+   grep disable-bt /boot/firmware/config.txt
+   ```
 
-3. Check XLR polarity (swap pins 2 and 3 if needed)
+3. Check RS485 wiring (DE and RE should be HIGH)
 
-4. Test with simple script (see section 5.3)
+4. Check XLR polarity (swap pins 2 and 3 if needed)
+
+5. Test with simple script (see section 5.3)
 
 ### Service Won't Start
 
@@ -554,6 +600,21 @@ dmx-dev status
    "
    ```
 
+### Encoder 5 Button Not Working
+
+This is usually because GPIO8 is being used by SPI CE0. The fix is already in the config:
+
+```bash
+grep spi0-2cs /boot/firmware/config.txt
+# Should show: dtoverlay=spi0-2cs,cs0_pin=0
+```
+
+If missing, copy the config file:
+```bash
+sudo cp config/boot/config.txt /boot/firmware/config.txt
+sudo reboot
+```
+
 ### Reset to Factory
 
 If things go wrong, you can always:
@@ -562,6 +623,16 @@ If things go wrong, you can always:
 cd ~/pi-dmx-controller-v2
 rm .dmx_config  # Reset saved settings
 sudo systemctl restart dmx_audio_react.service
+```
+
+### Complete System Reset
+
+For a full reset, use the restore script:
+
+```bash
+cd ~/pi-dmx-controller-v2
+sudo scripts/full_restore.sh
+sudo reboot
 ```
 
 ---
@@ -589,6 +660,10 @@ sudo systemctl restart dmx_audio_react.service
 │    sudo systemctl start dmx_audio_react.service         │
 │    sudo systemctl stop dmx_audio_react.service          │
 │    sudo journalctl -u dmx_audio_react.service -f        │
+├─────────────────────────────────────────────────────────┤
+│  CONFIG FILES:                                          │
+│    config/boot/config.txt  -> /boot/firmware/config.txt │
+│    config/alsa/asound.conf -> /etc/asound.conf          │
 └─────────────────────────────────────────────────────────┘
 ```
 
