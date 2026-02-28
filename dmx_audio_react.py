@@ -3,7 +3,7 @@
 #
 # Audio-reactive DMX with optional hardware:
 #   - 5 rotary encoders with push buttons (no MCP3008)
-#   - SPI OLED display with FFT spectrum (CE1)
+#   - SPI OLED display with FFT spectrum (CE1) - EastRising 3.2" SSD1322 256x64
 #
 # Hardware Wiring:
 #   SPI OLED:
@@ -62,7 +62,7 @@ _OLED_AVAILABLE = False
 try:
     from PIL import Image, ImageDraw, ImageFont
     from luma.core.interface.serial import spi as luma_spi
-    from luma.oled.device import ssd1309  # Waveshare 2.42" uses SSD1309
+    from luma.oled.device import ssd1322  # EastRising 3.2" uses SSD1322
     _OLED_AVAILABLE = True
 except Exception:
     _OLED_AVAILABLE = False
@@ -112,8 +112,8 @@ DEFAULTS_PRESETS = {
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dmx_config")
 
 def load_defaults_mode():
-    """Load defaults mode, DMX output mode, channel count, and any custom preset values from config."""
-    global DEFAULTS_PRESETS, DMX_OUTPUT_MODE, DMX_CHANNEL_COUNT
+    """Load defaults mode, DMX output mode, channel count, input gain, and any custom preset values from config."""
+    global DEFAULTS_PRESETS, DMX_OUTPUT_MODE, DMX_CHANNEL_COUNT, INPUT_GAIN_DB
     mode_idx = 0
     try:
         if os.path.exists(CONFIG_FILE):
@@ -135,6 +135,13 @@ def load_defaults_mode():
                                 DMX_CHANNEL_COUNT = count
                         except ValueError:
                             pass
+                    elif line.startswith("input_gain_db="):
+                        try:
+                            gain = int(line.split("=")[1])
+                            if -24 <= gain <= 24:
+                                INPUT_GAIN_DB = gain
+                        except ValueError:
+                            pass
                     elif "=" in line:
                         # Parse preset override: LOW=120.0,0.40,542.0,2.0,0,0
                         key, val = line.split("=", 1)
@@ -153,13 +160,14 @@ def load_defaults_mode():
     return mode_idx  # Default to LOW (0)
 
 def save_defaults_mode(idx):
-    """Save the defaults mode to config file, preserving preset overrides, DMX output mode, and channel count."""
+    """Save the defaults mode to config file, preserving preset overrides, DMX output mode, channel count, and gain."""
     try:
         mode_name = DEFAULTS_MODES[idx]
         # Read existing preset overrides and DMX settings
         preset_overrides = {}
         dmx_output = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
         channel_count = DMX_CHANNEL_COUNT
+        input_gain = INPUT_GAIN_DB
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 for line in f:
@@ -171,6 +179,11 @@ def save_defaults_mode(idx):
                             channel_count = int(line.split("=")[1])
                         except ValueError:
                             pass
+                    elif line.startswith("input_gain_db="):
+                        try:
+                            input_gain = int(line.split("=")[1])
+                        except ValueError:
+                            pass
                     elif "=" in line and not line.startswith("defaults_mode="):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -180,6 +193,7 @@ def save_defaults_mode(idx):
             f.write(f"defaults_mode={mode_name}\n")
             f.write(f"dmx_output_mode={dmx_output}\n")
             f.write(f"dmx_channel_count={channel_count}\n")
+            f.write(f"input_gain_db={input_gain}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -192,6 +206,7 @@ def save_dmx_output_mode(mode_idx):
         # Read existing config
         defaults_mode = "LOW"
         channel_count = DMX_CHANNEL_COUNT
+        input_gain = INPUT_GAIN_DB
         preset_overrides = {}
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -204,6 +219,11 @@ def save_dmx_output_mode(mode_idx):
                             channel_count = int(line.split("=")[1])
                         except ValueError:
                             pass
+                    elif line.startswith("input_gain_db="):
+                        try:
+                            input_gain = int(line.split("=")[1])
+                        except ValueError:
+                            pass
                     elif "=" in line and not line.startswith("dmx_output_mode="):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -213,6 +233,7 @@ def save_dmx_output_mode(mode_idx):
             f.write(f"defaults_mode={defaults_mode}\n")
             f.write(f"dmx_output_mode={output_mode}\n")
             f.write(f"dmx_channel_count={channel_count}\n")
+            f.write(f"input_gain_db={input_gain}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -224,6 +245,7 @@ def save_dmx_channel_count(count):
         # Read existing config
         defaults_mode = "LOW"
         output_mode = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
+        input_gain = INPUT_GAIN_DB
         preset_overrides = {}
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -233,6 +255,11 @@ def save_dmx_channel_count(count):
                         defaults_mode = line.split("=")[1]
                     elif line.startswith("dmx_output_mode="):
                         output_mode = line.split("=")[1]
+                    elif line.startswith("input_gain_db="):
+                        try:
+                            input_gain = int(line.split("=")[1])
+                        except ValueError:
+                            pass
                     elif "=" in line and not line.startswith("dmx_channel_count="):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -242,6 +269,43 @@ def save_dmx_channel_count(count):
             f.write(f"defaults_mode={defaults_mode}\n")
             f.write(f"dmx_output_mode={output_mode}\n")
             f.write(f"dmx_channel_count={count}\n")
+            f.write(f"input_gain_db={input_gain}\n")
+            for key, val in preset_overrides.items():
+                f.write(f"{key}={val}\n")
+    except Exception:
+        pass
+
+def save_input_gain(gain_db):
+    """Save the input gain (dB) to config file, preserving other settings."""
+    try:
+        # Read existing config
+        defaults_mode = "LOW"
+        output_mode = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
+        channel_count = DMX_CHANNEL_COUNT
+        preset_overrides = {}
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("defaults_mode="):
+                        defaults_mode = line.split("=")[1]
+                    elif line.startswith("dmx_output_mode="):
+                        output_mode = line.split("=")[1]
+                    elif line.startswith("dmx_channel_count="):
+                        try:
+                            channel_count = int(line.split("=")[1])
+                        except ValueError:
+                            pass
+                    elif "=" in line and not line.startswith("input_gain_db="):
+                        key, val = line.split("=", 1)
+                        if key in DEFAULTS_PRESETS:
+                            preset_overrides[key] = val
+        # Write back with updated input gain
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(f"defaults_mode={defaults_mode}\n")
+            f.write(f"dmx_output_mode={output_mode}\n")
+            f.write(f"dmx_channel_count={channel_count}\n")
+            f.write(f"input_gain_db={gain_db}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -254,6 +318,7 @@ def save_preset_values(mode_name, center_hz, thresh, decay_ms, q, thresh_mode, r
         defaults_mode = "LOW"
         dmx_output = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
         channel_count = DMX_CHANNEL_COUNT
+        input_gain = INPUT_GAIN_DB
         preset_overrides = {}
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -266,6 +331,11 @@ def save_preset_values(mode_name, center_hz, thresh, decay_ms, q, thresh_mode, r
                     elif line.startswith("dmx_channel_count="):
                         try:
                             channel_count = int(line.split("=")[1])
+                        except ValueError:
+                            pass
+                    elif line.startswith("input_gain_db="):
+                        try:
+                            input_gain = int(line.split("=")[1])
                         except ValueError:
                             pass
                     elif "=" in line:
@@ -279,6 +349,7 @@ def save_preset_values(mode_name, center_hz, thresh, decay_ms, q, thresh_mode, r
             f.write(f"defaults_mode={defaults_mode}\n")
             f.write(f"dmx_output_mode={dmx_output}\n")
             f.write(f"dmx_channel_count={channel_count}\n")
+            f.write(f"input_gain_db={input_gain}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -331,9 +402,12 @@ AGC_ON        = True
 AGC_TARGET    = 0.020
 REFRACTORY_MS = 110.0
 WEIGHTING_ON  = False
-INPUT_GAIN    = 0.64  # Default gain for 3-band mode (was 0.16, now 4x higher as new center)
-INPUT_VOLUME  = 50  # 0-99, centered at 50=0.64x gain (exponential: 0=0.04x, 50=0.64x, 99=10x)
+INPUT_GAIN_DB = 0  # Input gain in dB (-24 to +24), 0 = unity gain
 BRIGHTNESS    = DEFAULT_BRIGHT
+
+def db_to_linear(db):
+    """Convert dB to linear gain multiplier."""
+    return 10 ** (db / 20.0)
 
 # Threshold detection modes
 THRESH_MODES = ["fixed", "adapt"]
@@ -345,7 +419,7 @@ _effective_thresh = 0.3     # Effective threshold for display (varies by mode)
 RELEASE_MODES = ["fixed", "react", "bright", "both", "rand"]
 RELEASE_MODE_INDEX = 0  # Default to fixed (current behavior)
 _reactive_brightness_scale = 1.0  # For bright mode: scales brightness by level above threshold
-_effective_release_display = 0  # For displaying reactive release values (0-99)
+_effective_release_display = 40  # For displaying reactive release values (in ms)
 _effective_brightness_display = 50  # For displaying reactive brightness (0-99, 50 = default)
 _brightness_knob_last_turn = 0.0  # Timestamp of last brightness knob turn
 _release_knob_last_turn = 0.0  # Timestamp of last release knob turn
@@ -363,25 +437,13 @@ TRIGGER_SPEED_MAX_MULT = 2.0  # Maximum multiplier for slow triggers
 DETECT_MODES = ["level", "flux", "hybrid"]
 DETECT_MODE_INDEX = 2  # Default to hybrid mode
 
-# Beat detection method: 0 = FFT_STANDARD (existing Q-band), 1 = 3BAND_DETECT (new)
-# Now always using 3BAND mode
-BEAT_DETECT_METHOD = 1
-BEAT_DETECT_METHODS = ["FFT", "3BAND"]
+# Beat detection method: 0 = FFT_STANDARD (Q-band analysis)
+# 3-band mode has been removed - now using FFT-only mode
+BEAT_DETECT_METHOD = 0
 
-# 3-Band detector state
-THREEBAND_SELECTED = 0  # Selected band for DMX trigger (0=LOW, 1=MID, 2=HIGH)
-THREEBAND_NAMES = ["LOW", "MID", "HIGH"]
-
-# 3-Band view mode: 0 = FFT spectrum view, 1 = Three rectangles view, 2 = Selected band detail view
-THREEBAND_VIEW_MODE = 0
-
-# Encoder mode toggles for 3BAND_DETECT (HOME page only)
-_3band_enc2_range_mode = False  # False=band select, True=range/width adjust
-_3band_enc3_gain_mode = False   # False=threshold, True=gain adjust
-
-# 3-band detector update rate
+# 3-band detector update rate (kept for legacy code compatibility)
 _last_3band_update = 0.0
-THREEBAND_UPDATE_HZ = 50  # Run detector at 50 Hz (reduced from 100 for Pi performance)
+THREEBAND_UPDATE_HZ = 50
 
 # Program state
 PROGRAM      = 1
@@ -395,7 +457,7 @@ IGNORE_KNOBS_UNTIL = 0.0
 
 # Preferred device name patterns (fallback)
 PREFERRED_INPUTS = [
-    r"hifiberry", r"dac\+adc", r"scarlett", r"usb audio", r"codec", r"line", r"pulse"
+    r"scarlett", r"focusrite", r"usb audio", r"codec", r"line", r"pulse"
 ]
 
 # Rotary Encoder 1 (Page selection)
@@ -428,127 +490,113 @@ ENC5_SW_DISABLED = False  # ENABLED - brightness toggle on GPIO8
 # Reset button (separate from encoder buttons)
 RESET_PIN = 25
 
-# SPI OLED pins (Waveshare 2.42" SSD1309 on CE1)
+# SPI OLED pins (EastRising 3.2" SSD1322 on CE1)
 OLED_SPI_DEV = 1   # CE1 (GPIO 7)
 OLED_RST_PIN = 12
 OLED_DC_PIN  = 24
-OLED_WIDTH   = 128
+OLED_WIDTH   = 256
 OLED_HEIGHT  = 64
 
-# ===================== Page System =====================
+# OLED colors (SSD1322 uses RGB mode for grayscale)
+OLED_WHITE = (255, 255, 255)
+OLED_BLACK = (0, 0, 0)
+OLED_GRAY = (128, 128, 128)
 
-# All available pages (COLOR comes after SET, only shown in DMX mode)
-_ALL_PAGES = ["HOME", "PRE", "SET", "COLOR"]
-_DIMMER_PAGES = ["HOME", "PRE", "SET"]  # No COLOR page for dimmer mode
-_MAX_PAGES = 4  # Always reserve space for 4 pages for consistent icon spacing
+# ===================== Submenu System =====================
+# New UI: Top-left = FFT, Top-right = submenu tabs, Bottom = HOME controls
 
-def get_pages():
-    """Get available pages based on DMX output mode. COLOR page only available in DMX mode."""
-    if DMX_OUTPUT_MODE == 1:  # DMX mode
-        return _ALL_PAGES
-    return _DIMMER_PAGES
+# Submenu tabs (cycled by reset button)
+SUBMENU_TABS = ["Presets", "Settings", "Setup"]
+submenu_tab = 0        # 0=PRE, 1=SET, 2=SETUP
+submenu_column = 0     # 0-2 for which column is selected
+submenu_editing = False  # True when encoder 1 is editing selected column value
 
-# For backward compatibility, PAGES is now a function call
-PAGES = _DIMMER_PAGES  # Default, will be updated dynamically
-
-PAGE_POT_LABELS = {
-    "HOME": ["Freq", "Thresh", "Rels"],      # Freq center, Threshold, Release
-    "ADV": ["Q", "ThPre", "RelMd"],           # Q, Threshold Preset, Release Mode
-    "PRE": ["Preset", "Mode", "Beats"],       # Preset selection, Cycle mode, Beat cycles
-    "COLOR": ["Light", "HSV", "Sat"],         # Light select, HSV, Saturation
-    "SET": ["Reset", "Gain", "Setup"],        # Reset defaults, Input Gain, DMX Output Mode
+# Submenu column labels for each tab
+SUBMENU_LABELS = {
+    "Presets": ["Preset", "Mode", "Beats"],
+    "Settings": ["Gain", "Reset", ""],      # Reset = preset selector, col 3 blank
+    "Setup": ["Output", "Chans", "Band"],   # Output=Dimmer/DMX, Chans=4-24, Band=LOW/MID/HIGH
 }
 
-# HOME page encoder toggle states (False = primary, True = alternate)
+# Setup tab Band selection state
+SETUP_BAND_INDEX = 0  # 0=LOW, 1=MID, 2=HIGH
+SETUP_BAND_OPTIONS = ["LOW", "MID", "HIGH"]
+
+# HOME controls (always visible on bottom half)
+# Encoder toggle states for HOME controls
 _home_enc2_alt = False  # False = Freq, True = Q
 _home_enc3_alt = False  # False = Thresh, True = ThreshMode
 _home_enc4_alt = False  # False = Release, True = ReleaseMode
 
-# SET page encoder toggle states
-_setup_enc4_channels = False  # False = Dimmer/DMX mode, True = Channel count (4-24)
-_setup_enc3_detect = False    # False = Input Volume, True = Detection Mode
+# Legacy compatibility - keep current_page and get_pages() for remaining references
+current_page = 0
+_LEGACY_PAGES = ["HOME"]  # Only HOME page now - other pages are in submenu
 
-# COLOR page state
-_color_light_selection = 0  # 0=all, 1=odd, 2=even, 3+=individual light (1-indexed)
-_color_hue = 50            # 0-99 hue value (maps to 0-360 degrees)
-_color_saturation = 99     # 0-99 saturation (0=white, 99=full color)
-_color_temperature = 50    # 0-99 temperature (0=cool white, 99=warm white)
-_color_enc3_temp_mode = False  # False=Hue mode, True=Temperature mode
+def get_pages():
+    """Legacy function for compatibility - always returns HOME page."""
+    return _LEGACY_PAGES
 
-# Page icons - pixel art as coordinate lists (drawn in 9x9 space)
+# Legacy page labels (kept for _draw_pot_values compatibility)
+PAGE_POT_LABELS = {
+    "HOME": ["Freq", "Thresh", "Rels"],
+}
+
+# Legacy page icons (kept for compatibility)
 PAGE_ICONS = {
-    "HOME": [  # House shape
-        (4, 0),  # roof peak
-        (3, 1), (5, 1),
-        (2, 2), (6, 2),
-        (1, 3), (7, 3),
-        (0, 4), (8, 4),  # roof base
-        (1, 4), (2, 4), (3, 4), (4, 4), (5, 4), (6, 4), (7, 4),
-        (2, 5), (2, 6), (2, 7), (2, 8),  # left wall
-        (6, 5), (6, 6), (6, 7), (6, 8),  # right wall
-        (2, 8), (3, 8), (4, 8), (5, 8), (6, 8),  # floor
-        (4, 6), (4, 7), (4, 8),  # door
-    ],
-    "ADV": [  # Plus sign
-        (4, 1), (4, 2), (4, 3), (4, 4), (4, 5), (4, 6), (4, 7),  # vertical
-        (1, 4), (2, 4), (3, 4), (5, 4), (6, 4), (7, 4),  # horizontal
-    ],
-    "PRE": [  # Number/list icon (1 2 3)
-        (1, 1), (2, 1), (2, 2), (2, 3),  # "1"
-        (4, 1), (5, 1), (6, 1), (6, 2), (5, 3), (4, 4), (4, 5), (5, 5), (6, 5),  # "2" simplified
-        (1, 7), (2, 7), (3, 7), (5, 7), (6, 7), (7, 7),  # dots/lines
-    ],
-    "COLOR": [  # Palette/droplet
-        (4, 0), (3, 1), (5, 1),
-        (2, 2), (6, 2),
-        (1, 3), (7, 3),
-        (1, 4), (7, 4),
-        (1, 5), (7, 5),
-        (2, 6), (6, 6),
-        (3, 7), (4, 7), (5, 7),
-        (3, 3), (5, 4),  # inner dots
-    ],
-    "SET": [  # Gear icon
-        (4, 0),
-        (3, 1), (4, 1), (5, 1),
-        (2, 2), (6, 2),
-        (1, 3), (2, 3), (3, 3), (5, 3), (6, 3), (7, 3),
-        (0, 4), (1, 4), (3, 4), (5, 4), (7, 4), (8, 4),
-        (1, 5), (2, 5), (3, 5), (5, 5), (6, 5), (7, 5),
-        (2, 6), (6, 6),
-        (3, 7), (4, 7), (5, 7),
-        (4, 8),
+    "HOME": [
+        (4, 0), (3, 1), (5, 1), (2, 2), (6, 2), (1, 3), (7, 3),
+        (0, 4), (8, 4), (1, 4), (2, 4), (3, 4), (4, 4), (5, 4), (6, 4), (7, 4),
+        (2, 5), (2, 6), (2, 7), (2, 8), (6, 5), (6, 6), (6, 7), (6, 8),
+        (2, 8), (3, 8), (4, 8), (5, 8), (6, 8), (4, 6), (4, 7), (4, 8),
     ],
 }
 
-current_page = 0  # Index into PAGES
+_MAX_PAGES = 1  # Legacy constant
 
 # Program names for display
 # Program 1: ALL - all channels trigger together
 # Program 2: CHASE - sequential single channel cycling through all channels
 # Program 3: GROUPS - first half of channels alternate with second half
-# Program 4: ODD/EVEN - odd channels (1,3,5...) alternate with even (2,4,6...)
+# Program 4: SWAP - odd channels (1,3,5...) alternate with even (2,4,6...)
 # Program 5: RANDOM - random channel each trigger
 # Program 6: AMBIENT - non-audio-reactive random fading
-PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "ODD/EVEN", "RANDOM", "AMBIENT"]
+PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "SWAP", "RANDOM", "AMBIENT"]
 
 # ===================== FFT Display =====================
 
-# FFT settings - 32 bands, 100Hz to 10kHz
-FFT_MIN_FREQ = 100
-FFT_MAX_FREQ = 10000
+# FFT settings - 64 bands, 20Hz to 16kHz
+FFT_MIN_FREQ = 20
+FFT_MAX_FREQ = 16000
 FFT_NUM_BANDS = 64
 FFT_SIZE = 2048  # Zero-pad to 2048 for ~21Hz resolution (4x better than 512 samples)
 
 def generate_log_bands(num_bands, min_freq, max_freq):
-    """Generate logarithmically spaced frequency bands."""
+    """Generate logarithmically spaced frequency bands with low-end compression.
+    
+    Uses a warped scale that compresses the sub-100Hz range to give more
+    visual weight to the musically important 100Hz-10kHz range.
+    """
     bands = []
-    log_min = math.log10(min_freq)
-    log_max = math.log10(max_freq)
-    step = (log_max - log_min) / num_bands
+    
+    # Warp factor: higher values compress low frequencies more
+    # 0.0 = pure log scale, 0.3 = moderate compression
+    warp = 0.3
+    
     for i in range(num_bands):
-        low = 10 ** (log_min + i * step)
-        high = 10 ** (log_min + (i + 1) * step)
+        # Linear position 0-1
+        t_lo = i / num_bands
+        t_hi = (i + 1) / num_bands
+        
+        # Apply warping: shift weight toward higher frequencies
+        # This uses a power curve that compresses the low end
+        t_lo_warped = t_lo ** (1.0 - warp)
+        t_hi_warped = t_hi ** (1.0 - warp)
+        
+        # Map warped position to log frequency
+        log_min = math.log10(min_freq)
+        log_max = math.log10(max_freq)
+        low = 10 ** (log_min + t_lo_warped * (log_max - log_min))
+        high = 10 ** (log_min + t_hi_warped * (log_max - log_min))
         bands.append((low, high))
     return bands
 
@@ -667,11 +715,18 @@ def get_envelope_times(center_hz):
     else:                    # Highs
         return (4.0, 50.0)    # Fast attack, quick release
 
+def format_release_display(ms_value):
+    """Format release time for display. Shows seconds with 1 decimal for values >= 1000ms."""
+    if ms_value >= 1000:
+        return f"{ms_value / 1000.0:.1f}s"
+    return f"{int(ms_value)}ms"
+
 # ===================== Encoder / Pot State =====================
 
 encoder1_value = 0
 encoder1_button = False
 _reset_last_state = 1  # Reset button state (1 = not pressed)
+_reset_press_time = 0  # Timestamp when reset button was pressed (for long-press detection)
 
 # Encoder state for all 5 encoders
 # Encoders 1-4: Page, Param A, Param B, Param C (indices 0-3)
@@ -685,8 +740,10 @@ _enc_delta = [0, 0, 0, 0, 0]
 # Quadrature state machine for reliable direction detection
 # State is encoded as (CLK << 1) | DT, giving values 0-3
 # Valid transitions: 0->1->3->2->0 (CW) or 0->2->3->1->0 (CCW)
-_enc_state = [0, 0, 0, 0, 0]
-_enc_count = [0, 0, 0, 0, 0]  # Raw quadrature counts (4 counts per detent)
+_enc_state = [3, 3, 3, 3, 3]  # Current state per encoder, 3 = rest (both high)
+_enc_rotation_dir = [0, 0, 0, 0, 0]  # Accumulated rotation direction since leaving rest
+_enc_count = [0, 0, 0, 0, 0]  # Raw quadrature counts (legacy, kept for compatibility)
+_enc_direction = [0, 0, 0, 0, 0]  # Locked direction during a rotation (-1, 0, or 1)
 
 # Velocity-sensitive encoding: track timestamps and smoothed velocity
 _enc_last_click_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time of last click per encoder
@@ -708,7 +765,7 @@ _last_preset_before_ambient = 1  # Stores the preset to return to when toggling 
 
 # Simple velocity parameters - just max multiplier per parameter type
 # Velocity is calculated as clicks-per-second, then mapped logarithmically
-VELOCITY_MAX_FREQ = 25        # Frequency: large range, high acceleration
+VELOCITY_MAX_FREQ = 50        # Frequency: large range, high acceleration for fast sweeps
 VELOCITY_MAX_THRESH = 20      # Threshold: 0-99 range
 VELOCITY_MAX_DECAY = 8        # Decay/Release: reduced for more precision
 VELOCITY_MAX_Q = 20           # Q factor: 0-99 range
@@ -726,7 +783,9 @@ _brightness_saved = DEFAULT_BRIGHT  # Saved brightness before fade-out
 _brightness_fading = False  # True while fading
 _brightness_target = DEFAULT_BRIGHT  # Target for fade animation
 _brightness_off = False  # True when faded to zero
-BRIGHTNESS_FADE_SPEED = 0.05  # How fast to fade (per frame)
+BRIGHTNESS_FADE_DURATION = 0.5  # Fade duration in seconds
+_brightness_fade_start_time = 0.0  # When fade started
+_brightness_fade_start_value = DEFAULT_BRIGHT  # Brightness when fade started
 _brightness_click_flash = 0.0  # Decays over time, >0 means click detected recently
 _brightness_gpio8_state = 1  # Current GPIO8 state for debug display
 
@@ -735,7 +794,7 @@ _display_freq = DEFAULT_CENTER_HZ
 _display_thresh = DEFAULT_THRESH
 _display_q = DEFAULT_Q
 _display_bright = DEFAULT_BRIGHT
-_display_release = int((DEFAULT_DECAY_MS - 40.0) / 4960.0 * 99)  # Release display value
+_display_release = int(DEFAULT_DECAY_MS)  # Release display value in ms
 _display_q_pct = 50  # Q display value (0-99), will be recalculated dynamically
 
 # DMX throttling (44Hz is near max for DMX512 protocol)
@@ -770,14 +829,14 @@ def _set_run(val: bool):
 
 # Beat cycle options: 4, 8, 16, 32, 64, 128, 256, 512, 1024
 CYCLE_STEPS_OPTIONS = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
-CYCLE_STEPS         = 0
+CYCLE_STEPS_INDEX   = 0  # Index into CYCLE_STEPS_OPTIONS (default 4)
+CYCLE_STEPS         = CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]  # Initialize from index
 CYCLE_TRIGGER_COUNT = 0
 CYCLE_PHASE         = 0
-CYCLE_STEPS_INDEX   = 0  # Index into CYCLE_STEPS_OPTIONS (default 4)
 CYCLE_AMBIENT_START = 0  # Timestamp when ambient phase started (for rnd/amb mode)
 
-# Cycles between modes: off disables cycling, random/x+1/rnd/amb enable it
-CYCLES_BETWEEN_MODES = ["off", "random", "x+1", "rnd/amb"]
+# Cycles between modes: off disables cycling, x+1/rnd/rnd/amb enable it
+CYCLES_BETWEEN_MODES = ["off", "x+1", "rnd", "rnd/amb"]
 CYCLES_BETWEEN_INDEX = 0  # Start with mode off
 
 # Number of presets (can be expanded later)
@@ -1035,8 +1094,8 @@ def update_lights(dt_ms):
     # Only process configured channels (DMX_CHANNEL_COUNT)
     release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
     
-    # Calculate base release display value
-    base_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
+    # Calculate base release display value (in ms)
+    base_release_display = int(band.decay_ms)
     base_release_display = max(0, min(99, base_release_display))
     
     # Calculate base brightness display value
@@ -1259,15 +1318,15 @@ class ThreeBandOnsetDetector:
         #
         self.bands = [
             # LOW: Kick - fast attack, slow decay for clean sawtooth
-            # trigger_thresh 0.068 = very sensitive (UI shows 50 at this value)
+            # trigger_thresh 0.24 = moderate sensitivity (UI shows 30 at this value)
             # lag_attack 0.4 = follow rising signal at 40% per frame
             # lag_decay 0.015 = slow decay (1.5% per frame) for sawtooth shape
             # gain 6.3 = +16dB boost (UI shows 0dB at this value as new center)
-            BandConfig("LOW", 40, 150, 0.068, 200, 0.4, 0.015, 6.3),
+            BandConfig("LOW", 40, 150, 0.24, 200, 0.4, 0.015, 6.3),
             # MID: Snare - similar tuning
-            BandConfig("MID", 1000, 4000, 0.068, 120, 0.35, 0.02, 6.3),
+            BandConfig("MID", 1000, 4000, 0.24, 120, 0.35, 0.02, 6.3),
             # HIGH: Hats - similar tuning
-            BandConfig("HIGH", 6000, 16000, 0.068, 50, 0.5, 0.03, 6.3),
+            BandConfig("HIGH", 6000, 16000, 0.24, 50, 0.5, 0.03, 6.3),
         ]
         
         # Cross-band suppression: when one band triggers, suppress others briefly
@@ -1295,7 +1354,7 @@ class ThreeBandOnsetDetector:
         
         # Display values for UI
         self.display_flux = [0.0, 0.0, 0.0]     # Normalized slope for display (0-1)
-        self.display_thresh = [0.068, 0.068, 0.068]  # Trigger threshold for display (new center)
+        self.display_thresh = [0.24, 0.24, 0.24]  # Trigger threshold for display (default: UI shows 30)
         self.scaled_onset = [0.0, 0.0, 0.0]     # Alias for display_flux (UI compat)
         
         # Legacy aliases for UI compatibility
@@ -1634,17 +1693,16 @@ DEVICE_INDEX, DEVICE_NAME = choose_input_device()
 
 
 def update_encoders():
-    """Apply encoder deltas based on current page and handle brightness.
-    Uses per-parameter velocity sensitivity for acceleration.
-    Discrete controls (presets, modes) use debouncing for precise single-detent changes."""
-    global BRIGHTNESS, BASE_PROGRAM, CYCLES_BETWEEN_INDEX, THRESH_MODE_INDEX
-    global ambient_speed, ambient_fade_time, DEFAULTS_MODE_INDEX
+    """Apply encoder deltas for HOME controls (Freq, Trigger, Release, Brightness).
+    
+    New UI: Encoders 2-4 always control HOME parameters, encoder 5 controls brightness.
+    Submenu controls (PRE, SET) are handled via encoder 1 in _handle_submenu_value_change().
+    """
+    global BRIGHTNESS, THRESH_MODE_INDEX
     global _enc_delta, _brightness_target, _brightness_fading
     global _discrete_last_change
-    global current_page, encoder1_value
     global RELEASE_MODE_INDEX
     global _effective_release_display, _release_knob_last_turn
-    global THREEBAND_SELECTED, _3band_enc2_range_mode, _3band_enc3_gain_mode
     
     if DEV_NO_HW:
         return
@@ -1652,380 +1710,120 @@ def update_encoders():
         return
     
     # Get raw encoder deltas (direction only: -1, 0, or 1 per click)
-    # Indices: 1=Param A, 2=Param B, 3=Param C, 4=Brightness
-    raw_deltas = _enc_delta[1:4]  # Param A, B, C deltas
+    # Indices: 1=Freq, 2=Trigger, 3=Release, 4=Brightness
+    raw_deltas = _enc_delta[1:4]  # Freq, Trigger, Release deltas
     brightness_raw = _enc_delta[4]
     _enc_delta = [0, 0, 0, 0, 0]
     
-    # Handle brightness encoder (Encoder 5) with its own velocity
-    # Direct update (no lerp) when turning - lerp only on click toggle
+    # ===== Encoder 5: Brightness =====
     if brightness_raw != 0 and not _brightness_off:
         base_delta = 1 if brightness_raw > 0 else -1
         mult = _calc_velocity_multiplier(4, VELOCITY_MAX_BRIGHTNESS)
         delta = base_delta * mult
-        # Small range (0-100%), ~1% per slow click
         BRIGHTNESS = max(0.0, min(0.99, BRIGHTNESS + delta * 0.01))
-        _brightness_target = BRIGHTNESS  # Keep target in sync
-        # In bright/both mode, snap reactive brightness back to base when knob is turned
-        # and set buffer timestamp to delay reactivity
+        _brightness_target = BRIGHTNESS
         global _reactive_brightness_scale, _effective_brightness_display, _brightness_knob_last_turn
         if RELEASE_MODES[RELEASE_MODE_INDEX] in ("bright", "both"):
             _reactive_brightness_scale = BRIGHTNESS
             _effective_brightness_display = int(BRIGHTNESS * 99)
             _brightness_knob_last_turn = time.time()
     
-    # Animate brightness fade
+    # Animate brightness fade (time-based linear interpolation)
     if _brightness_fading:
-        diff = _brightness_target - BRIGHTNESS
-        if abs(diff) < BRIGHTNESS_FADE_SPEED:
+        now = time.time()
+        elapsed = now - _brightness_fade_start_time
+        t = min(1.0, elapsed / BRIGHTNESS_FADE_DURATION)  # 0.0 to 1.0 over duration
+        
+        # Linear interpolation from start value to target
+        BRIGHTNESS = _brightness_fade_start_value + t * (_brightness_target - _brightness_fade_start_value)
+        
+        if t >= 1.0:
             BRIGHTNESS = _brightness_target
             _brightness_fading = False
-        else:
-            BRIGHTNESS += BRIGHTNESS_FADE_SPEED if diff > 0 else -BRIGHTNESS_FADE_SPEED
+            # Show "OFF" message only after fade to zero completes
+            if _brightness_off and _brightness_target == 0.0:
+                ui_flash("Brightness: OFF", 0.8)
     
-    # Update parameters based on current page using encoder deltas with per-param velocity
-    pages = get_pages()
-    page_name = pages[current_page]
-    
-    if page_name == "HOME":
-        # Check if we're in AMBIENT mode (preset 6) - different encoder behavior
+    # ===== Encoder 2: Frequency OR Q (toggle with click), or Speed in AMBIENT mode =====
+    if raw_deltas[0] != 0:
+        global ambient_speed
+        base_delta = 1 if raw_deltas[0] > 0 else -1
         if BASE_PROGRAM == 6:
-            # AMBIENT mode: Enc A = Speed, Enc B = nothing, Enc C = Fade time
-            if raw_deltas[0] != 0:
-                global _ambient_next_time
-                base_delta = 1 if raw_deltas[0] > 0 else -1
-                mult = _calc_velocity_multiplier(1, VELOCITY_MAX_AMBIENT)
-                delta = base_delta * mult
-                # Range (0.2-8.0), fine control: 0.02x per slow click (~390 steps)
-                ambient_speed = max(0.2, min(8.0, ambient_speed + delta * 0.02))
-                # Reset timer so new speed takes effect immediately
-                _ambient_next_time = 0.0
-            if raw_deltas[2] != 0:
-                base_delta = 1 if raw_deltas[2] > 0 else -1
-                mult = _calc_velocity_multiplier(3, VELOCITY_MAX_AMBIENT)
-                delta = base_delta * mult
-                # Range (0.1-10s), fine control: 0.05s per slow click (~200 steps)
-                ambient_fade_time = max(0.1, min(10.0, ambient_fade_time + delta * 0.05))
-        elif BEAT_DETECT_METHOD == 1:
-            # ===== 3BAND_DETECT mode =====
-            # Enc A: Band select OR Range/width adjust (toggle with click)
-            if raw_deltas[0] != 0:
-                if _3band_enc2_range_mode:
-                    # Range/width adjust for selected band
-                    if three_band_detector is not None:
-                        # 5% width change per detent
-                        three_band_detector.adjust_width(THREEBAND_SELECTED, raw_deltas[0] * 5)
-                else:
-                    # Band select (cycle through LOW/MID/HIGH)
-                    now = time.time()
-                    elapsed_ms = (now - _discrete_last_change[1]) * 1000
-                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                        delta = 1 if raw_deltas[0] > 0 else -1
-                        THREEBAND_SELECTED = (THREEBAND_SELECTED + delta) % 3
-                        _discrete_last_change[1] = now
-                        ui_flash(f"Band: {THREEBAND_NAMES[THREEBAND_SELECTED]}", 0.5)
-            
-            # Enc B: Threshold OR Gain adjust (toggle with click)
-            if raw_deltas[1] != 0:
-                if three_band_detector is not None:
-                    band_cfg = three_band_detector.bands[THREEBAND_SELECTED]
-                    base_delta = 1 if raw_deltas[1] > 0 else -1
-                    mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
-                    delta = base_delta * mult
-                    
-                    if _3band_enc3_gain_mode:
-                        # Gain adjust: per-band gain multiplier (0.63 to 63.0, center at 6.3)
-                        # This gives +/- 20dB range from center
-                        band_cfg.gain = max(0.63, min(63.0, band_cfg.gain * (1.05 ** delta)))
-                    else:
-                        # Trigger threshold adjust (0.01 to 0.5, center at 0.068)
-                        # Lower value = more sensitive, higher = less sensitive
-                        # Right (positive delta) = more sensitive (lower thresh), Left = less sensitive
-                        band_cfg.trigger_thresh = max(0.01, min(0.5, band_cfg.trigger_thresh - delta * 0.01))
-            
-            # Enc C: Release (global, same as FFT mode) OR ReleaseMode (toggle with click)
-            if raw_deltas[2] != 0:
-                if _home_enc4_alt:
-                    # ReleaseMode: cycle through release modes (clamped, not wrapping)
-                    now = time.time()
-                    elapsed_ms = (now - _discrete_last_change[3]) * 1000
-                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                        delta = 1 if raw_deltas[2] > 0 else -1
-                        new_idx = max(0, min(len(RELEASE_MODES) - 1, RELEASE_MODE_INDEX + delta))
-                        if new_idx != RELEASE_MODE_INDEX:
-                            RELEASE_MODE_INDEX = new_idx
-                            _discrete_last_change[3] = now
-                else:
-                    # Release mode: (40-5000ms, display 0-99)
-                    base_delta = 1 if raw_deltas[2] > 0 else -1
-                    mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
-                    delta = base_delta * mult
-                    band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
-                    release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
-                    if release_mode in ("react", "rand", "both"):
-                        _effective_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                        _effective_release_display = max(0, min(99, _effective_release_display))
-                        _release_knob_last_turn = time.time()
-        else:
-            # ===== FFT_STANDARD mode (existing behavior) =====
-            # Enc A: Center frequency OR Q (toggle with click)
-            if raw_deltas[0] != 0:
-                # Clamp base delta to ±1, velocity multiplier handles acceleration
-                base_delta = 1 if raw_deltas[0] > 0 else -1
-                if _home_enc2_alt:
-                    # Q mode: Q factor - logarithmic scaling for perceptual linearity
-                    mult = _calc_velocity_multiplier(1, VELOCITY_MAX_Q)
-                    delta = base_delta * mult
-                    # Use logarithmic scaling: ~2% change per click for consistent feel across range
-                    # Negative delta = CW rotation = decrease Q (wider)
-                    factor = 1.02 ** (-delta)
-                    q_min = get_q_min(band.center)
-                    band.q = max(q_min, min(Q_MAX, band.q * factor))
-                else:
-                    # Freq mode: Center frequency (log scale)
-                    mult = _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ)
-                    delta = base_delta * mult
-                    # Large range (20Hz-20kHz), ~0.8% per slow click
-                    factor = 1.008 ** delta
-                    new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
-                    print(f"[FREQ] delta={delta} mult={mult} factor={factor:.3f} {band.center:.0f}Hz -> {new_center:.0f}Hz")
-                    band.center = new_center
-            # Enc B: Threshold OR ThreshMode (toggle with click)
-            if raw_deltas[1] != 0:
-                if _home_enc3_alt:
-                    # ThreshMode: cycle through threshold detection modes
-                    now = time.time()
-                    elapsed_ms = (now - _discrete_last_change[2]) * 1000
-                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                        delta = 1 if raw_deltas[1] > 0 else -1
-                        new_idx = max(0, min(len(THRESH_MODES) - 1, THRESH_MODE_INDEX + delta))
-                        if new_idx != THRESH_MODE_INDEX:
-                            THRESH_MODE_INDEX = new_idx
-                            _discrete_last_change[2] = now
-                else:
-                    # Threshold mode: (0-1, display 0-99)
-                    # Clamp base delta to ±1, velocity multiplier handles acceleration
-                    base_delta = 1 if raw_deltas[1] > 0 else -1
-                    mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
-                    delta = base_delta * mult
-                    # Medium range (0-99), ~1 display unit per slow click
-                    band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
-            # Enc C: Release/Decay OR ReleaseMode (toggle with click)
-            if raw_deltas[2] != 0:
-                if _home_enc4_alt:
-                    # ReleaseMode: cycle through release modes (clamped, not wrapping)
-                    now = time.time()
-                    elapsed_ms = (now - _discrete_last_change[3]) * 1000
-                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                        delta = 1 if raw_deltas[2] > 0 else -1
-                        new_idx = max(0, min(len(RELEASE_MODES) - 1, RELEASE_MODE_INDEX + delta))
-                        if new_idx != RELEASE_MODE_INDEX:
-                            RELEASE_MODE_INDEX = new_idx
-                            _discrete_last_change[3] = now
-                else:
-                    # Release mode: (40-5000ms, display 0-99)
-                    # Clamp base delta to ±1, velocity multiplier handles acceleration
-                    base_delta = 1 if raw_deltas[2] > 0 else -1
-                    mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
-                    delta = base_delta * mult
-                    # Medium range, ~1 display unit per slow click (50ms step)
-                    # With precision mode (min_mult=0.2), slow turns give ~10ms steps
-                    band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
-                    # In react/rand/both mode, snap effective release back to base when knob is turned
-                    # and set buffer timestamp to delay reactivity
-                    release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
-                    if release_mode in ("react", "rand", "both"):
-                        _effective_release_display = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                        _effective_release_display = max(0, min(99, _effective_release_display))
-                        _release_knob_last_turn = time.time()
-                
-    elif page_name == "ADV":
-        # Enc A: Q factor (display 0-99 inverted) - logarithmic scaling
-        if raw_deltas[0] != 0:
-            base_delta = 1 if raw_deltas[0] > 0 else -1
+            # AMBIENT mode: control speed (0.2x to 8x in 0.2 steps, 1 step per click)
+            ambient_speed = max(0.2, min(8.0, ambient_speed + base_delta * 0.2))
+        elif _home_enc2_alt:
+            # Q mode: Q factor - logarithmic scaling
             mult = _calc_velocity_multiplier(1, VELOCITY_MAX_Q)
             delta = base_delta * mult
-            # Use logarithmic scaling: ~6% change per click (3x HOME page) for consistent feel
-            # Negative delta = CW rotation = decrease Q (wider)
-            factor = 1.06 ** (-delta)
+            factor = 1.02 ** (-delta)
             q_min = get_q_min(band.center)
             band.q = max(q_min, min(Q_MAX, band.q * factor))
-        # Enc C: Decay (40-5000ms, display 0-99)
-        if raw_deltas[2] != 0:
-            base_delta = 1 if raw_deltas[2] > 0 else -1
-            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
+        else:
+            # Freq mode: Center frequency (log scale)
+            mult = _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ)
             delta = base_delta * mult
-            # Medium range, ~1 display unit per slow click (50ms step)
-            # With precision mode (min_mult=0.2), slow turns give ~10ms steps
-            band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 50.0))
-            
-    elif page_name == "PRE":
-        # Enc A: Preset selection (1-6) - debounced discrete control
-        if raw_deltas[0] != 0:
-            now = time.time()
-            elapsed_ms = (now - _discrete_last_change[1]) * 1000
-            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                delta = 1 if raw_deltas[0] > 0 else -1
-                # Limit to presets 1-5 (AMBIENT only via button click)
-                current = BASE_PROGRAM if BASE_PROGRAM <= 5 else 1  # If on AMBIENT, start from 1
-                new_preset = max(1, min(5, current + delta))
-                if new_preset != BASE_PROGRAM:
-                    global CYCLE_TRIGGER_COUNT, CYCLE_PHASE
-                    BASE_PROGRAM = new_preset
-                    # Reset cycle state when preset changes
-                    CYCLE_TRIGGER_COUNT = 0
-                    CYCLE_PHASE = 0
-                    _discrete_last_change[1] = now
-                    ui_flash(f"Preset: {PROGRAM_NAMES[new_preset-1]}", 0.8)
-        # Enc B: Cycle mode - debounced discrete control
-        if raw_deltas[1] != 0:
+            factor = 1.008 ** delta
+            new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
+            band.center = new_center
+    
+    # ===== Encoder 3: Trigger Threshold OR ThreshMode (toggle with click), disabled in AMBIENT mode =====
+    if raw_deltas[1] != 0 and BASE_PROGRAM != 6:
+        if _home_enc3_alt:
+            # ThreshMode: cycle through threshold detection modes
             now = time.time()
             elapsed_ms = (now - _discrete_last_change[2]) * 1000
             if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
                 delta = 1 if raw_deltas[1] > 0 else -1
-                new_idx = max(0, min(len(CYCLES_BETWEEN_MODES) - 1, CYCLES_BETWEEN_INDEX + delta))
-                if new_idx != CYCLES_BETWEEN_INDEX:
-                    old_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
-                    CYCLES_BETWEEN_INDEX = new_idx
-                    new_mode = CYCLES_BETWEEN_MODES[new_idx]
+                new_idx = max(0, min(len(THRESH_MODES) - 1, THRESH_MODE_INDEX + delta))
+                if new_idx != THRESH_MODE_INDEX:
+                    THRESH_MODE_INDEX = new_idx
                     _discrete_last_change[2] = now
-                    # When switching from off to a mode, set beats to 4 (index 0)
-                    if old_mode == "off" and new_mode != "off":
-                        set_cycle_steps_by_index(0)  # Default to 4 beats
-                        # If on AMBIENT, jump to ALL preset
-                        if BASE_PROGRAM == 6:
-                            BASE_PROGRAM = 1
-                            CYCLE_TRIGGER_COUNT = 0
-                            CYCLE_PHASE = 0
-                            ui_flash(f"Preset: ALL", 0.8)
-        # Enc C: Beat Cycles index - debounced discrete control (disabled for AMBIENT or mode off)
-        current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
-        if raw_deltas[2] != 0 and BASE_PROGRAM != 6 and current_mode != "off":
-            now = time.time()
-            elapsed_ms = (now - _discrete_last_change[3]) * 1000
-            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                delta = 1 if raw_deltas[2] > 0 else -1
-                new_idx = max(0, min(len(CYCLE_STEPS_OPTIONS) - 1, CYCLE_STEPS_INDEX + delta))
-                if new_idx != CYCLE_STEPS_INDEX:
-                    _discrete_last_change[3] = now
-                    set_cycle_steps_by_index(new_idx)
-            
-    elif page_name == "SET":
-        # Enc A: Defaults mode (0-5 for LOW/MID/HIGH/USR1/USR2/USR3) - debounced discrete control
-        if raw_deltas[0] != 0:
-            now = time.time()
-            elapsed_ms = (now - _discrete_last_change[1]) * 1000
-            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                delta = 1 if raw_deltas[0] > 0 else -1
-                new_idx = max(0, min(5, DEFAULTS_MODE_INDEX + delta))
-                if new_idx != DEFAULTS_MODE_INDEX:
-                    DEFAULTS_MODE_INDEX = new_idx
-                    _discrete_last_change[1] = now
-                    mode_name = DEFAULTS_MODES[new_idx]
-                    preset = DEFAULTS_PRESETS[mode_name]
-                    # Apply the defaults immediately (only if preset has values)
-                    if preset is not None:
-                        if len(preset) >= 6:
-                            center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
-                            THRESH_MODE_INDEX = thresh_mode
-                            RELEASE_MODE_INDEX = release_mode
-                        else:
-                            center_hz, thresh, decay_ms, q_factor = preset[:4]
-                        band.center   = center_hz
-                        band.thresh   = thresh
-                        band.decay_ms = decay_ms
-                        band.q        = q_factor
-                    # Save to config file for persistence
-                    save_defaults_mode(new_idx)
-                    ui_flash(f"Defaults: {mode_name}", 0.8)
-        
-        # Enc B: Input Volume (0-99) OR Detection Mode (toggle with click)
-        if raw_deltas[1] != 0:
-            if _setup_enc3_detect:
-                # Detection Mode: cycle through level/flux/hybrid
-                global DETECT_MODE_INDEX
-                now = time.time()
-                elapsed_ms = (now - _discrete_last_change[2]) * 1000
-                if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                    delta = 1 if raw_deltas[1] > 0 else -1
-                    new_idx = max(0, min(len(DETECT_MODES) - 1, DETECT_MODE_INDEX + delta))
-                    if new_idx != DETECT_MODE_INDEX:
-                        DETECT_MODE_INDEX = new_idx
-                        _discrete_last_change[2] = now
-                        ui_flash(f"Detect: {DETECT_MODES[new_idx]}", 0.8)
-            else:
-                # Input Volume mode
-                global INPUT_VOLUME, INPUT_GAIN
-                new_vol = max(0, min(99, INPUT_VOLUME + raw_deltas[1]))
-                if new_vol != INPUT_VOLUME:
-                    INPUT_VOLUME = new_vol
-                    # Exponential mapping centered at 50=0.64x (recalibrated for 3-band mode)
-                    # 0=0.04x, 50=0.64x, 99=10x (4 octaves each direction from center)
-                    INPUT_GAIN = 0.64 * (16 ** ((new_vol - 50) / 49.5))
-                    ui_flash(f"Input Vol: {INPUT_VOLUME}", 0.8)
-        
-        # Enc C: DMX Output Mode OR Channel Count (toggle with click) - debounced discrete control
-        if raw_deltas[2] != 0:
-            global DMX_OUTPUT_MODE, DMX_CHANNEL_COUNT
-            now = time.time()
-            elapsed_ms = (now - _discrete_last_change[3]) * 1000
-            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                delta = 1 if raw_deltas[2] > 0 else -1
-                if _setup_enc4_channels:
-                    # Channel count mode: 4-24 channels
-                    new_count = max(4, min(24, DMX_CHANNEL_COUNT + delta))
-                    if new_count != DMX_CHANNEL_COUNT:
-                        DMX_CHANNEL_COUNT = new_count
-                        _discrete_last_change[3] = now
-                        save_dmx_channel_count(new_count)
-                        ui_flash(f"Channels: {new_count}", 0.8)
-                else:
-                    # Output mode: Dimmer / (DMX) - can scroll to see both options
-                    # (DMX) is shown in parentheses to indicate it's not fully implemented yet
-                    new_mode = max(0, min(1, DMX_OUTPUT_MODE + delta))
-                    if new_mode != DMX_OUTPUT_MODE:
-                        DMX_OUTPUT_MODE = new_mode
-                        _discrete_last_change[3] = now
-                        save_dmx_output_mode(new_mode)
-                        ui_flash(f"Output: {DMX_OUTPUT_MODES[new_mode]}", 0.8)
-
-    elif page_name == "COLOR":
-        global _color_light_selection, _color_hue, _color_saturation, _color_temperature
-        
-        # Enc A: Light selection (all, odd, even, 1, 2, 3, ... n)
-        # Each channel is treated as an individual light
-        if raw_deltas[0] != 0:
-            now = time.time()
-            elapsed_ms = (now - _discrete_last_change[1]) * 1000
-            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                delta = 1 if raw_deltas[0] > 0 else -1
-                # all(0), odd(1), even(2), then 1..DMX_CHANNEL_COUNT
-                max_selection = 2 + DMX_CHANNEL_COUNT
-                new_sel = max(0, min(max_selection, _color_light_selection + delta))
-                if new_sel != _color_light_selection:
-                    _color_light_selection = new_sel
-                    _discrete_last_change[1] = now
-        
-        # Enc B: Hue (0-99) or Temperature (0-99) based on toggle
-        if raw_deltas[1] != 0:
+                    # Auto-save threshold mode change to current preset
+                    save_current_as_default()
+        else:
+            # Threshold mode: (0-1, display 0-99)
             base_delta = 1 if raw_deltas[1] > 0 else -1
             mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
             delta = base_delta * mult
-            if _color_enc3_temp_mode:
-                _color_temperature = max(0, min(99, _color_temperature + delta))
-            else:
-                _color_hue = max(0, min(99, _color_hue + delta))
-        
-        # Enc C: Saturation (0-99)
-        if raw_deltas[2] != 0:
-            base_delta = 1 if raw_deltas[2] > 0 else -1
-            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_THRESH)
+            band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
+    
+    # ===== Encoder 4: Release OR ReleaseMode (toggle with click), or Fade in AMBIENT mode =====
+    if raw_deltas[2] != 0:
+        global ambient_fade_time
+        base_delta = 1 if raw_deltas[2] > 0 else -1
+        if BASE_PROGRAM == 6:
+            # AMBIENT mode: control fade time (0.1s to 10s in 0.1 steps)
+            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_AMBIENT)
             delta = base_delta * mult
-            _color_saturation = max(0, min(99, _color_saturation + delta))
+            ambient_fade_time = max(0.1, min(10.0, ambient_fade_time + delta * 0.1))
+        elif _home_enc4_alt:
+            # ReleaseMode: cycle through release modes
+            now = time.time()
+            elapsed_ms = (now - _discrete_last_change[3]) * 1000
+            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                delta = 1 if raw_deltas[2] > 0 else -1
+                new_idx = max(0, min(len(RELEASE_MODES) - 1, RELEASE_MODE_INDEX + delta))
+                if new_idx != RELEASE_MODE_INDEX:
+                    RELEASE_MODE_INDEX = new_idx
+                    _discrete_last_change[3] = now
+        else:
+            # Release mode: (40-5000ms, display in ms)
+            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
+            delta = base_delta * mult
+            band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 20.0))
+            release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+            if release_mode in ("react", "rand", "both"):
+                _effective_release_display = int(band.decay_ms)
+                _release_knob_last_turn = time.time()
 
 def toggle_brightness():
     """Toggle brightness between current value and zero with fade animation."""
     global _brightness_saved, _brightness_off, _brightness_target, _brightness_fading
+    global _brightness_fade_start_time, _brightness_fade_start_value
+    
+    # Record fade start state
+    _brightness_fade_start_time = time.time()
+    _brightness_fade_start_value = BRIGHTNESS
     
     if _brightness_off:
         # Fade back to saved brightness
@@ -2039,18 +1837,8 @@ def toggle_brightness():
         _brightness_target = 0.0
         _brightness_off = True
         _brightness_fading = True
-        ui_flash("Brightness: OFF", 0.8)
 
 # ===================== GPIO / Rotary Encoders =====================
-
-def reset_to_defaults():
-    """Toggle between FFT and 3BAND audio analysis modes."""
-    global BEAT_DETECT_METHOD
-    
-    # Toggle between FFT (0) and 3BAND (1) modes
-    BEAT_DETECT_METHOD = 1 - BEAT_DETECT_METHOD
-    mode_name = BEAT_DETECT_METHODS[BEAT_DETECT_METHOD]
-    ui_flash(f"Mode: {mode_name}", 1.0)
 
 def save_current_as_default():
     """Save current band params and modes as the selected default preset."""
@@ -2153,10 +1941,10 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10, min_mult=1.0):
     
     # Map velocity to multiplier with logarithmic scaling
     # Based on PHYSICAL detent rate (updates per second), not internal clicks
-    # Velocity thresholds for different speed zones:
-    PRECISION_VELOCITY = 0.8  # updates/sec - below this = min_mult (>1250ms between detents)
-    SLOW_VELOCITY = 1.5       # updates/sec - at this point = 1x (>660ms between physical detents)
-    FAST_VELOCITY = 15.0      # updates/sec - above this = max (<67ms between physical detents)
+    # Velocity thresholds tuned for responsive acceleration:
+    PRECISION_VELOCITY = 1.0  # updates/sec - below this = min_mult (>1000ms between detents)
+    SLOW_VELOCITY = 2.0       # updates/sec - at this point = 1x (500ms between detents)
+    FAST_VELOCITY = 12.0      # updates/sec - above this = max (83ms between detents)
     
     if min_mult < 1.0 and velocity <= PRECISION_VELOCITY:
         # Precision mode: very slow turning gets sub-1x multiplier
@@ -2182,37 +1970,32 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10, min_mult=1.0):
     return max(min_mult, min(float(max_mult), mult))
 
 
+ENC_DEBOUNCE_MS = 20  # Minimum ms between valid clicks for encoders 2-5
+
 def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
-    """Read encoder using quadrature state machine for reliable direction detection.
-    Returns direction: 1 for CW, -1 for CCW, 0 for no change.
-    Uses sub-count threshold of 2 for more responsive feel.
-    Note: Velocity multiplier is applied later in update_encoders() per-parameter."""
-    global _enc_state, _enc_count, _enc_last_click_time, _enc_prev_click_time
+    """Read encoder using detent-based detection for clean 1:1 click response.
+    
+    Accumulates rotation direction while encoder is away from rest position.
+    Triggers exactly once when encoder returns to detent (rest state 3).
+    This matches the physical "click" feel of the encoder.
+    
+    Returns: 1 for CW, -1 for CCW, 0 for no change
+    """
+    global _enc_state, _enc_rotation_dir, _enc_last_click_time, _enc_prev_click_time
     
     clk = GPIO.input(clk_pin)
     dt = GPIO.input(dt_pin)
     
-    # Encode current state as 2-bit value: (CLK << 1) | DT
-    # State 0 = 00 (both low)
-    # State 1 = 01 (CLK low, DT high)
-    # State 2 = 10 (CLK high, DT low)
-    # State 3 = 11 (both high) - detent/rest position
     new_state = (clk << 1) | dt
     old_state = _enc_state[enc_idx]
     
     if new_state == old_state:
-        return 0  # No change
+        return 0
     
     _enc_state[enc_idx] = new_state
     
-    # Quadrature transition table:
-    # CW sequence:  3 -> 1 -> 0 -> 2 -> 3 (or 3 -> 2 -> 0 -> 1 -> 3 depending on encoder)
-    # CCW sequence: 3 -> 2 -> 0 -> 1 -> 3 (or reverse)
-    #
-    # Direction lookup: [old_state][new_state] -> direction
-    # +1 = CW, -1 = CCW, 0 = invalid/skip
+    # Quadrature transition table: [old_state][new_state] -> direction
     transition = [
-        # new:  0   1   2   3
         [  0, -1,  1,  0],  # old = 0
         [  1,  0,  0, -1],  # old = 1
         [ -1,  0,  0,  1],  # old = 2
@@ -2222,81 +2005,178 @@ def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
     direction = transition[old_state][new_state]
     
     if direction != 0:
-        _enc_count[enc_idx] += direction
-        
-        # Using threshold of 2 for responsive velocity-based controls
-        # Discrete controls use debouncing in update_encoders() instead
-        if _enc_count[enc_idx] >= 2:
-            _enc_count[enc_idx] = 0
-            # Record click times for velocity calculation
-            # Move last click to prev BEFORE updating last click
-            _enc_prev_click_time[enc_idx] = _enc_last_click_time[enc_idx]
-            _enc_last_click_time[enc_idx] = time.time()
-            return 1  # CW click
-        elif _enc_count[enc_idx] <= -2:
-            _enc_count[enc_idx] = 0
-            # Record click times for velocity calculation
-            # Move last click to prev BEFORE updating last click
-            _enc_prev_click_time[enc_idx] = _enc_last_click_time[enc_idx]
-            _enc_last_click_time[enc_idx] = time.time()
-            return -1  # CCW click
+        _enc_rotation_dir[enc_idx] += direction
     
-    return 0  # Not enough transitions yet
+    # Trigger when returning to rest/detent position (state 3) with accumulated rotation
+    if new_state == 3 and _enc_rotation_dir[enc_idx] != 0:
+        now = time.time()
+        if (now - _enc_last_click_time[enc_idx]) * 1000 >= ENC_DEBOUNCE_MS:
+            result = 1 if _enc_rotation_dir[enc_idx] > 0 else -1
+            _enc_prev_click_time[enc_idx] = _enc_last_click_time[enc_idx]
+            _enc_last_click_time[enc_idx] = now
+            _enc_rotation_dir[enc_idx] = 0
+            return result
+        _enc_rotation_dir[enc_idx] = 0
+    
+    return 0
 
 
-# Page encoder state (quadrature with debouncing)
-# Uses full quadrature state machine for reliable direction detection
-_page_enc_state = 3  # Initial state (both high = rest)
-_page_enc_count = 0  # Raw quadrature count (4 counts per detent)
-_page_enc_clk_buffer = [1, 1, 1]  # Debounce buffer for CLK
-_page_enc_dt_buffer = [1, 1, 1]   # Debounce buffer for DT
+# Encoder 1 state (detent-based detection for reliable 1:1 clicks)
+# Triggers when encoder returns to rest position (state 3) after rotation
+_enc1_state = 3               # Current quadrature state (0-3), 3 = rest (both high)
+_enc1_rotation_dir = 0        # Accumulated rotation direction since leaving rest
+_enc1_last_click = 0.0        # Timestamp of last valid click for debouncing
+ENC1_DEBOUNCE_MS = 20         # Minimum ms between valid clicks
 
 # Quadrature transition table: [old_state][new_state] -> direction
 # State encoding: (CLK << 1) | DT
-# State 0 = both low, State 1 = CLK low/DT high, State 2 = CLK high/DT low, State 3 = both high (rest)
-_PAGE_QUAD_TRANSITION = [
+# State 0 = both low, State 1 = CLK low/DT high, State 2 = CLK high/DT low, State 3 = both high (rest/detent)
+_ENC1_QUAD_TRANSITION = [
     [  0, -1,  1,  0],  # old = 0 (both low)
     [  1,  0,  0, -1],  # old = 1 (CLK low, DT high)
     [ -1,  0,  0,  1],  # old = 2 (CLK high, DT low)
     [  0,  1, -1,  0],  # old = 3 (both high - rest/detent)
 ]
 
-def _read_page_encoder(clk_pin, dt_pin):
-    """Read page encoder with debounced quadrature state machine.
-    Returns -1, 0, or 1 for exactly one page change per physical detent.
+def _read_enc1_quadrature(clk_pin, dt_pin):
+    """Read Encoder 1 using detent-based detection for clean 1:1 click response.
     
-    Uses 3-sample majority voting to filter electrical noise and a full
-    quadrature state machine for reliable direction detection."""
-    global _page_enc_state, _page_enc_count
-    global _page_enc_clk_buffer, _page_enc_dt_buffer
+    Accumulates rotation direction while encoder is away from rest position.
+    Triggers exactly once when encoder returns to detent (rest state 3).
+    This matches the physical "click" feel of the encoder.
     
-    # Read and debounce using majority voting (2 of 3 samples)
-    _page_enc_clk_buffer.pop(0)
-    _page_enc_clk_buffer.append(GPIO.input(clk_pin))
-    _page_enc_dt_buffer.pop(0)
-    _page_enc_dt_buffer.append(GPIO.input(dt_pin))
+    Returns: 1 for CW, -1 for CCW, 0 for no change
+    """
+    global _enc1_state, _enc1_rotation_dir, _enc1_last_click
     
-    clk = 1 if sum(_page_enc_clk_buffer) >= 2 else 0
-    dt = 1 if sum(_page_enc_dt_buffer) >= 2 else 0
+    clk = GPIO.input(clk_pin)
+    dt = GPIO.input(dt_pin)
     
     new_state = (clk << 1) | dt
-    old_state = _page_enc_state
+    old_state = _enc1_state
     
-    if new_state != old_state:
-        _page_enc_state = new_state
-        direction = _PAGE_QUAD_TRANSITION[old_state][new_state]
-        _page_enc_count += direction
-        
-        # 4 quadrature transitions = 1 physical detent
-        # Using threshold of 2 for responsive feel (half-detent)
-        if _page_enc_count >= 2:
-            _page_enc_count = 0
-            return 1
-        elif _page_enc_count <= -2:
-            _page_enc_count = 0
-            return -1
+    if new_state == old_state:
+        return 0
+    
+    _enc1_state = new_state
+    
+    direction = _ENC1_QUAD_TRANSITION[old_state][new_state]
+    
+    if direction != 0:
+        _enc1_rotation_dir += direction
+    
+    if new_state == 3 and _enc1_rotation_dir != 0:
+        now = time.time()
+        if (now - _enc1_last_click) * 1000 >= ENC1_DEBOUNCE_MS:
+            result = 1 if _enc1_rotation_dir > 0 else -1
+            _enc1_rotation_dir = 0
+            _enc1_last_click = now
+            return result
+        _enc1_rotation_dir = 0
     
     return 0
+
+
+def _handle_submenu_value_change(direction):
+    """Handle value changes when encoder 1 is in editing mode for submenu columns."""
+    global BASE_PROGRAM, CYCLES_BETWEEN_INDEX, CYCLES_BETWEEN, CYCLE_TRIGGER_COUNT, CYCLE_PHASE
+    global INPUT_GAIN_DB, DMX_OUTPUT_MODE, DMX_CHANNEL_COUNT
+    
+    tab = SUBMENU_TABS[submenu_tab]
+    col = submenu_column
+    
+    if tab == "Presets":
+        if col == 0:
+            # Preset selection (1-6)
+            BASE_PROGRAM = max(1, min(6, BASE_PROGRAM + direction))
+            CYCLE_TRIGGER_COUNT = 0
+            CYCLE_PHASE = 0
+            # If AMBIENT preset selected, force mode to "off"
+            if BASE_PROGRAM == 6:
+                CYCLES_BETWEEN_INDEX = 0  # "off"
+            ui_flash(f"Preset: {PROGRAM_NAMES[BASE_PROGRAM-1]}", 0.5)
+        elif col == 1:
+            # Cycle mode
+            CYCLES_BETWEEN_INDEX = max(0, min(len(CYCLES_BETWEEN_MODES) - 1, CYCLES_BETWEEN_INDEX + direction))
+            # Reset cycle state when changing modes
+            CYCLE_PHASE = 0
+            CYCLE_TRIGGER_COUNT = 0
+            # For rnd/amb and random modes, ensure we're not on AMBIENT preset
+            new_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+            if new_mode in ("rnd/amb", "rnd") and BASE_PROGRAM == 6:
+                BASE_PROGRAM = random.randint(1, 5)
+            ui_flash(f"Mode: {new_mode}", 0.5)
+        elif col == 2:
+            # Beat cycles
+            global CYCLE_STEPS_INDEX, CYCLE_STEPS
+            # If mode is "off", scrolling right enables x+1 at lowest beat value
+            if CYCLES_BETWEEN_INDEX == 0:  # "off"
+                if direction > 0:  # Scrolling right - enable cycling at 4
+                    CYCLES_BETWEEN_INDEX = 1  # "x+1"
+                    CYCLE_STEPS_INDEX = 0  # Start at 4
+                    CYCLE_STEPS = CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]
+                    CYCLE_PHASE = 0
+                    CYCLE_TRIGGER_COUNT = 0
+                    ui_flash(f"Beats: {CYCLE_STEPS}", 0.5)
+                # Scrolling left when off does nothing
+                return
+            
+            new_index = CYCLE_STEPS_INDEX + direction
+            # Scrolling left past min (4) turns off cycling
+            if new_index < 0:
+                CYCLES_BETWEEN_INDEX = 0  # "off"
+                CYCLE_PHASE = 0
+                CYCLE_TRIGGER_COUNT = 0
+                ui_flash("Beats: --", 0.5)
+            elif new_index < len(CYCLE_STEPS_OPTIONS):
+                CYCLE_STEPS_INDEX = new_index
+                CYCLE_STEPS = CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]
+                ui_flash(f"Beats: {CYCLE_STEPS}", 0.5)
+    elif tab == "Settings":
+        if col == 0:
+            # Input gain in dB (-24 to +24, step by 1dB) - saved to config for persistence
+            INPUT_GAIN_DB = max(-24, min(24, INPUT_GAIN_DB + direction))
+            save_input_gain(INPUT_GAIN_DB)
+            sign = "+" if INPUT_GAIN_DB > 0 else ""
+            ui_flash(f"Gain: {sign}{INPUT_GAIN_DB}dB", 0.5)
+        elif col == 1:
+            # Reset - cycle through presets (clamped, no looping)
+            global DEFAULTS_MODE_INDEX
+            new_idx = max(0, min(len(DEFAULTS_MODES) - 1, DEFAULTS_MODE_INDEX + direction))
+            DEFAULTS_MODE_INDEX = new_idx
+            mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+            preset = DEFAULTS_PRESETS[mode_name]
+            if len(preset) >= 6:
+                center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
+                global THRESH_MODE_INDEX, RELEASE_MODE_INDEX
+                THRESH_MODE_INDEX = thresh_mode
+                RELEASE_MODE_INDEX = release_mode
+            else:
+                center_hz, thresh, decay_ms, q_factor = preset[:4]
+            band.center = center_hz
+            band.thresh = thresh
+            band.decay_ms = decay_ms
+            band.q = q_factor
+            save_defaults_mode(DEFAULTS_MODE_INDEX)
+            ui_flash(f"Reset: {mode_name}", 0.5)
+        elif col == 2:
+            # Column 3 is blank - no action
+            pass
+    elif tab == "Setup":
+        if col == 0:
+            # Output mode (Dimmer/DMX)
+            DMX_OUTPUT_MODE = max(0, min(1, DMX_OUTPUT_MODE + direction))
+            ui_flash(f"Output: {DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]}", 0.5)
+        elif col == 1:
+            # Channel count (4-24) - saved to config for persistence
+            DMX_CHANNEL_COUNT = max(4, min(24, DMX_CHANNEL_COUNT + direction))
+            save_dmx_channel_count(DMX_CHANNEL_COUNT)
+            ui_flash(f"Chans: {DMX_CHANNEL_COUNT}", 0.5)
+        elif col == 2:
+            # Band selection (LOW/MID/HIGH) - clamped, no cycling
+            global SETUP_BAND_INDEX
+            SETUP_BAND_INDEX = max(0, min(len(SETUP_BAND_OPTIONS) - 1, SETUP_BAND_INDEX + direction))
+            ui_flash(f"Band: {SETUP_BAND_OPTIONS[SETUP_BAND_INDEX]}", 0.5)
 
 
 def encoder_reader():
@@ -2306,11 +2186,11 @@ def encoder_reader():
     """
     global encoder1_value, encoder1_button
     global current_page
-    global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state
+    global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state, _reset_press_time
     global _enc_state, _enc_count, _enc_last_click_time, _enc_velocity_mult
     global _home_enc2_alt, _home_enc3_alt, _home_enc4_alt
     global _enc2_press_time, _enc2_saving, _enc2_save_complete
-    global _3band_enc2_range_mode, _3band_enc3_gain_mode, THREEBAND_VIEW_MODE
+    global submenu_tab, submenu_column, submenu_editing
     
     if DEV_NO_HW:
         return
@@ -2329,10 +2209,21 @@ def encoder_reader():
             clk = GPIO.input(clk_pin)
             dt = GPIO.input(dt_pin)
             _enc_state[i] = (clk << 1) | dt
-            _enc_count[i] = 0
         except Exception:
             _enc_state[i] = 3  # Default to rest position (both high)
-            _enc_count[i] = 0
+        _enc_rotation_dir[i] = 0
+        _enc_count[i] = 0
+    
+    # Initialize Encoder 1 dedicated state (detent-based detection)
+    global _enc1_state, _enc1_rotation_dir, _enc1_last_click
+    try:
+        clk = GPIO.input(ENC1_CLK)
+        dt = GPIO.input(ENC1_DT)
+        _enc1_state = (clk << 1) | dt
+    except Exception:
+        _enc1_state = 3  # Default to rest position (both high)
+    _enc1_rotation_dir = 0
+    _enc1_last_click = 0.0
     
     # Initialize switch states
     _enc_last_sw[0] = GPIO.input(ENC1_SW)
@@ -2353,28 +2244,27 @@ def encoder_reader():
     try:
         while not STOP_THREADS:
             try:
-                # ===== Encoder 1 - Page selection (uses detent-based detection) =====
-                direction = _read_page_encoder(ENC1_CLK, ENC1_DT)
+                # ===== Encoder 1 - Submenu column selection/editing =====
+                direction = _read_enc1_quadrature(ENC1_CLK, ENC1_DT)
                 if direction != 0:
-                    pages = get_pages()
-                    encoder1_value += direction
-                    encoder1_value = max(0, min(len(pages) - 1, encoder1_value))
-                    if current_page != encoder1_value:
-                        current_page = encoder1_value
-                        # Reset HOME page encoder toggles when changing pages
-                        _home_enc2_alt = False
-                        _home_enc3_alt = False
-                        _home_enc4_alt = False
+                    global submenu_column, submenu_editing
+                    if submenu_editing:
+                        # Editing mode: adjust the selected column's value
+                        _handle_submenu_value_change(direction)
+                    else:
+                        # Selection mode: move between columns 0-2
+                        submenu_column = max(0, min(2, submenu_column + direction))
                 
                 enc1_sw = GPIO.input(ENC1_SW)
                 if enc1_sw == 0 and _enc_last_sw[0] == 1:
                     time.sleep(0.02)  # Debounce
                     if GPIO.input(ENC1_SW) == 0:
-                        # Cycle through 3-band view modes (0 -> 1 -> 2 -> 0)
-                        global THREEBAND_VIEW_MODE
-                        THREEBAND_VIEW_MODE = (THREEBAND_VIEW_MODE + 1) % 3
-                        view_names = ["Spectrum", "Bands", "Detail"]
-                        ui_flash(f"View: {view_names[THREEBAND_VIEW_MODE]}", 0.5)
+                        # Toggle between selection and editing mode
+                        submenu_editing = not submenu_editing
+                        if submenu_editing:
+                            ui_flash("Edit", 0.3)
+                        else:
+                            ui_flash("Select", 0.3)
                 _enc_last_sw[0] = enc1_sw
                 
                 # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
@@ -2384,57 +2274,18 @@ def encoder_reader():
                 
                 enc2_sw = GPIO.input(ENC2_SW)
                 if enc2_sw == 0 and _enc_last_sw[1] == 1:
-                    # Button just pressed - start timing
-                    time.sleep(0.02)  # Debounce
+                    time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC2_SW) == 0:
-                        _enc2_press_time = time.time()
-                        if get_pages()[current_page] == "SET":
-                            _enc2_saving = True  # Start showing loader
-                elif enc2_sw == 1 and _enc_last_sw[1] == 0:
-                    # Button released
-                    press_duration = time.time() - _enc2_press_time
-                    if _enc2_saving:
-                        # Was in save mode but released early - cancel
-                        _enc2_saving = False
-                    elif press_duration < 3.0:
-                        # Short press - toggle Freq/Q mode on HOME page (or range mode in 3BAND)
-                        pages = get_pages()
-                        if pages[current_page] == "HOME":
-                            if BEAT_DETECT_METHOD == 1:
-                                # 3BAND mode: toggle range/width adjust mode
-                                _3band_enc2_range_mode = not _3band_enc2_range_mode
-                                if _3band_enc2_range_mode:
-                                    ui_flash("Mode: Range", 0.5)
-                                else:
-                                    ui_flash("Mode: Band", 0.5)
-                            else:
-                                # FFT mode: toggle Freq/Q
-                                _home_enc2_alt = not _home_enc2_alt
-                        # Short press - toggle to/from ambient on PRE page
-                        elif pages[current_page] == "PRE":
-                            global _last_preset_before_ambient, BASE_PROGRAM, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLES_BETWEEN_INDEX
-                            if BASE_PROGRAM == 6:
-                                # Currently on ambient - jump back to last preset (mode stays off)
-                                BASE_PROGRAM = _last_preset_before_ambient
-                                # Reset cycle state when preset changes
-                                CYCLE_TRIGGER_COUNT = 0
-                                CYCLE_PHASE = 0
-                                ui_flash(f"Preset: {PROGRAM_NAMES[BASE_PROGRAM-1]}", 0.8)
-                            else:
-                                # Not on ambient - save current and jump to ambient
-                                _last_preset_before_ambient = BASE_PROGRAM
-                                BASE_PROGRAM = 6
-                                # Reset cycle state and set mode to off
-                                CYCLE_TRIGGER_COUNT = 0
-                                CYCLE_PHASE = 0
-                                CYCLES_BETWEEN_INDEX = 0  # Set mode to "off"
-                                ui_flash("Preset: AMBIENT", 0.8)
-                elif enc2_sw == 0 and _enc2_saving:
-                    # Button still held on SET page - check if 3 seconds reached
-                    if time.time() - _enc2_press_time >= 3.0:
-                        _enc2_saving = False
-                        save_current_as_default()  # Save and show "Saved"
-                        _enc2_save_complete = time.time()
+                        # Toggle Freq/Q mode for HOME controls
+                        _home_enc2_alt = not _home_enc2_alt
+                        if _home_enc2_alt:
+                            ui_flash("Mode: Range", 0.5)
+                        else:
+                            ui_flash("Mode: Freq", 0.5)
+                        # Wait for button release to prevent double-toggle
+                        while GPIO.input(ENC2_SW) == 0 and not STOP_THREADS:
+                            time.sleep(0.01)
+                        time.sleep(0.05)  # Additional debounce after release
                 _enc_last_sw[1] = enc2_sw
                 
                 # ===== Encoder 3 - Param B (Thresh/Beats) =====
@@ -2444,42 +2295,18 @@ def encoder_reader():
                 
                 enc3_sw = GPIO.input(ENC3_SW)
                 if enc3_sw == 0 and _enc_last_sw[2] == 1:
-                    time.sleep(0.02)
+                    time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC3_SW) == 0:
-                        # Toggle Thresh/ThreshMode on HOME page (or gain mode in 3BAND)
-                        pages = get_pages()
-                        if pages[current_page] == "HOME":
-                            if BEAT_DETECT_METHOD == 1:
-                                # 3BAND mode: toggle gain adjust mode
-                                _3band_enc3_gain_mode = not _3band_enc3_gain_mode
-                                if _3band_enc3_gain_mode:
-                                    ui_flash("Mode: Gain", 0.5)
-                                else:
-                                    ui_flash("Mode: Thresh", 0.5)
-                            else:
-                                # FFT mode: toggle Thresh/ThreshMode
-                                _home_enc3_alt = not _home_enc3_alt
-                        # Turn Mode OFF on PRE page
-                        elif pages[current_page] == "PRE":
-                            if CYCLES_BETWEEN_INDEX != 0:
-                                CYCLES_BETWEEN_INDEX = 0
-                                ui_flash("Mode: off", 0.8)
-                        # Toggle Input Volume / Detection Mode on SET page
-                        elif pages[current_page] == "SET":
-                            global _setup_enc3_detect
-                            _setup_enc3_detect = not _setup_enc3_detect
-                            if _setup_enc3_detect:
-                                ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.8)
-                            else:
-                                ui_flash(f"Input Vol: {INPUT_VOLUME}", 0.8)
-                        # Toggle Hue/Temp mode on COLOR page
-                        elif pages[current_page] == "COLOR":
-                            global _color_enc3_temp_mode
-                            _color_enc3_temp_mode = not _color_enc3_temp_mode
-                            if _color_enc3_temp_mode:
-                                ui_flash("Mode: Temp", 0.8)
-                            else:
-                                ui_flash("Mode: Hue", 0.8)
+                        # Toggle Thresh/ThreshMode for HOME controls
+                        _home_enc3_alt = not _home_enc3_alt
+                        if _home_enc3_alt:
+                            ui_flash("Mode: Th-Mode", 0.5)
+                        else:
+                            ui_flash("Mode: Trigger", 0.5)
+                        # Wait for button release to prevent double-toggle
+                        while GPIO.input(ENC3_SW) == 0 and not STOP_THREADS:
+                            time.sleep(0.01)
+                        time.sleep(0.05)  # Additional debounce after release
                 _enc_last_sw[2] = enc3_sw
                 
                 # ===== Encoder 4 - Param C (Release/Mode) =====
@@ -2489,21 +2316,18 @@ def encoder_reader():
                 
                 enc4_sw = GPIO.input(ENC4_SW)
                 if enc4_sw == 0 and _enc_last_sw[3] == 1:
-                    time.sleep(0.02)
+                    time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC4_SW) == 0:
-                        # Toggle Release/ReleaseMode on HOME page
-                        pages = get_pages()
-                        if pages[current_page] == "HOME":
-                            _home_enc4_alt = not _home_enc4_alt
-                        # Toggle Output/Channels mode on SET page
-                        elif pages[current_page] == "SET":
-                            global _setup_enc4_channels
-                            _setup_enc4_channels = not _setup_enc4_channels
-                            if _setup_enc4_channels:
-                                ui_flash(f"Channels: {DMX_CHANNEL_COUNT}", 0.8)
-                            else:
-                                ui_flash(f"Output: {DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]}", 0.8)
-                        # No action on PRE page for encoder 4 button
+                        # Toggle Release/ReleaseMode for HOME controls
+                        _home_enc4_alt = not _home_enc4_alt
+                        if _home_enc4_alt:
+                            ui_flash("Mode: R-Mode", 0.5)
+                        else:
+                            ui_flash("Mode: Release", 0.5)
+                        # Wait for button release to prevent double-toggle
+                        while GPIO.input(ENC4_SW) == 0 and not STOP_THREADS:
+                            time.sleep(0.01)
+                        time.sleep(0.05)  # Additional debounce after release
                 _enc_last_sw[3] = enc4_sw
                 
                 # ===== Encoder 5 - Brightness =====
@@ -2531,13 +2355,40 @@ def encoder_reader():
                     _enc_last_sw[4] = enc5_sw
                 
                 # ===== Reset button (GPIO 25) =====
-                # Press = toggle between FFT and 3BAND audio analysis modes
+                # Short press = cycle through submenu tabs (PRE -> SET -> PRE...)
+                # Long press (3s) = reset freq/thresh/release to defaults
                 reset_btn = GPIO.input(RESET_PIN)
                 if reset_btn == 0 and _reset_last_state == 1:
-                    # Button just pressed
-                    time.sleep(0.02)  # Debounce
-                    if GPIO.input(RESET_PIN) == 0:
-                        reset_to_defaults()
+                    # Button just pressed - start timing
+                    _reset_press_time = time.time()
+                elif reset_btn == 0 and _reset_last_state == 0:
+                    # Button still held - check for long press
+                    if _reset_press_time > 0:
+                        hold_duration = time.time() - _reset_press_time
+                        if hold_duration >= 2.0:
+                            # Long press detected - reset to defaults
+                            mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+                            preset = DEFAULTS_PRESETS[mode_name]
+                            if len(preset) >= 6:
+                                center_hz, thresh, decay_ms, q_factor, _, _ = preset
+                            else:
+                                center_hz, thresh, decay_ms, q_factor = preset[:4]
+                            band.center = center_hz
+                            band.thresh = thresh
+                            band.decay_ms = decay_ms
+                            ui_flash("Reset to defaults", 1.0)
+                            _reset_press_time = 0  # Prevent repeated triggers
+                elif reset_btn == 1 and _reset_last_state == 0:
+                    # Button just released
+                    if _reset_press_time > 0:
+                        hold_duration = time.time() - _reset_press_time
+                        if hold_duration < 2.0:
+                            # Short press - cycle tabs
+                            time.sleep(0.02)  # Debounce
+                            submenu_tab = (submenu_tab + 1) % len(SUBMENU_TABS)
+                            submenu_column = 0  # Jump to first column of new page
+                            ui_flash(f"Tab: {SUBMENU_TABS[submenu_tab]}", 0.5)
+                    _reset_press_time = 0
                 _reset_last_state = reset_btn
                 
             except RuntimeError:
@@ -2638,7 +2489,7 @@ def audio_loop():
         # Use channel 1 (Input 2 on Scarlett Solo - the line input on back)
         # Change to indata[:, 0] for Input 1 (front XLR/inst jack)
         x = indata[:, 1].astype(np.float32)
-        x = x * INPUT_GAIN  # Apply input volume control
+        x = x * db_to_linear(INPUT_GAIN_DB)  # Apply input gain (dB)
         input_rms = float(np.sqrt(np.mean(x*x)) + 1e-12)
 
         # FFT analysis for display - zero-padded for better frequency resolution
@@ -2781,8 +2632,8 @@ def audio_loop():
             # x+1 mode: toggle between base and neighbor preset
             p_base, p_neighbor = program_pair_for_base(BASE_PROGRAM)
             active_prog = p_base if CYCLE_PHASE == 0 else p_neighbor
-        elif current_mode == "random":
-            # Random mode: BASE_PROGRAM is the active program (changes on beat)
+        elif current_mode == "rnd":
+            # Rnd mode: BASE_PROGRAM is the active program (changes on beat)
             active_prog = BASE_PROGRAM
         elif current_mode == "rnd/amb":
             # rnd/amb mode: alternate between random preset and ambient
@@ -2869,9 +2720,8 @@ def audio_loop():
                     # Max 300% boost based on combined signal strength and trigger speed
                     scale = 1.0 + min(3.0, combined_boost * 3.0)  # 1x to 4x
                     effective_decay = band.decay_ms * scale
-                    # Update display value (0-99 scale)
-                    _effective_release_display = int((effective_decay - 40.0) / 4960.0 * 99)
-                    _effective_release_display = max(0, min(99, _effective_release_display))
+                    # Update display value (in ms)
+                    _effective_release_display = int(effective_decay)
             elif release_mode == "bright":
                 # Reactive brightness: brightness scales up from set value based on signal strength + speed
                 # Check if we're still in the buffer period after knob turn
@@ -2889,9 +2739,8 @@ def audio_loop():
                     # Max 300% boost based on combined signal strength and trigger speed
                     scale = 1.0 + min(3.0, combined_boost * 3.0)  # 1x to 4x
                     effective_decay = band.decay_ms * scale
-                    # Update display value (0-99 scale)
-                    _effective_release_display = int((effective_decay - 40.0) / 4960.0 * 99)
-                    _effective_release_display = max(0, min(99, _effective_release_display))
+                    # Update display value (in ms)
+                    _effective_release_display = int(effective_decay)
                 # Check brightness buffer
                 if (now - _brightness_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
                     # Max 50% boost based on combined signal strength and trigger speed
@@ -2901,19 +2750,14 @@ def audio_loop():
                     _effective_brightness_display = int(_reactive_brightness_scale * 99)
                     _effective_brightness_display = max(0, min(99, _effective_brightness_display))
             elif release_mode == "rand":
-                # Random: add/subtract random value between -20 and +20 from current release
+                # Random: add/subtract random value between -500ms and +500ms from current release
                 # Check if we're still in the buffer period after knob turn
                 if (now - _release_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
-                    # Calculate base release display value (0-99)
-                    base_release = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                    base_release = max(0, min(99, base_release))
-                    # Add random offset between -20 and +20
-                    rand_offset = random.randint(-20, 20)
-                    new_release_display = max(0, min(99, base_release + rand_offset))
-                    # Convert back to decay_ms
-                    effective_decay = 40.0 + (new_release_display / 99.0) * 4960.0
-                    # Update display value
-                    _effective_release_display = new_release_display
+                    # Add random offset between -500ms and +500ms
+                    rand_offset = random.randint(-500, 500)
+                    effective_decay = max(40.0, min(5000.0, band.decay_ms + rand_offset))
+                    # Update display value (in ms)
+                    _effective_release_display = int(effective_decay)
 
             if active_prog == 1:
                 # ALL - trigger all configured channels
@@ -2951,7 +2795,7 @@ def audio_loop():
                 if CYCLE_TRIGGER_COUNT >= CYCLE_STEPS:
                     CYCLE_TRIGGER_COUNT = 0
                     CYCLE_PHASE = 1 - CYCLE_PHASE
-            elif current_mode == "random":
+            elif current_mode == "rnd":
                 CYCLE_TRIGGER_COUNT += 1
                 if CYCLE_TRIGGER_COUNT >= CYCLE_STEPS:
                     CYCLE_TRIGGER_COUNT = 0
@@ -3030,7 +2874,7 @@ class OledUI:
                 gpio_DC=OLED_DC_PIN,
                 gpio_RST=OLED_RST_PIN,
             )
-            self.device = ssd1309(serial, width=width, height=height, rotate=0)
+            self.device = ssd1322(serial, width=width, height=height, rotate=0)
             try:
                 self._font = ImageFont.truetype(
                     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 9
@@ -3054,7 +2898,7 @@ class OledUI:
         except Exception:
             pass
 
-    def _draw_text_kerned(self, draw, pos, text, font, fill=1, kerning=1):
+    def _draw_text_kerned(self, draw, pos, text, font, fill=OLED_WHITE, kerning=1):
         """Draw text with custom letter spacing (kerning).
         
         Args:
@@ -3062,7 +2906,7 @@ class OledUI:
             pos: (x, y) tuple for starting position
             text: String to draw
             font: Font to use
-            fill: Fill color (1 for white on OLED)
+            fill: Fill color (OLED_WHITE for white on OLED)
             kerning: Extra pixels between each character (can be negative)
         """
         x, y = pos
@@ -3075,55 +2919,42 @@ class OledUI:
         return x  # Return final x position
 
     def _freq_to_x(self, freq, x_start, width):
-        """Convert frequency to x position (log scale)."""
+        """Convert frequency to x position (warped log scale).
+        
+        Uses the same warping as generate_log_bands() to compress low frequencies.
+        """
         if freq <= FFT_MIN_FREQ:
             return x_start
         if freq >= FFT_MAX_FREQ:
             return x_start + width - 1
+        
+        # Same warp factor as generate_log_bands
+        warp = 0.3
+        
         log_min = math.log10(FFT_MIN_FREQ)
         log_max = math.log10(FFT_MAX_FREQ)
         log_freq = math.log10(freq)
-        ratio = (log_freq - log_min) / (log_max - log_min)
-        return int(x_start + ratio * (width - 1))
+        
+        # Get position in log space (0-1)
+        t = (log_freq - log_min) / (log_max - log_min)
+        
+        # Inverse warp: convert from log position to display position
+        # Since bands use t^(1-warp), we need t^(1/(1-warp)) to invert
+        t_display = t ** (1.0 / (1.0 - warp))
+        
+        return int(x_start + t_display * (width - 1))
 
     def _draw_fft_spectrum(self, draw, x, y, width, height):
         """Draw FFT spectrum with Q band highlighting.
-        - Left: Vertical meter showing band envelope vs threshold
         - Bars inside Q range above threshold: crosshatch/dashed (triggering zone)
         - Bars inside Q range below threshold: solid fill
         - Bars outside Q range: single-pixel outline
         - Q range boundaries: vertical lines
         - Threshold line: horizontal within Q range"""
         
-        # === Left side: Band envelope meter (10px wide) ===
-        meter_width = 10
-        meter_x = x + 1
-        meter_height = height - 2
-        meter_y = y + 1
-        
-        # Draw meter outline
-        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=1)
-        
-        # Draw band envelope level (filled from bottom)
-        env_height = int(min(1.0, live_band_env) * (meter_height - 2))
-        if env_height > 0:
-            fill_y = meter_y + meter_height - 1 - env_height
-            triggered = trigger_flash > 0.2
-            if triggered:
-                # Solid fill with horizontal lines when triggered
-                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
-                for py in range(fill_y, meter_y + meter_height - 1, 3):
-                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=0)
-            else:
-                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
-        
-        # Draw threshold line on meter
-        thresh_meter_y = meter_y + meter_height - 1 - int(_effective_thresh * (meter_height - 2))
-        draw.line((meter_x, thresh_meter_y, meter_x + meter_width - 1, thresh_meter_y), fill=1)
-        
-        # === Right side: FFT spectrum ===
-        fft_x = meter_x + meter_width + 3
-        fft_width = width - meter_width - 4
+        # FFT spectrum uses full width (VU meter removed)
+        fft_x = x
+        fft_width = width
         
         num_bands = len(fft_bands)
         
@@ -3135,7 +2966,8 @@ class OledUI:
         
         low_x = self._freq_to_x(low_freq, fft_x, fft_width)
         high_x = self._freq_to_x(high_freq, fft_x, fft_width)
-        # Use effective threshold for display (varies by threshold mode)
+        # Threshold line position: _effective_thresh is 0.0-1.0, UI shows 0-99
+        # thresh=0 (UI 0) = line at bottom, thresh=1.0 (UI 99) = line at top
         thresh_y = y + height - int(_effective_thresh * height)
         
         # Calculate bar positions to fill the entire width (no gaps)
@@ -3168,43 +3000,42 @@ class OledUI:
             bar_bottom = y + height - 1
             
             if in_q_range:
-                # Check if bar crosses threshold
+                # Check if bar crosses threshold line
                 if bar_top < thresh_y:
                     # Part above threshold - crosshatch (triggering zone)
-                    # Leave 1px gap above threshold line for distinction
                     above_top = bar_top
-                    above_bottom = min(thresh_y - 2, bar_bottom)  # -2 leaves 1px gap
+                    above_bottom = min(thresh_y - 1, bar_bottom)
                     if above_top <= above_bottom:
                         for py in range(above_top, above_bottom + 1):
                             for px in range(bx_start, bx_end + 1):
                                 if (px + py) % 2 == 0:
-                                    draw.point((px, py), fill=1)
+                                    draw.point((px, py), fill=OLED_WHITE)
                     
-                    # Part below threshold - solid fill (start 1px below threshold line)
-                    if thresh_y + 1 <= bar_bottom:
-                        draw.rectangle((bx_start, thresh_y + 1, bx_end, bar_bottom), fill=1)
+                    # Part below threshold - solid fill
+                    if thresh_y <= bar_bottom:
+                        draw.rectangle((bx_start, thresh_y, bx_end, bar_bottom), fill=OLED_WHITE)
                 else:
                     # Entirely below threshold - solid fill
-                    draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=1)
+                    draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
             else:
                 # Single pixel outline for bands outside Q range
-                draw.line((bx_start, bar_top, bx_end, bar_top), fill=1)
+                draw.line((bx_start, bar_top, bx_end, bar_top), fill=OLED_WHITE)
                 if bar_h > 1:
-                    draw.line((bx_start, bar_top, bx_start, bar_bottom), fill=1)
-                    draw.line((bx_end, bar_top, bx_end, bar_bottom), fill=1)
+                    draw.line((bx_start, bar_top, bx_start, bar_bottom), fill=OLED_WHITE)
+                    draw.line((bx_end, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
         
         # Draw Q range boundary lines (vertical)
-        draw.line((low_x, y, low_x, y + height - 1), fill=1)
-        draw.line((high_x, y, high_x, y + height - 1), fill=1)
+        draw.line((low_x, y, low_x, y + height - 1), fill=OLED_WHITE)
+        draw.line((high_x, y, high_x, y + height - 1), fill=OLED_WHITE)
         
         # Threshold line (horizontal within Q range)
         if y <= thresh_y < y + height:
-            draw.line((low_x, thresh_y, high_x, thresh_y), fill=1)
+            draw.line((low_x, thresh_y, high_x, thresh_y), fill=OLED_WHITE)
         
         # Trigger flash - filled bar at top of Q range when triggered
         if trigger_flash > 0.2:
             flash_height = 3
-            draw.rectangle((low_x + 1, y, high_x - 1, y + flash_height), fill=1)
+            draw.rectangle((low_x + 1, y, high_x - 1, y + flash_height), fill=OLED_WHITE)
 
     def _format_freq_range(self, f_lo, f_hi):
         """Format frequency range for display (e.g., '2.5k-4.5k')."""
@@ -3258,7 +3089,7 @@ class OledUI:
         meter_y = y + 1
         
         # Draw meter outline
-        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=1)
+        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=OLED_WHITE)
         
         # Draw onset level (filled from bottom) - this is what actually triggers
         onset_height = int(min(1.0, onset) * (meter_height - 2))
@@ -3266,12 +3097,12 @@ class OledUI:
             fill_y = meter_y + meter_height - 1 - onset_height
             if triggered:
                 # Solid fill with inverted top portion when triggered (faster than checkerboard)
-                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=OLED_WHITE)
                 # Add horizontal lines for visual distinction
                 for py in range(fill_y, meter_y + meter_height - 1, 3):
-                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=0)
+                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=OLED_BLACK)
             else:
-                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=OLED_WHITE)
         
         # No threshold line in 3-band mode (TouchDesigner-style detection doesn't use visual threshold)
         
@@ -3317,24 +3148,24 @@ class OledUI:
             
             if in_selected_range:
                 # Solid fill for bars in selected range (no threshold crosshatch in 3-band mode)
-                draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=1)
+                draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
             else:
                 # Outline only for bars outside selected range
-                draw.line((bx_start, bar_top, bx_end, bar_top), fill=1)
+                draw.line((bx_start, bar_top, bx_end, bar_top), fill=OLED_WHITE)
                 if bar_h > 1:
-                    draw.line((bx_start, bar_top, bx_start, bar_bottom), fill=1)
-                    draw.line((bx_end, bar_top, bx_end, bar_bottom), fill=1)
+                    draw.line((bx_start, bar_top, bx_start, bar_bottom), fill=OLED_WHITE)
+                    draw.line((bx_end, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
         
         # Draw vertical lines at band boundaries
-        draw.line((sel_low_x, y, sel_low_x, y + fft_height - 1), fill=1)
-        draw.line((sel_high_x, y, sel_high_x, y + fft_height - 1), fill=1)
+        draw.line((sel_low_x, y, sel_low_x, y + fft_height - 1), fill=OLED_WHITE)
+        draw.line((sel_high_x, y, sel_high_x, y + fft_height - 1), fill=OLED_WHITE)
         
         # No threshold line in 3-band mode
         
         # Draw trigger flash at top of selected range
         if triggered:
             flash_height = 3
-            draw.rectangle((sel_low_x + 1, y, sel_high_x - 1, y + flash_height), fill=1)
+            draw.rectangle((sel_low_x + 1, y, sel_high_x - 1, y + flash_height), fill=OLED_WHITE)
     
     def _draw_3band_rectangles_view(self, draw, x, y, width, height):
         """Three rectangles with LOW/MID/HIGH text, selected has border, trigger fills inside."""
@@ -3355,15 +3186,15 @@ class OledUI:
             
             # Selected band: double border (outer indicator)
             if is_selected:
-                draw.rectangle((rect_x - 2, rect_y - 2, rect_x + rect_width + 1, rect_y + rect_height + 1), outline=1)
-                draw.rectangle((rect_x, rect_y, rect_x + rect_width - 1, rect_y + rect_height - 1), outline=1)
+                draw.rectangle((rect_x - 2, rect_y - 2, rect_x + rect_width + 1, rect_y + rect_height + 1), outline=OLED_WHITE)
+                draw.rectangle((rect_x, rect_y, rect_x + rect_width - 1, rect_y + rect_height - 1), outline=OLED_WHITE)
             else:
                 # Non-selected: single outline
-                draw.rectangle((rect_x, rect_y, rect_x + rect_width - 1, rect_y + rect_height - 1), outline=1)
+                draw.rectangle((rect_x, rect_y, rect_x + rect_width - 1, rect_y + rect_height - 1), outline=OLED_WHITE)
             
             # Trigger: fill inside the rectangle
             if triggered:
-                draw.rectangle((rect_x + 2, rect_y + 2, rect_x + rect_width - 3, rect_y + rect_height - 3), fill=1)
+                draw.rectangle((rect_x + 2, rect_y + 2, rect_x + rect_width - 3, rect_y + rect_height - 3), fill=OLED_WHITE)
             
             # Draw band name centered in rectangle
             label = band_names[i]
@@ -3372,7 +3203,7 @@ class OledUI:
             text_y = rect_y + (rect_height - 8) // 2
             
             # Invert text color when triggered (so it's visible on filled background)
-            fill_color = 0 if triggered else 1
+            fill_color = OLED_BLACK if triggered else OLED_WHITE
             draw.text((text_x, text_y), label, font=self._font_small, fill=fill_color)
     
     def _draw_3band_detail_view(self, draw, x, y, width, height):
@@ -3400,7 +3231,7 @@ class OledUI:
         meter_y = y + 1
         
         # Draw meter outline
-        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=1)
+        draw.rectangle((meter_x, meter_y, meter_x + meter_width - 1, meter_y + meter_height - 1), outline=OLED_WHITE)
         
         # Draw onset level (filled from bottom)
         onset_height = int(min(1.0, onset) * (meter_height - 2))
@@ -3408,11 +3239,11 @@ class OledUI:
             fill_y = meter_y + meter_height - 1 - onset_height
             if triggered:
                 # Solid fill with horizontal lines when triggered (faster than checkerboard)
-                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=OLED_WHITE)
                 for py in range(fill_y, meter_y + meter_height - 1, 3):
-                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=0)
+                    draw.line((meter_x + 1, py, meter_x + meter_width - 2, py), fill=OLED_BLACK)
             else:
-                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=1)
+                draw.rectangle((meter_x + 1, fill_y, meter_x + meter_width - 2, meter_y + meter_height - 2), fill=OLED_WHITE)
         
         # No threshold line in 3-band mode (TouchDesigner-style detection doesn't use visual threshold)
         
@@ -3420,17 +3251,17 @@ class OledUI:
         info_x = meter_x + meter_width + 4
         
         # Row 1: Band name + trigger indicator
-        draw.text((info_x, y), band_names[sel], font=self._font_small, fill=1)
+        draw.text((info_x, y), band_names[sel], font=self._font_small, fill=OLED_WHITE)
         trig_box_x = info_x + 22
         trig_box_size = 6
         if triggered:
-            draw.rectangle((trig_box_x, y, trig_box_x + trig_box_size, y + trig_box_size), fill=1)
+            draw.rectangle((trig_box_x, y, trig_box_x + trig_box_size, y + trig_box_size), fill=OLED_WHITE)
         else:
-            draw.rectangle((trig_box_x, y, trig_box_x + trig_box_size, y + trig_box_size), outline=1)
+            draw.rectangle((trig_box_x, y, trig_box_x + trig_box_size, y + trig_box_size), outline=OLED_WHITE)
         
         # Row 2: Frequency range
         range_str = self._format_freq_range(f_lo, f_hi)
-        draw.text((info_x, y + 9), range_str, font=self._font_small, fill=1)
+        draw.text((info_x, y + 9), range_str, font=self._font_small, fill=OLED_WHITE)
         
         # === Right side: Running line graph ===
         graph_width = 64  # Wider graph
@@ -3439,7 +3270,7 @@ class OledUI:
         graph_height = height - 2
         
         # Draw graph outline
-        draw.rectangle((graph_x, graph_y, graph_x + graph_width - 1, graph_y + graph_height - 1), outline=1)
+        draw.rectangle((graph_x, graph_y, graph_x + graph_width - 1, graph_y + graph_height - 1), outline=OLED_WHITE)
         
         # No threshold line in 3-band mode (TouchDesigner-style detection doesn't use visual threshold)
         
@@ -3469,26 +3300,26 @@ class OledUI:
             
             # Draw line segment from previous point
             if prev_px is not None:
-                draw.line((prev_px, prev_py, px, py), fill=1)
+                draw.line((prev_px, prev_py, px, py), fill=OLED_WHITE)
             
             # Draw trigger marker (vertical line from bottom when triggered)
             if trigger_history[hist_idx]:
-                draw.line((px, base_y, px, trig_top), fill=1)
+                draw.line((px, base_y, px, trig_top), fill=OLED_WHITE)
             
             prev_px, prev_py = px, py
 
     def _draw_sun_icon(self, draw, x, y, size=7):
         """Draw sun icon for brightness."""
         cx, cy = x + size // 2, y + size // 2
-        draw.rectangle((cx - 1, cy - 1, cx, cy), fill=1)
-        draw.point((cx, y), fill=1)
-        draw.point((cx, y + size - 1), fill=1)
-        draw.point((x, cy), fill=1)
-        draw.point((x + size - 1, cy), fill=1)
-        draw.point((x + 1, y + 1), fill=1)
-        draw.point((x + size - 2, y + 1), fill=1)
-        draw.point((x + 1, y + size - 2), fill=1)
-        draw.point((x + size - 2, y + size - 2), fill=1)
+        draw.rectangle((cx - 1, cy - 1, cx, cy), fill=OLED_WHITE)
+        draw.point((cx, y), fill=OLED_WHITE)
+        draw.point((cx, y + size - 1), fill=OLED_WHITE)
+        draw.point((x, cy), fill=OLED_WHITE)
+        draw.point((x + size - 1, cy), fill=OLED_WHITE)
+        draw.point((x + 1, y + 1), fill=OLED_WHITE)
+        draw.point((x + size - 2, y + 1), fill=OLED_WHITE)
+        draw.point((x + 1, y + size - 2), fill=OLED_WHITE)
+        draw.point((x + size - 2, y + size - 2), fill=OLED_WHITE)
 
     def _draw_global_controls(self, draw, x, y):
         """Draw program number and brightness percentage."""
@@ -3496,12 +3327,12 @@ class OledUI:
         current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
         if current_mode == "x+1" and CYCLE_PHASE == 1:
             _, neighbor = program_pair_for_base(BASE_PROGRAM)
-            draw.text((x, y), f"(P{neighbor})", font=self._font_small, fill=1)
+            draw.text((x, y), f"(P{neighbor})", font=self._font_small, fill=OLED_WHITE)
         elif current_mode == "rnd/amb" and CYCLE_PHASE == 1:
             # Show (P6) when in rnd/amb ambient phase
-            draw.text((x, y), f"(P6)", font=self._font_small, fill=1)
+            draw.text((x, y), f"(P6)", font=self._font_small, fill=OLED_WHITE)
         else:
-            draw.text((x, y), f"P{BASE_PROGRAM}", font=self._font_small, fill=1)
+            draw.text((x, y), f"P{BASE_PROGRAM}", font=self._font_small, fill=OLED_WHITE)
         
         # Sun icon + brightness percentage (use smoothed display value)
         self._draw_sun_icon(draw, x, y + 10, size=7)
@@ -3510,9 +3341,9 @@ class OledUI:
         if release_mode in ("bright", "both") and _effective_brightness_display > base_brt:
             # Show effective brightness when boosted in bright/both mode
             brt_pct = _effective_brightness_display
-            draw.text((x + 9, y + 11), f"{brt_pct:2d}", font=self._font_small, fill=1)
+            draw.text((x + 9, y + 11), f"{brt_pct:2d}", font=self._font_small, fill=OLED_WHITE)
         else:
-            draw.text((x + 9, y + 11), f"{base_brt:2d}", font=self._font_small, fill=1)
+            draw.text((x + 9, y + 11), f"{base_brt:2d}", font=self._font_small, fill=OLED_WHITE)
     
     def _draw_brightness_inline(self, draw, x, y):
         """Draw sun icon + brightness percentage inline."""
@@ -3522,18 +3353,18 @@ class OledUI:
         if release_mode in ("bright", "both") and _effective_brightness_display > base_brt:
             # Show effective brightness when boosted in bright/both mode
             brt_pct = _effective_brightness_display
-            draw.text((x + 9, y + 1), f"{brt_pct:2d}", font=self._font_small, fill=1)
+            draw.text((x + 9, y + 1), f"{brt_pct:2d}", font=self._font_small, fill=OLED_WHITE)
         else:
-            draw.text((x + 9, y + 1), f"{base_brt:2d}", font=self._font_small, fill=1)
+            draw.text((x + 9, y + 1), f"{base_brt:2d}", font=self._font_small, fill=OLED_WHITE)
     
     def _draw_trigger_indicator(self, draw, x, y):
         """Draw trigger indicator dot at specified position."""
         if trigger_flash > 0.2:
             # Draw filled circle (trigger active)
-            draw.ellipse((x, y, x + 6, y + 6), fill=1)
+            draw.ellipse((x, y, x + 6, y + 6), fill=OLED_WHITE)
         else:
             # Draw empty circle (trigger idle)
-            draw.ellipse((x, y, x + 6, y + 6), outline=1)
+            draw.ellipse((x, y, x + 6, y + 6), outline=OLED_WHITE)
 
     def _draw_page_icon(self, draw, x, y, page_name, selected):
         """Draw a single page icon (11x11 box with 9x9 icon inside)."""
@@ -3541,11 +3372,11 @@ class OledUI:
         
         # Draw box (filled if selected)
         if selected:
-            draw.rectangle((x, y, x + box_size - 1, y + box_size - 1), outline=1, fill=1)
-            fill_color = 0
+            draw.rectangle((x, y, x + box_size - 1, y + box_size - 1), outline=OLED_WHITE, fill=OLED_WHITE)
+            fill_color = OLED_BLACK
         else:
-            draw.rectangle((x, y, x + box_size - 1, y + box_size - 1), outline=1, fill=0)
-            fill_color = 1
+            draw.rectangle((x, y, x + box_size - 1, y + box_size - 1), outline=OLED_WHITE, fill=OLED_BLACK)
+            fill_color = OLED_WHITE
         
         # Draw icon pixels (offset by 1 to center in box)
         icon_coords = PAGE_ICONS.get(page_name, [])
@@ -3580,11 +3411,11 @@ class OledUI:
             
             # Draw tab rectangle
             if selected:
-                draw.rectangle((tab_x, y, tab_end_x, y + box_height - 1), outline=1, fill=1)
-                fill_color = 0
+                draw.rectangle((tab_x, y, tab_end_x, y + box_height - 1), outline=OLED_WHITE, fill=OLED_WHITE)
+                fill_color = OLED_BLACK
             else:
-                draw.rectangle((tab_x, y, tab_end_x, y + box_height - 1), outline=1, fill=0)
-                fill_color = 1
+                draw.rectangle((tab_x, y, tab_end_x, y + box_height - 1), outline=OLED_WHITE, fill=OLED_BLACK)
+                fill_color = OLED_WHITE
             
             # Center the icon within the tab
             icon_offset_x = (tab_width - 2 - icon_size) // 2
@@ -3617,7 +3448,7 @@ class OledUI:
         # Override labels for HOME page based on encoder toggle states (FFT mode)
         elif page_name == "HOME":
             labels = [
-                "Q" if _home_enc2_alt else "Freq",
+                "Range" if _home_enc2_alt else "Freq",
                 "Th-Mode" if _home_enc3_alt else "Thresh",
                 "R-Mode" if _home_enc4_alt else "Release"
             ]
@@ -3651,13 +3482,13 @@ class OledUI:
         # Use tighter kerning (0) for longer labels/values to fit on screen
         # Use extra tight kerning (-1) for very long values
         tight_labels = {"Th-Mode", "R-Mode"}  # Labels that need tighter kerning
-        tight_values = {"rnd/amb", "random", "ODD/EVEN"}  # Values that need tighter kerning (kern=0)
+        tight_values = {"rnd/amb", "rnd"}  # Values that need tighter kerning (kern=0)
         extra_tight_values = set()  # Values that need extra tight kerning (kern=-1)
         
         for i in range(3):
             px = x + i * (col_width + spacing)
             label_kern = 0 if labels[i] in tight_labels else 1
-            self._draw_text_kerned(draw, (px, y), labels[i], self._font_small, fill=1, kerning=label_kern)
+            self._draw_text_kerned(draw, (px, y), labels[i], self._font_small, fill=OLED_WHITE, kerning=label_kern)
             
             # Format value based on page and pot (using smoothed display values)
             if page_name == "HOME":
@@ -3703,16 +3534,13 @@ class OledUI:
                             # ReleaseMode - show current mode name
                             val_str = RELEASE_MODES[RELEASE_MODE_INDEX]
                         else:
-                            # Release - 0-99 (based on decay_ms: 40-5000ms range)
-                            release_pct = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                            release_pct = max(0, min(99, release_pct))
-                            if abs(release_pct - _display_release) > 1:
-                                _display_release = release_pct
+                            # Release - show in ms (or seconds if >= 1000ms)
+                            release_ms = int(band.decay_ms)
                             release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
                             if release_mode in ("react", "rand", "both"):
-                                val_str = f"{_effective_release_display}"
+                                val_str = format_release_display(_effective_release_display)
                             else:
-                                val_str = f"{_display_release}"
+                                val_str = format_release_display(release_ms)
                 else:
                     # FFT_STANDARD mode
                     if i == 0:  # Frequency or Q (based on toggle)
@@ -3731,14 +3559,14 @@ class OledUI:
                             # Freq mode - show in Hz (with tenths for kHz)
                             freq_hz = _display_freq
                             if freq_hz >= 1000:
-                                # Show to tenths place for kHz (e.g., "1.2k", "10.5k")
+                                # Show to tenths place for kHz (e.g., "1.2kHz", "10.5kHz")
                                 freq_khz = freq_hz / 1000.0
                                 if freq_khz >= 10:
-                                    val_str = f"{freq_khz:.1f}k"
+                                    val_str = f"{freq_khz:.1f}kHz"
                                 else:
-                                    val_str = f"{freq_khz:.1f}k"
+                                    val_str = f"{freq_khz:.1f}kHz"
                             else:
-                                val_str = f"{int(freq_hz)}"
+                                val_str = f"{int(freq_hz)}Hz"
                     elif i == 1:  # Threshold or ThreshMode (based on toggle)
                         if _home_enc3_alt:
                             # ThreshMode - show current mode name
@@ -3751,20 +3579,13 @@ class OledUI:
                             # ReleaseMode - show current mode name
                             val_str = RELEASE_MODES[RELEASE_MODE_INDEX]
                         else:
-                            # Release - 0-99 (based on decay_ms: 40-5000ms range)
-                            # Convert decay_ms back to 0-99 scale
-                            release_pct = int((band.decay_ms - 40.0) / 4960.0 * 99)
-                            release_pct = max(0, min(99, release_pct))
-                            # Only update display if changed by more than 1
-                            if abs(release_pct - _display_release) > 1:
-                                _display_release = release_pct
-                            
-                            # Show effective value for react/rand/both modes, base value otherwise
+                            # Release - show in ms (or seconds if >= 1000ms)
+                            release_ms = int(band.decay_ms)
                             release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
                             if release_mode in ("react", "rand", "both"):
-                                val_str = f"{_effective_release_display}"
+                                val_str = format_release_display(_effective_release_display)
                             else:
-                                val_str = f"{_display_release}"
+                                val_str = format_release_display(release_ms)
             elif page_name == "ADV":
                 if i == 0:  # Q factor - display as 0-99 (inverted: higher = wider range)
                     # Q ranges from Q_MAX (narrow) to Q_MIN (wide, frequency-dependent)
@@ -3789,8 +3610,8 @@ class OledUI:
                         _, neighbor = program_pair_for_base(BASE_PROGRAM)
                         val_str = f"({PROGRAM_NAMES[neighbor - 1]})"
                     elif current_mode == "rnd/amb" and CYCLE_PHASE == 1:
-                        # Show AMBIENT in parentheses when in rnd/amb ambient phase
-                        val_str = "(AMBIENT)"
+                        # Show AMB in brackets when in rnd/amb ambient phase
+                        val_str = "[AMB]"
                     else:
                         val_str = PROGRAM_NAMES[BASE_PROGRAM - 1]
                 elif i == 1:  # Mode - Cycles Between mode
@@ -3813,11 +3634,12 @@ class OledUI:
                         val_str = "Saved"
                     else:
                         val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                elif i == 1:  # Input Volume or Detection Mode (based on toggle)
+                elif i == 1:  # Input Gain or Detection Mode (based on toggle)
                     if _setup_enc3_detect:
                         val_str = DETECT_MODES[DETECT_MODE_INDEX]
                     else:
-                        val_str = str(INPUT_VOLUME)
+                        sign = "+" if INPUT_GAIN_DB > 0 else ""
+                        val_str = f"{sign}{INPUT_GAIN_DB}dB"
                 else:  # DMX Output Mode or Channel Count (based on toggle)
                     if _setup_enc4_channels:
                         val_str = str(DMX_CHANNEL_COUNT)
@@ -3850,39 +3672,280 @@ class OledUI:
                 val_kern = 0
             else:
                 val_kern = 1
-            self._draw_text_kerned(draw, (px, y + 9), val_str, self._font_small, fill=1, kerning=val_kern)
+            self._draw_text_kerned(draw, (px, y + 9), val_str, self._font_small, fill=OLED_WHITE, kerning=val_kern)
+
+    def _draw_home_controls(self, draw, x, y, width):
+        """Draw the 4-column HOME controls at the bottom: Freq, Trigger, Release, Brightness.
+        
+        These are always visible and controlled by encoders 2-5.
+        In AMBIENT mode: Speed, --, Fade, Bright
+        """
+        global _display_freq, _display_thresh, _display_release, _display_bright, _display_q_pct
+        
+        # 4 columns with spacing
+        spacing = 2
+        col_width = (width - spacing * 3) // 4
+        
+        # Labels based on mode and encoder toggle states
+        if BASE_PROGRAM == 6:
+            # AMBIENT mode: Speed, blank, Fade, Bright
+            labels = ["Speed", "--", "Fade", "Brightness"]
+        else:
+            labels = [
+                "Range" if _home_enc2_alt else "Freq",
+                "Th-Mode" if _home_enc3_alt else "Trigger",
+                "R-Mode" if _home_enc4_alt else "Release",
+                "Brightness"
+            ]
+        
+        # Update display values
+        _display_freq = band.center
+        _display_thresh = band.thresh
+        _display_bright = BRIGHTNESS
+        
+        for i in range(4):
+            px = x + i * (col_width + spacing)
+            label_kern = 0 if labels[i] in {"Th-Mode", "R-Mode"} else 1
+            self._draw_text_kerned(draw, (px, y), labels[i], self._font_small, fill=OLED_WHITE, kerning=label_kern)
+            
+            # Format value based on column
+            if BASE_PROGRAM == 6:
+                # AMBIENT mode values
+                if i == 0:  # Speed
+                    val_str = f"{ambient_speed:.1f}x"
+                elif i == 1:  # Blank
+                    val_str = "--"
+                elif i == 2:  # Fade
+                    val_str = f"{ambient_fade_time:.1f}s"
+                else:  # Brightness
+                    if _brightness_off and not _brightness_fading:
+                        val_str = "OFF"
+                    else:
+                        val_str = f"{int(BRIGHTNESS * 100)}"
+            else:
+                # Normal mode values
+                if i == 0:  # Frequency or Q
+                    if _home_enc2_alt:
+                        q_min = get_q_min(_display_freq)
+                        q_ratio = math.log(Q_MAX / max(q_min, band.q)) / math.log(Q_MAX / q_min)
+                        q_pct = round(q_ratio * 99)
+                        q_pct = max(0, min(99, q_pct))
+                        if abs(q_pct - _display_q_pct) > 1:
+                            _display_q_pct = q_pct
+                        val_str = f"{_display_q_pct}"
+                    else:
+                        freq_hz = _display_freq
+                        if freq_hz >= 1000:
+                            freq_khz = freq_hz / 1000.0
+                            val_str = f"{freq_khz:.1f}kHz"
+                        else:
+                            val_str = f"{int(freq_hz)}Hz"
+                elif i == 1:  # Trigger threshold or mode
+                    if _home_enc3_alt:
+                        val_str = THRESH_MODES[THRESH_MODE_INDEX]
+                    else:
+                        val_str = f"{int(_display_thresh * 99)}"
+                elif i == 2:  # Release or mode
+                    if _home_enc4_alt:
+                        val_str = RELEASE_MODES[RELEASE_MODE_INDEX]
+                    else:
+                        release_ms = int(band.decay_ms)
+                        release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+                        if release_mode in ("react", "rand", "both"):
+                            val_str = format_release_display(_effective_release_display)
+                        else:
+                            val_str = format_release_display(release_ms)
+                else:  # Brightness
+                    if _brightness_off and not _brightness_fading:
+                        val_str = "OFF"
+                    else:
+                        val_str = f"{int(BRIGHTNESS * 100)}"
+            
+            self._draw_text_kerned(draw, (px, y + 9), val_str, self._font_small, fill=OLED_WHITE, kerning=1)
+
+    def _draw_submenu_tabs_and_border(self, draw, x, y, width, content_height):
+        """Draw folder-style tabs with border enclosing content below."""
+        tab_names = SUBMENU_TABS
+        tab_width = width // len(tab_names)
+        tab_height = 10
+        border_y = y + tab_height  # Where the content border starts
+        total_height = tab_height + content_height
+        
+        # Draw the content border (box below tabs)
+        # Left edge
+        draw.line((x, border_y, x, y + total_height - 1), fill=OLED_WHITE)
+        # Bottom edge
+        draw.line((x, y + total_height - 1, x + width - 1, y + total_height - 1), fill=OLED_WHITE)
+        # Right edge
+        draw.line((x + width - 1, border_y, x + width - 1, y + total_height - 1), fill=OLED_WHITE)
+        
+        # Draw tabs and connect selected tab to border
+        tab_kerning = -1  # Negative kerning for tighter text
+        char_width = 4  # Approximate width per character with kerning=-1
+        
+        for i, name in enumerate(tab_names):
+            tx = x + i * tab_width
+            tab_right = tx + tab_width - 3
+            is_selected = (i == submenu_tab)
+            
+            # Calculate centered text position
+            text_width = len(name) * char_width
+            tab_inner_width = tab_right - tx - 2  # Usable width inside tab
+            text_x = tx + (tab_inner_width - text_width) // 2 + 1
+            
+            if is_selected:
+                # Selected tab: rounded top corners, connects to content box
+                # Top-left corner (rounded)
+                draw.point((tx + 1, y), fill=OLED_WHITE)
+                draw.point((tx, y + 1), fill=OLED_WHITE)
+                # Top edge
+                draw.line((tx + 2, y, tab_right - 2, y), fill=OLED_WHITE)
+                # Top-right corner (rounded)
+                draw.point((tab_right - 1, y), fill=OLED_WHITE)
+                draw.point((tab_right, y + 1), fill=OLED_WHITE)
+                # Left edge of tab
+                draw.line((tx, y + 2, tx, border_y - 1), fill=OLED_WHITE)
+                # Right edge of tab
+                draw.line((tab_right, y + 2, tab_right, border_y - 1), fill=OLED_WHITE)
+                # Text (white on black background) - tight kerning, centered
+                self._draw_text_kerned(draw, (text_x, y + 1), name, self._font_small, fill=OLED_WHITE, kerning=tab_kerning)
+                
+                # Connect border: draw line from content box edge to tab edges
+                # Line from left edge to tab left
+                if tx > x:
+                    draw.line((x, border_y, tx - 1, border_y), fill=OLED_WHITE)
+                # Line from tab right to right edge (or next tab)
+                if tab_right < x + width - 1:
+                    draw.line((tab_right + 1, border_y, x + width - 1, border_y), fill=OLED_WHITE)
+            else:
+                # Unselected tab: just text, sits on the border line - tight kerning, centered
+                self._draw_text_kerned(draw, (text_x, y), name, self._font_small, fill=OLED_GRAY, kerning=tab_kerning)
+                # Draw border line under unselected tab
+                draw.line((tx, border_y, tx + tab_width - 3, border_y), fill=OLED_WHITE)
+
+    def _draw_submenu_content(self, draw, x, y, width, height):
+        """Draw the submenu content (3 columns of controls for current tab)."""
+        tab = SUBMENU_TABS[submenu_tab]
+        labels = SUBMENU_LABELS[tab]
+        
+        # 3 columns
+        spacing = 2
+        col_width = (width - spacing * 2) // 3
+        
+        for i in range(3):
+            px = x + i * (col_width + spacing)
+            is_selected = (i == submenu_column)
+            
+            # Draw label - invert when selected and NOT editing (column selection mode)
+            label_str = labels[i]
+            label_kern = 0  # Tighter kerning for labels
+            if is_selected and not submenu_editing:
+                # Column selection mode: invert the label (white bg, black text)
+                text_width = len(label_str) * 5  # Tighter spacing
+                draw.rectangle((px - 1, y - 1, px + text_width, y + 8), fill=OLED_WHITE)
+                self._draw_text_kerned(draw, (px, y), label_str, self._font_small, fill=OLED_BLACK, kerning=label_kern)
+            else:
+                # Editing mode or unselected: normal colors
+                label_color = OLED_WHITE if is_selected else OLED_GRAY
+                self._draw_text_kerned(draw, (px, y), label_str, self._font_small, fill=label_color, kerning=label_kern)
+            
+            # Get value for this column
+            if tab == "Presets":
+                if i == 0:  # Preset - show cycling state with parentheses
+                    current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+                    if current_mode == "x+1" and CYCLE_PHASE == 1 and BASE_PROGRAM != 6:
+                        # Show neighbor preset in parentheses when in x+1 neighbor phase
+                        _, neighbor = program_pair_for_base(BASE_PROGRAM)
+                        val_str = f"({PROGRAM_NAMES[neighbor - 1]})"
+                        # #region agent log
+                        import json as _json; open("/home/benglasser/.cursor/debug-4c4bbd.log","a").write(_json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3625","message":"x+1 showing neighbor","data":{"val_str":val_str,"phase":CYCLE_PHASE,"base":BASE_PROGRAM},"timestamp":int(time.time()*1000)})+"\n")
+                        # #endregion
+                    elif current_mode == "rnd/amb" and CYCLE_PHASE == 1:
+                        # Show AMB in brackets when in rnd/amb ambient phase
+                        val_str = "[AMB]"
+                        # #region agent log
+                        import json as _json; open("/home/benglasser/.cursor/debug-4c4bbd.log","a").write(_json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3631","message":"rnd/amb showing AMB","data":{"val_str":val_str,"phase":CYCLE_PHASE},"timestamp":int(time.time()*1000)})+"\n")
+                        # #endregion
+                    else:
+                        # Normal: show base preset name
+                        val_str = PROGRAM_NAMES[BASE_PROGRAM - 1]
+                elif i == 1:  # Mode
+                    val_str = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
+                else:  # Beats
+                    if CYCLES_BETWEEN_INDEX == 0:
+                        val_str = "--"
+                    else:
+                        val_str = f"{CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]}"
+            elif tab == "Settings":
+                if i == 0:  # Gain (dB)
+                    sign = "+" if INPUT_GAIN_DB > 0 else ""
+                    val_str = f"{sign}{INPUT_GAIN_DB}dB"
+                elif i == 1:  # Reset - show current preset name
+                    val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+                else:  # Column 3 is blank
+                    val_str = ""
+            elif tab == "Setup":
+                if i == 0:  # Output
+                    val_str = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
+                elif i == 1:  # Channels
+                    val_str = str(DMX_CHANNEL_COUNT)
+                else:  # Band
+                    val_str = SETUP_BAND_OPTIONS[SETUP_BAND_INDEX]
+            else:
+                val_str = "--"
+            
+            # Draw value - invert when editing (white bg, black text), otherwise white/gray
+            val_y = y + 9
+            val_kern = 0  # Tighter kerning for values
+            if is_selected and submenu_editing:
+                # Editing mode: invert colors (white background, black text)
+                # Get text width for background rectangle
+                text_width = len(val_str) * 5  # Tighter spacing
+                draw.rectangle((px - 1, val_y - 1, px + text_width, val_y + 8), fill=OLED_WHITE)
+                self._draw_text_kerned(draw, (px, val_y), val_str, self._font_small, fill=OLED_BLACK, kerning=val_kern)
+            else:
+                # Selection mode or unselected: normal colors
+                val_color = OLED_WHITE if is_selected else OLED_GRAY
+                self._draw_text_kerned(draw, (px, val_y), val_str, self._font_small, fill=val_color, kerning=val_kern)
 
     def render_once(self):
         if not self.enabled or self.device is None:
             return
         
         W, H = self.width, self.height
-        image = Image.new("1", (W, H))
+        image = Image.new("RGB", (W, H), OLED_BLACK)
         draw = ImageDraw.Draw(image)
 
         if APP_STATE == "error":
-            draw.text((0, 0), "ERROR", font=self._font, fill=1)
-            draw.text((0, 14), (APP_ERROR or "See logs")[:20], font=self._font, fill=1)
+            draw.text((0, 0), "ERROR", font=self._font, fill=OLED_WHITE)
+            draw.text((0, 14), (APP_ERROR or "See logs")[:20], font=self._font, fill=OLED_WHITE)
         else:
-            # Top half: Visualization based on detection mode
-            if BEAT_DETECT_METHOD == 1:
-                # 3BAND mode: show 3-band visualization
-                self._draw_3band_vu(draw, 0, 0, W, 32)
-            else:
-                # FFT mode: show FFT spectrum with Q-band and threshold
-                self._draw_fft_spectrum(draw, 0, 0, W, 32)
+            # New layout: 256x64 split into quadrants
+            # Top-left (128x32): FFT visualization
+            # Top-right (128x32): Submenu tabs + content
+            # Bottom (256x32): HOME controls (4 columns)
             
-            # Bottom half layout:
-            # Row 1: [Page tabs] [Brightness]
-            # Row 2: [Enc2,3,4 values - full width]
+            half_width = W // 2  # 128px
+            half_height = H // 2  # 32px
             
-            # Row 1: Page tabs + brightness (inline)
-            brightness_width = 25  # sun icon (7) + space (2) + 2-digit number (~16)
-            self._draw_page_tabs_wide(draw, 0, 33, W, reserved_right=brightness_width)
-            self._draw_brightness_inline(draw, W - brightness_width + 2, 34)
+            # Top-left: FFT spectrum (always FFT mode now, no 3-band)
+            # Draw box around FFT area first, then draw FFT inside with 1px margin
+            draw.rectangle((0, 0, half_width - 1, half_height - 1), outline=OLED_WHITE)
+            self._draw_fft_spectrum(draw, 1, 1, half_width - 2, half_height - 2)
             
-            # Row 2: Pot values (full width)
-            self._draw_pot_values(draw, 0, 46, W)
+            # Top-right: Submenu area
+            submenu_x = half_width + 2
+            submenu_width = half_width - 4
+            content_height = half_height - 11  # Height of content area below tabs
+            
+            # Draw folder-style tabs with border enclosing content
+            self._draw_submenu_tabs_and_border(draw, submenu_x, 0, submenu_width, content_height)
+            
+            # Submenu content inside the bordered area (offset by 1 for border)
+            self._draw_submenu_content(draw, submenu_x + 2, 12, submenu_width - 4, content_height - 2)
+            
+            # Bottom: HOME controls (4 columns)
+            self._draw_home_controls(draw, 0, half_height + 2, W)
 
         try:
             self.device.display(image)
@@ -3928,10 +3991,13 @@ def safe_addstr(stdscr, y, x, s):
 
 def draw_band_bar(stdscr, y, x, width, center, q):
     left_hz, right_hz = MIN_CENTER_HZ, MAX_CENTER_HZ
+    warp = 0.3  # Same warp factor as generate_log_bands
     def hz_to_col(f):
         lf = math.log10(max(left_hz, min(right_hz, f)))
         lmin, lmax = math.log10(left_hz), math.log10(right_hz)
-        return int((lf - lmin)/(lmax-lmin) * (width-1))
+        t = (lf - lmin) / (lmax - lmin)
+        t_display = t ** (1.0 / (1.0 - warp))
+        return int(t_display * (width-1))
     bw   = center/max(1e-6, q)
     f_lo = max(left_hz,  center - 0.5*bw)
     f_hi = min(right_hz, center + 0.5*bw)
@@ -4022,8 +4088,8 @@ def main():
     dmx_backend = make_dmx_backend()
     threading.Thread(target=lambda: dmx_sender_loop(dmx_backend), daemon=True).start()
 
-    # OLED UI (SPI) with FFT display
-    oled_ui = OledUI(width=128, height=64, fps=15)
+    # OLED UI (SPI) with FFT display - EastRising 3.2" SSD1322 256x64
+    oled_ui = OledUI(width=OLED_WIDTH, height=OLED_HEIGHT, fps=15)
     if getattr(oled_ui, "enabled", False):
         threading.Thread(target=oled_ui.loop, daemon=True).start()
         print("[OK] OLED UI: 128x64 SPI with FFT display")

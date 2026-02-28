@@ -90,14 +90,20 @@ sudo reboot
   - **ALL**: All channels trigger together
   - **CHASE**: Sequential single channel cycling
   - **GROUPS**: First half alternates with second half
-  - **ODD/EVEN**: Odd channels alternate with even
+  - **SWAP**: Odd channels alternate with even
   - **RANDOM**: Random channel each trigger
   - **AMBIENT**: Non-audio-reactive random fading
+- 4 cycle modes for automatic preset switching:
+  - **off**: No cycling
+  - **x+1**: Alternate between current preset and next (skips AMBIENT)
+  - **rnd**: Random preset every N beats
+  - **rnd/amb**: Alternate between random preset (N beats) and AMBIENT (N seconds)
 
 ### Hardware Interface
-- 128x64 SPI OLED display with live FFT visualization
+- 256x64 SPI OLED display (EastRising 3.2" SSD1322) with live FFT visualization
 - 5 rotary encoders with push buttons for parameter control
-- Multi-page UI: HOME, PRE (presets), SET (settings), COLOR (DMX mode only)
+- Split-screen UI: FFT + submenu on top, home controls on bottom
+- Submenu tabs: PRE (presets), SET (settings), SETUP (DMX config) - cycled via Reset button
 - 6 preset slots (3 built-in: LOW/MID/HIGH, 3 user-saveable)
 - Persistent settings saved to config file
 
@@ -118,7 +124,7 @@ This section documents the exact configuration of the working system.
 |-----------|------------|------------|
 | Raspberry Pi | Pi 4 or 5 | - |
 | Audio HAT | HiFiBerry DAC+ ADC Pro | GPIO header (stacked) |
-| OLED Display | SSD1309 128x64 SPI | SPI0 CE1 (GPIO 7) |
+| OLED Display | EastRising 3.2" SSD1322 256x64 SPI | SPI0 CE1 (GPIO 7) |
 | DMX Output | MAX485 RS485 | UART TX (GPIO 14) |
 | Encoders | 5x KY-040 rotary | Various GPIO pins |
 
@@ -180,7 +186,7 @@ ctl.!default {
 | Raspberry Pi 4 or 5 | Main computer |
 | HiFiBerry DAC+ ADC Pro | Audio input |
 | MAX485 RS485 transceiver | DMX output |
-| SPI OLED 128x64 (SSD1309) | Display |
+| SPI OLED 256x64 (EastRising SSD1322) | Display |
 | 5x Rotary encoders with push buttons | Controls |
 | 3-pin or 5-pin XLR connector | DMX output |
 | DMX fixtures | Lights! |
@@ -208,7 +214,7 @@ sudo scripts/install_services.sh
 
 ### Pin Reference (BCM Numbering)
 
-#### SPI OLED Display (128x64 SSD1309 on CE1)
+#### SPI OLED Display (256x64 EastRising SSD1322 on CE1)
 
 | OLED Pin | Pi GPIO | Pi Pin |
 |----------|---------|--------|
@@ -224,20 +230,22 @@ sudo scripts/install_services.sh
 
 | Encoder | Function | CLK | DT | SW (Button) |
 |---------|----------|-----|-----|-------------|
-| Encoder 1 | Page Selection | BCM 5 | BCM 6 | BCM 13 |
-| Encoder 2 | Param A (Freq/Speed/Preset) | BCM 17 | BCM 27 | BCM 22 |
-| Encoder 3 | Param B (Thresh/Beats) | BCM 19 | BCM 26 | BCM 23 |
-| Encoder 4 | Param C (Release/Mode) | BCM 16 | BCM 20 | BCM 21 |
+| Encoder 1 | Submenu Navigation | BCM 5 | BCM 6 | BCM 13 |
+| Encoder 2 | Frequency | BCM 17 | BCM 27 | BCM 22 |
+| Encoder 3 | Trigger Threshold | BCM 19 | BCM 26 | BCM 23 |
+| Encoder 4 | Release Time | BCM 16 | BCM 20 | BCM 21 |
 | Encoder 5 | Brightness | BCM 4 | BCM 18 | BCM 8 |
 
 All encoder common pins connect to GND.
 
-#### Reset Button
+#### Reset Button (Submenu Tab Cycle)
 
 | Pin | Connection |
 |-----|------------|
 | BCM 25 | Button terminal 1 |
 | GND | Button terminal 2 |
+
+Press to cycle through submenu tabs (PRE → SET → PRE...).
 
 #### DMX Output (UART via RS485)
 
@@ -331,18 +339,41 @@ This produces clean triggers that only fire on actual transients (kick attacks, 
 3. DMX controller starts automatically
 4. OLED shows FFT spectrum and controls
 
-### UI Pages
+### UI Layout
 
-Navigate pages with **Encoder 1** (turn to switch, press to confirm):
+The 256x64 OLED is split into regions:
 
-| Page | Encoder 2 | Encoder 3 | Encoder 4 |
-|------|-----------|-----------|-----------|
-| **HOME** | Frequency (press: Q) | Threshold (press: Thresh Mode) | Release (press: Release Mode) |
-| **PRE** | Preset Select | Program Mode | Beat Cycles |
-| **SET** | Reset Defaults | Input Gain | Output Mode / Channel Count |
-| **COLOR** | Light Select | Hue/Temp | Saturation |
+```
+┌─────────────────────────────────────────────────────────────┐
+│  FFT Visualization  │  Submenu Tabs: [PRE] [SET] [SETUP]    │
+│  (left half)        │  ┌─────────────────────────────────┐  │
+│                     │  │ Col 1   │ Col 2   │ Col 3       │  │
+│                     │  │ (varies by tab)                 │  │
+│                     │  └─────────────────────────────────┘  │
+├─────────────────────┴───────────────────────────────────────┤
+│  Freq      │  Trigger   │  Release   │  Brightness          │
+│  (Enc 2)   │  (Enc 3)   │  (Enc 4)   │  (Enc 5)             │
+└─────────────────────────────────────────────────────────────┘
+```
 
-**Encoder 5** always controls brightness.
+### Controls
+
+| Encoder | Function |
+|---------|----------|
+| **Encoder 1** | Submenu navigation: turn to select column, click to edit/exit |
+| **Encoder 2** | Frequency (bottom) |
+| **Encoder 3** | Trigger threshold (bottom) |
+| **Encoder 4** | Release time (bottom) |
+| **Encoder 5** | Brightness (bottom) |
+| **Reset Button** | Cycle submenu tabs (PRE → SET → SETUP → PRE...) |
+
+### Submenu Tabs
+
+| Tab | Column 1 | Column 2 | Column 3 |
+|-----|----------|----------|----------|
+| **PRE** | Preset (1-6) | Cycle Mode | Beat Count |
+| **SET** | Input Gain | Reset to Preset | (reserved) |
+| **SETUP** | DMX Output Mode | Channel Count | Band (LOW/MID/HIGH) |
 
 ### Presets
 
@@ -353,7 +384,18 @@ Navigate pages with **Encoder 1** (turn to switch, press to confirm):
 | HIGH | 5000 Hz | Hi-hats/cymbals |
 | USR 1-3 | Custom | User-saveable slots |
 
-**Saving Presets:** Long-press Encoder 2 on the PRE page to save current settings to a USR slot.
+**Saving Presets:** Long-press Encoder 2 to save current settings to a USR slot.
+
+### Cycle Modes
+
+| Mode | Behavior |
+|------|----------|
+| **off** | No automatic preset switching |
+| **x+1** | Alternate between current preset and next in list (wraps 5→1, skips AMBIENT) |
+| **rnd** | Switch to random preset every N beats |
+| **rnd/amb** | Alternate between random preset (N beats) and AMBIENT mode (N seconds) |
+
+The "Beats" column controls N - how many beats (or seconds for rnd/amb ambient phase) before switching.
 
 ### Release Modes
 
@@ -497,7 +539,7 @@ pi-dmx-controller-v2/
 
 | Problem | Solution |
 |---------|----------|
-| No OLED display | Check SPI wiring, verify `dtparam=spi=on` in config.txt |
+| No OLED display | Check SPI wiring, verify `dtparam=spi=on` in config.txt, ensure SSD1322 driver |
 | No audio input | Run `arecord -l` to list devices, check HiFiBerry overlay |
 | No DMX output | Check RS485 wiring, verify UART is enabled |
 | Service won't start | Check logs: `journalctl -u dmx_audio_react.service -n 50` |
@@ -583,4 +625,4 @@ Expected boot times:
 
 ## License
 
-MIT © 2025 Ben Glasser
+MIT © 2026 Ben Glasser

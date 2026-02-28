@@ -26,7 +26,7 @@ This guide walks you through building a complete audio-reactive DMX lighting con
 | Raspberry Pi 4 or 5 | 1 | Main controller | 2GB+ RAM recommended |
 | MicroSD Card | 1 | OS storage | 16GB+ recommended |
 | Power Supply | 1 | Pi power | 5V 3A USB-C |
-| SPI OLED Display 128x64 | 1 | UI display | SSD1309 controller (Waveshare 2.42") |
+| SPI OLED Display 256x64 | 1 | UI display | SSD1322 controller (EastRising 3.2") |
 | Rotary Encoders with Push Button | 5 | Parameter controls | KY-040 or similar |
 | MAX485 RS485 Transceiver | 1 | DMX output | Or similar RS485 module |
 | 3-pin or 5-pin XLR Connector | 1 | DMX output | Female for fixture connection |
@@ -120,7 +120,7 @@ The Raspberry Pi uses BCM (Broadcom) pin numbering. Here's the complete pinout:
                   GND (39) (40) GPIO 21 [Enc4 SW]
 ```
 
-### 3.1 SPI OLED Display (128x64 SSD1309)
+### 3.1 SPI OLED Display (256x64 SSD1322)
 
 | OLED Pin | Connect To | Pi Physical Pin |
 |----------|------------|-----------------|
@@ -230,10 +230,10 @@ The Pi uses internal pull-up resistors. Pressing the button pulls GPIO 25 LOW.
                            ┌─────────────────────┐
                            │   Raspberry Pi 4    │
                            │                     │
-  ┌──────────┐             │  GPIO 5,6,13 ◄──────┼─── Encoder 1 (Page)
+  ┌──────────┐             │  GPIO 5,6,13 ◄──────┼─── Encoder 1 (Submenu)
   │  OLED    │             │  GPIO 17,27,22 ◄────┼─── Encoder 2 (Freq)
-  │ SSD1309  │◄────────────┼─ GPIO 7,10,11,12,24 │
-  │ 128x64   │             │  GPIO 19,26,23 ◄────┼─── Encoder 3 (Thresh)
+  │ SSD1322  │◄────────────┼─ GPIO 7,10,11,12,24 │
+  │ 256x64   │             │  GPIO 19,26,23 ◄────┼─── Encoder 3 (Thresh)
   └──────────┘             │  GPIO 16,20,21 ◄────┼─── Encoder 4 (Release)
                            │  GPIO 4,18,8 ◄──────┼─── Encoder 5 (Bright)
   ┌──────────┐             │                     │
@@ -425,25 +425,33 @@ Play some music into your audio input - you should see the FFT display respond a
 3. DMX controller starts automatically
 4. OLED shows FFT spectrum and parameter display
 
-### 6.2 Encoder Controls
+### 6.2 UI Layout
+
+The 256x64 OLED is split into regions:
+- **Top-left**: FFT visualization
+- **Top-right**: Submenu tabs (PRE/SET/SETUP) with 3-column controls
+- **Bottom**: HOME controls (Freq, Trigger, Release, Brightness)
+
+### 6.3 Encoder Controls
 
 | Encoder | Turn | Press |
 |---------|------|-------|
-| **Enc 1** | Change page | (reserved) |
-| **Enc 2** | Adjust param A | Toggle alternate param |
-| **Enc 3** | Adjust param B | Toggle alternate param |
-| **Enc 4** | Adjust param C | Toggle alternate param |
-| **Enc 5** | Adjust brightness | Toggle brightness mode |
+| **Enc 1** | Navigate submenu columns | Enter/exit edit mode |
+| **Enc 2** | Adjust frequency (or Q when toggled) | Toggle Q mode |
+| **Enc 3** | Adjust trigger threshold | Toggle threshold mode |
+| **Enc 4** | Adjust release time | Toggle release mode |
+| **Enc 5** | Adjust brightness | Toggle brightness on/off |
+| **Reset Button** | - | Cycle submenu tabs (PRE → SET → SETUP → PRE...) |
 
-### 6.3 Pages
+### 6.4 Submenu Tabs
 
-| Page | Enc 2 | Enc 3 | Enc 4 |
-|------|-------|-------|-------|
-| **HOME** | Frequency (press: Q) | Threshold (press: Mode) | Release (press: Mode) |
-| **PRE** | Preset | Program | Beats |
-| **SET** | Reset | Input Gain | Output Mode |
+| Tab | Column 1 | Column 2 | Column 3 |
+|-----|----------|----------|----------|
+| **PRE** | Preset (1-6) | Cycle Mode | Beat Count |
+| **SET** | Input Gain | Reset to Preset | (reserved) |
+| **SETUP** | DMX Output Mode | Channel Count | Band (LOW/MID/HIGH) |
 
-### 6.4 Presets
+### 6.5 Presets
 
 | Preset | Frequency | Use Case |
 |--------|-----------|----------|
@@ -454,7 +462,7 @@ Play some music into your audio input - you should see the FFT display respond a
 
 **Save a preset:** On PRE page, hold Encoder 2 for 3 seconds while on a USR slot.
 
-### 6.5 Programs
+### 6.6 Programs
 
 | Program | Behavior |
 |---------|----------|
@@ -644,12 +652,17 @@ sudo reboot
 │              DMX Audio-Reactive Controller              │
 ├─────────────────────────────────────────────────────────┤
 │  ENCODERS:                                              │
-│    Enc 1: Page select                                   │
-│    Enc 2: Freq/Preset (press: Q/ThreshMode)            │
-│    Enc 3: Thresh/Program (press: ThreshMode)           │
-│    Enc 4: Release/Beats (press: ReleaseMode)           │
-│    Enc 5: Brightness                                    │
-│    Reset: Short press = reset to preset defaults        │
+│    Enc 1: Submenu column select (click: edit/exit)      │
+│    Enc 2: Frequency (press: toggle Q mode)              │
+│    Enc 3: Trigger threshold (press: toggle mode)        │
+│    Enc 4: Release time (press: toggle mode)             │
+│    Enc 5: Brightness (press: toggle on/off)             │
+│    Reset: Cycle submenu tabs (PRE → SET → SETUP)        │
+├─────────────────────────────────────────────────────────┤
+│  SUBMENU TABS:                                          │
+│    PRE:   Preset | Cycle Mode | Beat Count              │
+│    SET:   Gain   | Reset      | (blank)                 │
+│    SETUP: Output | Channels   | Band                    │
 ├─────────────────────────────────────────────────────────┤
 │  COMMANDS:                                              │
 │    dmx-dev disable  - Enter development mode            │
@@ -676,4 +689,4 @@ sudo reboot
 
 ---
 
-© 2025 Ben Glasser | MIT License
+© 2026 Ben Glasser | MIT License
