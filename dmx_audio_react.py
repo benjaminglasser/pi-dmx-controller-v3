@@ -514,7 +514,7 @@ submenu_editing = False  # True when encoder 1 is editing selected column value
 # Submenu column labels for each tab
 SUBMENU_LABELS = {
     "Presets": ["Preset", "Mode", "Beats"],
-    "Settings": ["Gain", "Reset", ""],      # Reset = preset selector, col 3 blank
+    "Settings": ["Gain", "Defaults", ""],    # Defaults = preset selector, col 3 blank
     "Setup": ["Output", "Chans", "Band"],   # Output=Dimmer/DMX, Chans=4-24, Band=LOW/MID/HIGH
 }
 
@@ -760,6 +760,12 @@ _enc2_press_time = 0.0       # When button was pressed
 _enc2_saving = False         # True while in 3-second hold on SET page
 _enc2_save_complete = 0.0    # Timestamp when save completed (for "Saved" display)
 
+# Long-press state for encoder 1 (save preset on Settings page, Reset column)
+_enc1_press_time = 0.0       # When encoder 1 button was pressed (0 = not pressed)
+_enc1_save_progress = 0.0    # 0.0-1.0 progress for countdown display (3 seconds total)
+_enc1_save_complete = 0.0    # Timestamp when save completed (for "Saved" display)
+ENC1_SAVE_HOLD_DURATION = 3.0  # Seconds to hold for preset save
+
 # Preset toggle state for encoder 2 on PRE page (toggle to/from ambient)
 _last_preset_before_ambient = 1  # Stores the preset to return to when toggling from ambient
 
@@ -811,6 +817,42 @@ TRIG_DEBUG  = os.environ.get("TRIG_DEBUG",  "0").strip() == "1"
 # --- TUI flash message ---
 _ui_flash_msg   = ""
 _ui_flash_until = 0.0
+
+# --- Persistent error state for TUI ---
+_error_msg = ""
+_error_time = 0.0
+_error_type = "error"  # "error", "warning", "info"
+
+def set_error(msg: str, error_type: str = "error"):
+    """Set a persistent error message (displayed until cleared).
+    
+    Args:
+        msg: The error message to display
+        error_type: One of "error", "warning", or "info"
+    """
+    global _error_msg, _error_time, _error_type
+    _error_msg = msg
+    _error_time = time.time()
+    _error_type = error_type
+
+def clear_error():
+    """Clear the persistent error message."""
+    global _error_msg, _error_time, _error_type
+    _error_msg = ""
+    _error_time = 0.0
+    _error_type = "error"
+
+def get_error():
+    """Get current error message, time, and type."""
+    return _error_msg, _error_time, _error_type
+
+def set_warning(msg: str):
+    """Set a warning message (displayed until cleared)."""
+    set_error(msg, "warning")
+
+def set_info(msg: str):
+    """Set an info message (displayed until cleared)."""
+    set_error(msg, "info")
 
 def ui_flash(msg: str, seconds: float = 1.5):
     global _ui_flash_msg, _ui_flash_until
@@ -1664,10 +1706,10 @@ def pick_input_device():
         rx = re.compile(pat, re.I)
         for i, d in enumerate(devs):
             if d.get("max_input_channels",0) >= 1 and rx.search(d.get("name","")):
-                return i, d["name"]
+                return i, d["name"], min(d.get("max_input_channels", 1), 2)
     for i, d in enumerate(devs):
         if d.get("max_input_channels",0) >= 1:
-            return i, d["name"]
+            return i, d["name"], min(d.get("max_input_channels", 1), 2)
     raise RuntimeError("No suitable input device (>=1ch) found")
 
 def choose_input_device():
@@ -1678,18 +1720,18 @@ def choose_input_device():
         d = sd.query_devices(idx)
         if d.get("max_input_channels", 0) <= 0:
             raise RuntimeError(f"AUDIO_DEVICE={idx} has no input channels")
-        return idx, d["name"]
+        return idx, d["name"], min(d.get("max_input_channels", 1), 2)
 
     if AUDIO_DEVICE_NAME:
         needle = AUDIO_DEVICE_NAME.lower()
         for i, d in enumerate(devs):
             if d.get("max_input_channels", 0) > 0 and needle in d.get("name", "").lower():
-                return i, d["name"]
+                return i, d["name"], min(d.get("max_input_channels", 1), 2)
         raise RuntimeError(f'No input device name contains "{AUDIO_DEVICE_NAME}"')
 
     return pick_input_device()
 
-DEVICE_INDEX, DEVICE_NAME = choose_input_device()
+DEVICE_INDEX, DEVICE_NAME, DEVICE_CHANNELS = choose_input_device()
 
 
 def update_encoders():
@@ -1851,44 +1893,69 @@ def save_current_as_default():
                        THRESH_MODE_INDEX, RELEASE_MODE_INDEX)
 
 def setup_gpio_inputs():
+    """Initialize GPIO pins for encoders and reset button.
+    
+    Returns True on success, False on failure (with error set for TUI display).
+    """
+    global DEV_NO_HW
+    
     if DEV_NO_HW:
-        return
+        return True
     if GPIO is None:
-        raise RuntimeError("RPi.GPIO not available")
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BCM)
+        set_error("RPi.GPIO not available - run with DEV_NO_HW=1")
+        return False
     
-    # Rotary Encoder 1 (Page selection)
-    GPIO.setup(ENC1_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC1_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC1_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    
-    # Rotary Encoder 2 (Param A - Freq/Speed/Preset)
-    GPIO.setup(ENC2_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC2_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC2_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    
-    # Rotary Encoder 3 (Param B - Thresh/Beats)
-    GPIO.setup(ENC3_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    
-    # Rotary Encoder 4 (Param C - Release/Mode)
-    GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC4_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC4_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    
-    # Rotary Encoder 5 (Brightness)
-    GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    if not ENC5_SW_DISABLED:
-        try:
-            GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        except Exception as e:
-            print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
-    
-    # Reset button
-    GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    try:
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        
+        # Rotary Encoder 1 (Page selection)
+        GPIO.setup(ENC1_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC1_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC1_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        
+        # Rotary Encoder 2 (Param A - Freq/Speed/Preset)
+        GPIO.setup(ENC2_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC2_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC2_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        
+        # Rotary Encoder 3 (Param B - Thresh/Beats)
+        GPIO.setup(ENC3_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        
+        # Rotary Encoder 4 (Param C - Release/Mode)
+        GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC4_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC4_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        
+        # Rotary Encoder 5 (Brightness)
+        GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        if not ENC5_SW_DISABLED:
+            try:
+                GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            except Exception as e:
+                print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
+        
+        # Reset button
+        GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        return True
+        
+    except Exception as e:
+        error_str = str(e)
+        if "busy" in error_str.lower():
+            set_error(f"GPIO busy - kill other processes: sudo pkill -f python")
+            print(f"\n[ERROR] GPIO busy - another process is using GPIO pins.")
+            print(f"        Fix: sudo pkill -f dmx_audio_react.py && sudo pkill -f board_bringup.py")
+            print(f"        Or reboot: sudo reboot\n")
+        else:
+            set_error(f"GPIO error: {error_str[:50]}")
+            print(f"\n[ERROR] GPIO setup failed: {e}\n")
+        
+        # Disable hardware mode and continue without GPIO
+        DEV_NO_HW = True
+        return False
 
 _enc_last_update_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time when delta was last consumed
 _enc_update_velocity = [0.0, 0.0, 0.0, 0.0, 0.0]   # Smoothed velocity based on update intervals
@@ -2256,15 +2323,55 @@ def encoder_reader():
                         submenu_column = max(0, min(2, submenu_column + direction))
                 
                 enc1_sw = GPIO.input(ENC1_SW)
+                global _enc1_press_time, _enc1_save_progress, _enc1_save_complete
+                
+                # Check if we're on Settings tab with Reset column in EDITING mode (showing preset names)
+                # Only allow long-press save when editing (viewing LOW/MID/HIGH/USR 1-3)
+                is_settings_reset_editing = (SUBMENU_TABS[submenu_tab] == "Settings" and 
+                                             submenu_column == 1 and submenu_editing)
+                
                 if enc1_sw == 0 and _enc_last_sw[0] == 1:
+                    # Button just pressed - start timing
                     time.sleep(0.02)  # Debounce
                     if GPIO.input(ENC1_SW) == 0:
-                        # Toggle between selection and editing mode
-                        submenu_editing = not submenu_editing
-                        if submenu_editing:
-                            ui_flash("Edit", 0.3)
+                        _enc1_press_time = time.time()
+                        _enc1_save_progress = 0.0
+                elif enc1_sw == 0 and _enc_last_sw[0] == 0:
+                    # Button still held - check for long press on Settings/Reset (editing mode only)
+                    if _enc1_press_time > 0 and is_settings_reset_editing:
+                        hold_duration = time.time() - _enc1_press_time
+                        # Only start showing progress after 150ms delay
+                        if hold_duration >= 0.15:
+                            # Progress starts after 150ms, completes at ENC1_SAVE_HOLD_DURATION
+                            adjusted_duration = hold_duration - 0.15
+                            _enc1_save_progress = min(1.0, adjusted_duration / ENC1_SAVE_HOLD_DURATION)
+                        
+                        if hold_duration >= (ENC1_SAVE_HOLD_DURATION + 0.15):
+                            # Long press complete - save current settings to selected preset
+                            save_current_as_default()
+                            _enc1_press_time = 0.0
+                            _enc1_save_progress = 2.0  # Special value to show "saved"
+                            _enc1_save_complete = time.time()
+                            # Wait for button release to prevent toggle
+                            while GPIO.input(ENC1_SW) == 0 and not STOP_THREADS:
+                                time.sleep(0.01)
+                            time.sleep(0.05)
+                elif enc1_sw == 1 and _enc_last_sw[0] == 0:
+                    # Button just released
+                    if _enc1_press_time > 0:
+                        # If countdown was showing (progress > 0), just cancel - don't toggle
+                        if _enc1_save_progress > 0:
+                            # Countdown was active - cancel save, stay in current mode
+                            pass
                         else:
-                            ui_flash("Select", 0.3)
+                            # No countdown was showing - normal short press toggle
+                            submenu_editing = not submenu_editing
+                            if submenu_editing:
+                                ui_flash("Edit", 0.3)
+                            else:
+                                ui_flash("Select", 0.3)
+                    _enc1_press_time = 0.0
+                    _enc1_save_progress = 0.0
                 _enc_last_sw[0] = enc1_sw
                 
                 # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
@@ -2387,6 +2494,7 @@ def encoder_reader():
                             time.sleep(0.02)  # Debounce
                             submenu_tab = (submenu_tab + 1) % len(SUBMENU_TABS)
                             submenu_column = 0  # Jump to first column of new page
+                            submenu_editing = False  # Exit edit mode, return to header selection
                             ui_flash(f"Tab: {SUBMENU_TABS[submenu_tab]}", 0.5)
                     _reset_press_time = 0
                 _reset_last_state = reset_btn
@@ -2486,9 +2594,13 @@ def audio_loop():
         _cb_start = time.time()
         # #endregion
 
-        # Use channel 1 (Input 2 on Scarlett Solo - the line input on back)
-        # Change to indata[:, 0] for Input 1 (front XLR/inst jack)
-        x = indata[:, 1].astype(np.float32)
+        # Handle mono vs stereo input
+        # For stereo: use channel 1 (Input 2 on Scarlett Solo - the line input on back)
+        # For mono: use the single channel available
+        if indata.shape[1] >= 2:
+            x = indata[:, 1].astype(np.float32)
+        else:
+            x = indata[:, 0].astype(np.float32)
         x = x * db_to_linear(INPUT_GAIN_DB)  # Apply input gain (dB)
         input_rms = float(np.sqrt(np.mean(x*x)) + 1e-12)
 
@@ -2832,16 +2944,31 @@ def audio_loop():
                 _f.write(_json.dumps({"ts": int(_cb_start*1000), "type": "SLOW_CB", "ms": int(_cb_elapsed*1000)}) + "\n")
         # #endregion
 
-    try:
-        with sd.InputStream(device=DEVICE_INDEX, channels=2, samplerate=SR, blocksize=HOP, callback=cb):
-            APP_STATE = "ready"
-            if AUDIO_DEBUG:
-                print(f"[AUDIO] Using device {DEVICE_INDEX}: {DEVICE_NAME}")
-            while not STOP_THREADS:
-                time.sleep(0.05)
-    except Exception as e:
+    # Try to open audio stream, falling back to 1 channel if multi-channel fails
+    stream_opened = False
+    last_error = None
+    channels_to_try = [DEVICE_CHANNELS] if DEVICE_CHANNELS == 1 else [DEVICE_CHANNELS, 1]
+    
+    for try_channels in channels_to_try:
+        if stream_opened:
+            break
+        try:
+            with sd.InputStream(device=DEVICE_INDEX, channels=try_channels, samplerate=SR, blocksize=HOP, callback=cb):
+                stream_opened = True
+                APP_STATE = "ready"
+                if AUDIO_DEBUG or try_channels != DEVICE_CHANNELS:
+                    print(f"[AUDIO] Using device {DEVICE_INDEX}: {DEVICE_NAME} ({try_channels}ch)")
+                while not STOP_THREADS:
+                    time.sleep(0.05)
+        except Exception as e:
+            last_error = e
+            if try_channels > 1:
+                print(f"[AUDIO] Failed with {try_channels}ch, trying 1ch...", file=sys.stderr)
+            continue
+    
+    if not stream_opened:
         APP_STATE = "error"
-        APP_ERROR = f"Audio init failed: {e}"
+        APP_ERROR = f"Audio init failed: {last_error}"
         print(f"[AUDIO][ERROR] {APP_ERROR}", file=sys.stderr, flush=True)
         _set_stop(True)
         _set_run(False)
@@ -3825,6 +3952,7 @@ class OledUI:
 
     def _draw_submenu_content(self, draw, x, y, width, height):
         """Draw the submenu content (3 columns of controls for current tab)."""
+        global _enc1_save_progress
         tab = SUBMENU_TABS[submenu_tab]
         labels = SUBMENU_LABELS[tab]
         
@@ -3880,8 +4008,23 @@ class OledUI:
                 if i == 0:  # Gain (dB)
                     sign = "+" if INPUT_GAIN_DB > 0 else ""
                     val_str = f"{sign}{INPUT_GAIN_DB}dB"
-                elif i == 1:  # Reset - show current preset name
-                    val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+                elif i == 1:  # Reset - show current preset name or countdown
+                    # Check if "saved" should be shown (progress=2.0 for 0.8s after save)
+                    if _enc1_save_progress >= 2.0 and (time.time() - _enc1_save_complete) < 0.8:
+                        val_str = "saved"
+                    elif _enc1_save_progress > 0 and _enc1_save_progress < 2.0 and is_selected and submenu_editing:
+                        # Show countdown replacing preset name: 3 -> 2 -> 1 based on progress
+                        if _enc1_save_progress < 0.33:
+                            val_str = "3..."
+                        elif _enc1_save_progress < 0.67:
+                            val_str = "2.."
+                        else:
+                            val_str = "1."
+                    else:
+                        # Clear saved state after display timeout
+                        if _enc1_save_progress >= 2.0 and (time.time() - _enc1_save_complete) >= 0.8:
+                            _enc1_save_progress = 0.0
+                        val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
                 else:  # Column 3 is blank
                     val_str = ""
             elif tab == "Setup":
@@ -4021,10 +4164,178 @@ def draw_threshold_meter(stdscr, y, x, width, env_val, thr):
     bar[thr_col] = "|"
     safe_addstr(stdscr, y, x, "".join(bar))
 
+def wrap_text(text: str, width: int) -> list:
+    """Wrap text to fit within a given width, preserving words where possible."""
+    if width <= 0:
+        return []
+    words = text.split()
+    lines = []
+    current_line = ""
+    for word in words:
+        if len(word) > width:
+            if current_line:
+                lines.append(current_line)
+                current_line = ""
+            for i in range(0, len(word), width):
+                lines.append(word[i:i+width])
+        elif not current_line:
+            current_line = word
+        elif len(current_line) + 1 + len(word) <= width:
+            current_line += " " + word
+        else:
+            lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+    return lines if lines else [""]
+
+def draw_error_box(stdscr, error_msg: str, error_type: str, error_time: float):
+    """Draw a visually elegant error/warning/info box in the TUI.
+    
+    The box is centered horizontally and positioned near the bottom of the screen.
+    It includes a border, icon, title, wrapped message, age indicator, and dismiss hint.
+    """
+    h, w = stdscr.getmaxyx()
+    
+    # Configuration based on error type
+    config = {
+        "error": {
+            "icon": "✖",
+            "title": "ERROR",
+            "color_pair": 1,  # Red
+            "border_char": "═",
+            "corner_tl": "╔", "corner_tr": "╗",
+            "corner_bl": "╚", "corner_br": "╝",
+            "side": "║"
+        },
+        "warning": {
+            "icon": "⚠",
+            "title": "WARNING",
+            "color_pair": 2,  # Yellow
+            "border_char": "─",
+            "corner_tl": "┌", "corner_tr": "┐",
+            "corner_bl": "└", "corner_br": "┘",
+            "side": "│"
+        },
+        "info": {
+            "icon": "ℹ",
+            "title": "INFO",
+            "color_pair": 3,  # Green
+            "border_char": "─",
+            "corner_tl": "┌", "corner_tr": "┐",
+            "corner_bl": "└", "corner_br": "┘",
+            "side": "│"
+        }
+    }
+    cfg = config.get(error_type, config["error"])
+    
+    # Calculate box dimensions
+    max_box_width = min(60, w - 4)
+    min_box_width = 30
+    content_width = max(min_box_width - 4, min(max_box_width - 4, len(error_msg) + 2))
+    box_width = content_width + 4
+    
+    # Wrap the message text
+    wrapped_lines = wrap_text(error_msg, content_width)
+    max_lines = 4
+    if len(wrapped_lines) > max_lines:
+        wrapped_lines = wrapped_lines[:max_lines-1] + [wrapped_lines[max_lines-1][:content_width-3] + "..."]
+    
+    # Calculate age string
+    age_secs = time.time() - error_time
+    if age_secs < 60:
+        age_str = f"{int(age_secs)}s ago"
+    elif age_secs < 3600:
+        age_str = f"{int(age_secs/60)}m ago"
+    else:
+        age_str = f"{int(age_secs/3600)}h ago"
+    
+    # Box height: top border + title + blank + message lines + blank + hint + bottom border
+    box_height = 3 + len(wrapped_lines) + 2
+    
+    # Position: centered horizontally, near bottom
+    start_y = max(0, h - box_height - 3)
+    start_x = max(0, (w - box_width) // 2)
+    
+    # Ensure we have room
+    if start_y < 0 or start_x < 0 or box_height > h or box_width > w:
+        # Fallback to simple display
+        try:
+            stdscr.attron(curses.color_pair(cfg["color_pair"]) | curses.A_BOLD)
+            safe_addstr(stdscr, h - 3, 0, f"{cfg['icon']} {cfg['title']}: {error_msg}"[:w-1])
+            stdscr.attroff(curses.color_pair(cfg["color_pair"]) | curses.A_BOLD)
+        except Exception:
+            safe_addstr(stdscr, h - 3, 0, f"{cfg['title']}: {error_msg}"[:w-1])
+        return
+    
+    try:
+        color = curses.color_pair(cfg["color_pair"])
+        
+        # Draw top border with title
+        top_border = cfg["corner_tl"] + cfg["border_char"] * (box_width - 2) + cfg["corner_tr"]
+        stdscr.attron(color | curses.A_BOLD)
+        safe_addstr(stdscr, start_y, start_x, top_border)
+        
+        # Title line with icon
+        title_text = f" {cfg['icon']} {cfg['title']} "
+        title_line = cfg["side"] + title_text.center(box_width - 2) + cfg["side"]
+        safe_addstr(stdscr, start_y + 1, start_x, title_line)
+        stdscr.attroff(color | curses.A_BOLD)
+        
+        # Separator line
+        sep_line = cfg["side"] + "─" * (box_width - 2) + cfg["side"]
+        stdscr.attron(color)
+        safe_addstr(stdscr, start_y + 2, start_x, sep_line)
+        stdscr.attroff(color)
+        
+        # Message lines
+        for i, line in enumerate(wrapped_lines):
+            msg_line = cfg["side"] + " " + line.ljust(content_width) + " " + cfg["side"]
+            stdscr.attron(color)
+            safe_addstr(stdscr, start_y + 3 + i, start_x, cfg["side"])
+            safe_addstr(stdscr, start_y + 3 + i, start_x + box_width - 1, cfg["side"])
+            stdscr.attroff(color)
+            safe_addstr(stdscr, start_y + 3 + i, start_x + 1, " " + line.ljust(content_width) + " ")
+        
+        # Hint line with age
+        hint_row = start_y + 3 + len(wrapped_lines)
+        hint_text = f"[c] dismiss"
+        age_text = age_str
+        padding = box_width - 4 - len(hint_text) - len(age_text)
+        hint_content = " " + hint_text + " " * max(1, padding) + age_text + " "
+        stdscr.attron(color)
+        safe_addstr(stdscr, hint_row, start_x, cfg["side"])
+        safe_addstr(stdscr, hint_row, start_x + box_width - 1, cfg["side"])
+        stdscr.attroff(color)
+        stdscr.attron(curses.A_DIM)
+        safe_addstr(stdscr, hint_row, start_x + 1, hint_content[:box_width-2])
+        stdscr.attroff(curses.A_DIM)
+        
+        # Bottom border
+        bottom_border = cfg["corner_bl"] + cfg["border_char"] * (box_width - 2) + cfg["corner_br"]
+        stdscr.attron(color)
+        safe_addstr(stdscr, hint_row + 1, start_x, bottom_border)
+        stdscr.attroff(color)
+        
+    except Exception:
+        # Fallback if box drawing fails
+        safe_addstr(stdscr, h - 3, 0, f"{cfg['title']}: {error_msg}"[:w-1])
+
 def tui(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(False)
     stdscr.timeout(33)
+    
+    # Initialize color pairs for error display
+    curses.start_color()
+    curses.use_default_colors()
+    try:
+        curses.init_pair(1, curses.COLOR_RED, -1)      # Red text on default bg
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)   # Yellow text on default bg
+        curses.init_pair(3, curses.COLOR_GREEN, -1)    # Green text on default bg
+    except Exception:
+        pass  # Color not available
+    
     while True:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
@@ -4054,6 +4365,12 @@ def tui(stdscr):
         for i, s in enumerate(states, start=1):
             safe_addstr(stdscr, row+7+i, 1, f"ch{i}: env={s.env:.3f} post={s.post:.3f} {'ON' if s.active else 'off'}")
 
+        # Display persistent error in elegant box at bottom of screen
+        error_msg, error_time, error_type = get_error()
+        if error_msg:
+            draw_error_box(stdscr, error_msg, error_type, error_time)
+
+        # Flash message (temporary) - shown at very bottom
         if time.time() < _ui_flash_until and _ui_flash_msg:
             msg = _ui_flash_msg
             x = max(0, (w - len(msg)) // 2)
@@ -4065,12 +4382,15 @@ def tui(stdscr):
             _set_stop(True)
             _set_run(False)
             break
+        elif ch in (ord('c'), ord('C')):
+            # Dismiss error message
+            clear_error()
 
 # ===================== Main =====================
 
 def main():
-    print(f"[OK] Using input: {DEVICE_INDEX} - {DEVICE_NAME}")
-    print(f"[OK] DMX backend: {DMX_BACKEND} (Universe {UNIVERSE}, Channels 1..4)")
+    print(f"[OK] Using input: {DEVICE_INDEX} - {DEVICE_NAME} ({DEVICE_CHANNELS}ch)")
+    print(f"[OK] DMX backend: {DMX_BACKEND} (Universe {UNIVERSE}, Channels 1..{DMX_CHANNEL_COUNT})")
     if DEV_NO_HW:
         print("[OK] DEV_NO_HW=1: skipping GPIO, OLED.")
     else:
@@ -4081,8 +4401,11 @@ def main():
     IGNORE_KNOBS_UNTIL = time.time() + 0.3
 
     # init GPIO if enabled
+    gpio_ok = True
     if not DEV_NO_HW:
-        setup_gpio_inputs()
+        gpio_ok = setup_gpio_inputs()
+        if not gpio_ok:
+            print("[WARN] GPIO init failed - continuing without hardware controls")
 
     # DMX backend + sender thread
     dmx_backend = make_dmx_backend()

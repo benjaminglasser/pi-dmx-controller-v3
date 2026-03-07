@@ -1,5 +1,6 @@
-defaults_mode=LOW
+defaults_mode=MID
 dmx_output_mode=Dimmer
 dmx_channel_count=4
 input_gain_db=0
-LOW=120.0,0.40,542.0,2.0,0,0
+LOW=96.41488208711787,0.44073406107375496,156.80363305215624,0.971573494971591,0,0
+MID=1000.0,0.42,542.0,1.5,0,0
