@@ -7,7 +7,7 @@ DEV_MODE_FLAG="/tmp/dmx-dev-mode"
 case "$1" in
     disable|off)
         touch "$DEV_MODE_FLAG"
-        sudo systemctl stop dmx_audio_react.service 2>/dev/null || true
+        sudo systemctl stop pi-dmx.service 2>/dev/null || true
         echo "Dev mode ENABLED - DMX autostart disabled"
         echo "The DMX controller has been stopped."
         echo "Run 'dmx-dev enable' to re-enable autostart."
@@ -15,7 +15,7 @@ case "$1" in
     enable|on)
         rm -f "$DEV_MODE_FLAG"
         echo "Dev mode DISABLED - DMX will autostart on next boot"
-        echo "To start the service now, run: sudo systemctl start dmx_audio_react.service"
+        echo "To start the service now, run: sudo systemctl start pi-dmx.service"
         ;;
     status)
         if [ -f "$DEV_MODE_FLAG" ]; then
@@ -26,7 +26,7 @@ case "$1" in
         # Also show service status
         echo ""
         echo "Service status:"
-        systemctl is-active dmx_audio_react.service 2>/dev/null || echo "dmx_audio_react.service is not running"
+        systemctl is-active pi-dmx.service 2>/dev/null || echo "pi-dmx.service is not running"
         ;;
     *)
         echo "Usage: dmx-dev {disable|enable|status}"

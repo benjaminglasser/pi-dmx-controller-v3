@@ -7,7 +7,7 @@
 #
 # Hardware:
 # - HiFiBerry DAC+ ADC Pro (audio input/output)
-# - SPI OLED display (SSD1309 128x64)
+# - SPI OLED display (EastRising SSD1322 256×64, CE1)
 # - RS485 DMX output via UART (/dev/serial0)
 # - 5 rotary encoders (GPIO)
 # - Bluetooth disabled to free UART for DMX
