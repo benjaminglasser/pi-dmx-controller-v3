@@ -1,18 +1,18 @@
-# /etc/systemd/system/oled_splash.service
 [Unit]
-Description=OLED Early Boot Splash
-DefaultDependencies=no
-After=local-fs.target systemd-udev-settle.service
-Wants=systemd-udev-settle.service
-RequiresMountsFor=/home/benglasser/pi-dmx-controller-v2
-Before=basic.target
+Description=OLED splash (Loading...) before DMX app
+# Run as soon as root is mounted - no oled_wake (initramfs handles early display)
+After=local-fs.target
+Before=multi-user.target
 
 [Service]
 Type=oneshot
+# Run as same user as dmx (adjust User/WorkingDirectory to match your install)
 User=benglasser
-ExecStart=/bin/sh -lc 'sleep 0.3; for i in 1 2 3 4 5 6; do /home/benglasser/pi-dmx-controller-v2/.venv/bin/python /home/benglasser/pi-dmx-controller-v2/utils/oled_boot.py && exit 0; sleep 0.5; done; exit 0'
+WorkingDirectory=/home/benglasser/pi-dmx-controller-v2
+ExecStart=/home/benglasser/pi-dmx-controller-v2/.venv/bin/python /home/benglasser/pi-dmx-controller-v2/oled_boot.py
 RemainAfterExit=yes
-SupplementaryGroups=i2c
+StandardOutput=journal
+StandardError=journal
 
 [Install]
-WantedBy=basic.target
+WantedBy=multi-user.target

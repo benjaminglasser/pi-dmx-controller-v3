@@ -1,0 +1,13 @@
+#!/bin/sh
+# Initramfs hook: add oled_early binary for early boot display
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /usr/share/initramfs-tools/hook-functions
+
+BINARY="/home/benglasser/pi-dmx-controller-v2/utils/oled_early"
+if [ -f "$BINARY" ]; then
+    copy_exec "$BINARY" /bin/oled_early
+else
+    echo "oled-boot hook: $BINARY not found, skipping"
+fi

@@ -61,10 +61,13 @@ if [ -f systemd/pi-dmx.service ]; then
   sudo systemctl enable pi-dmx.service || true
 fi
 
-if [ -f systemd/oled_boot.service ]; then
-  echo "  - Installing oled_boot.service"
-  sudo cp systemd/oled_boot.service /etc/systemd/system/oled_boot.service
-  sudo systemctl enable oled_boot.service || true
+if [ -f systemd/oled_splash.service ]; then
+  echo "  - Installing oled_splash.service"
+  sudo cp systemd/oled_splash.service /etc/systemd/system/oled_splash.service
+  sudo systemctl enable oled_splash.service || true
+  # Remove oled_wake if present (caused ordering cycle)
+  sudo systemctl disable oled_wake.service 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/oled_wake.service
 fi
 
 sudo systemctl daemon-reload
