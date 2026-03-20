@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 echo "[1/7] Update system"
-sudo apt update
-sudo apt -y full-upgrade
+sudo apt-get update
+sudo apt-get -y -o Dpkg::Options::="--force-confold" full-upgrade
 
 echo "[2/7] Core packages"
-sudo apt install -y \
+sudo apt-get install -y -o Dpkg::Options::="--force-confold" \
   git python3 python3-venv python3-pip \
   alsa-utils libportaudio2 portaudio19-dev libsndfile1 \
   ola ola-python \
@@ -16,23 +17,7 @@ echo "[3/7] Enable SPI/I2C (non-interactive)"
 sudo raspi-config nonint do_spi 0
 sudo raspi-config nonint do_i2c 0
 
-echo "[4/7] HiFiBerry overlay (ALSA) in /boot/firmware/config.txt"
-CFG=/boot/firmware/config.txt
-
-# Disable onboard audio if enabled
-sudo sed -i 's/^dtparam=audio=on/# dtparam=audio=on/' "$CFG" || true
-grep -q '^dtparam=audio=off' "$CFG" || echo 'dtparam=audio=off' | sudo tee -a "$CFG"
-
-# Ensure HiFiBerry DAC+ADC overlay is present
-grep -q '^dtoverlay=hifiberry-dacplusadc' "$CFG" || \
-  echo 'dtoverlay=hifiberry-dacplusadc' | sudo tee -a "$CFG"
-
-# Ensure I2S is on (uncomment or append)
-if grep -q '^#dtparam=i2s=on' "$CFG"; then
-  sudo sed -i 's/^#dtparam=i2s=on/dtparam=i2s=on/' "$CFG"
-elif ! grep -q '^dtparam=i2s=on' "$CFG"; then
-  echo 'dtparam=i2s=on' | sudo tee -a "$CFG"
-fi
+echo "[4/7] Skipping HiFiBerry/boot audio tweaks (USB audio — config.txt unchanged)"
 
 echo "[5/7] Python venv (with system packages so OLA Python is visible)"
 cd ~/pi-dmx-controller-v2

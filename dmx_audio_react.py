@@ -67,6 +67,19 @@ try:
 except Exception:
     _OLED_AVAILABLE = False
 
+
+def _agent_debug_append(rel_filename: str, line: str) -> None:
+    """Best-effort NDJSON debug log under ~/.cursor/ (ignore failures)."""
+    try:
+        base = os.path.join(os.path.expanduser("~"), ".cursor")
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, rel_filename)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line if line.endswith("\n") else line + "\n")
+    except OSError:
+        pass
+
+
 # ===================== Config =====================
 
 DEV_NO_HW = os.environ.get("DEV_NO_HW", "0").strip() == "1"
@@ -1530,8 +1543,9 @@ class ThreeBandOnsetDetector:
             # Log kick detection details (band 0 = LOW)
             if i == 0 and (self.normalized_slope[i] > 0.05 or self.trigger[i]):
                 import json as _json
-                with open("/home/benglasser/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({
+                _agent_debug_append(
+                    "debug.log",
+                    _json.dumps({
                         "ts": int(now*1000), "type": "TD_KICK",
                         "energy": round(float(self.energy[i]), 4),
                         "lagged": round(float(self.lagged_energy[i]), 4),
@@ -1540,7 +1554,8 @@ class ThreeBandOnsetDetector:
                         "thresh": round(float(band.trigger_thresh), 2),
                         "cooldown_ok": cooldown_ok,
                         "trig": self.trigger[i]
-                    }) + "\n")
+                    }) + "\n",
+                )
             # #endregion
             
             # Update display values for UI
@@ -2655,8 +2670,10 @@ def audio_loop():
                 _3band_elapsed = time.time() - _3band_start
                 if _3band_elapsed > 0.005:  # >5ms is slow for this operation
                     import json as _json
-                    with open("/home/benglasser/.cursor/debug.log", "a") as _f:
-                        _f.write(_json.dumps({"ts": int(now*1000), "type": "SLOW_3BAND", "ms": int(_3band_elapsed*1000)}) + "\n")
+                    _agent_debug_append(
+                        "debug.log",
+                        _json.dumps({"ts": int(now*1000), "type": "SLOW_3BAND", "ms": int(_3band_elapsed*1000)}) + "\n",
+                    )
                 # #endregion
         
         # Apply per-band normalization (spectral whitening) - SKIPPED for performance
@@ -2940,8 +2957,10 @@ def audio_loop():
         if _cb_elapsed > 0.012 and _cb_slow_count[0] < 30:  # >12ms is slow (buffer is 11.6ms)
             _cb_slow_count[0] += 1
             import json as _json
-            with open("/home/benglasser/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"ts": int(_cb_start*1000), "type": "SLOW_CB", "ms": int(_cb_elapsed*1000)}) + "\n")
+            _agent_debug_append(
+                "debug.log",
+                _json.dumps({"ts": int(_cb_start*1000), "type": "SLOW_CB", "ms": int(_cb_elapsed*1000)}) + "\n",
+            )
         # #endregion
 
     # Try to open audio stream, falling back to 1 channel if multi-channel fails
@@ -3986,13 +4005,21 @@ class OledUI:
                         _, neighbor = program_pair_for_base(BASE_PROGRAM)
                         val_str = f"({PROGRAM_NAMES[neighbor - 1]})"
                         # #region agent log
-                        import json as _json; open("/home/benglasser/.cursor/debug-4c4bbd.log","a").write(_json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3625","message":"x+1 showing neighbor","data":{"val_str":val_str,"phase":CYCLE_PHASE,"base":BASE_PROGRAM},"timestamp":int(time.time()*1000)})+"\n")
+                        import json as _json
+                        _agent_debug_append(
+                            "debug-4c4bbd.log",
+                            _json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3625","message":"x+1 showing neighbor","data":{"val_str":val_str,"phase":CYCLE_PHASE,"base":BASE_PROGRAM},"timestamp":int(time.time()*1000)})+"\n",
+                        )
                         # #endregion
                     elif current_mode == "rnd/amb" and CYCLE_PHASE == 1:
                         # Show AMB in brackets when in rnd/amb ambient phase
                         val_str = "[AMB]"
                         # #region agent log
-                        import json as _json; open("/home/benglasser/.cursor/debug-4c4bbd.log","a").write(_json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3631","message":"rnd/amb showing AMB","data":{"val_str":val_str,"phase":CYCLE_PHASE},"timestamp":int(time.time()*1000)})+"\n")
+                        import json as _json
+                        _agent_debug_append(
+                            "debug-4c4bbd.log",
+                            _json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3631","message":"rnd/amb showing AMB","data":{"val_str":val_str,"phase":CYCLE_PHASE},"timestamp":int(time.time()*1000)})+"\n",
+                        )
                         # #endregion
                     else:
                         # Normal: show base preset name
@@ -4113,8 +4140,10 @@ class OledUI:
             if elapsed > 0.12 and _oled_slow_count[0] < 30:  # >120ms is a freeze
                 _oled_slow_count[0] += 1
                 import json as _json
-                with open("/home/benglasser/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"ts": int(start*1000), "type": "SLOW_OLED", "ms": int(elapsed*1000)}) + "\n")
+                _agent_debug_append(
+                    "debug.log",
+                    _json.dumps({"ts": int(start*1000), "type": "SLOW_OLED", "ms": int(elapsed*1000)}) + "\n",
+                )
             # #endregion
             sleep_time = frame_time - elapsed
             if sleep_time > 0:

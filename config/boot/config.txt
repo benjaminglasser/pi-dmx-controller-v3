@@ -6,7 +6,7 @@
 # Copy this file to /boot/firmware/config.txt after a fresh OS install.
 #
 # Hardware:
-# - HiFiBerry DAC+ ADC Pro (audio input/output)
+# - USB audio input (no HiFiBerry HAT)
 # - SPI OLED display (EastRising SSD1322 256×64, CE1)
 # - RS485 DMX output via UART (/dev/serial0)
 # - 5 rotary encoders (GPIO)
@@ -20,7 +20,7 @@
 # SPI for OLED display (spidev0.0 / spidev0.1)
 dtparam=spi=on
 
-# I2C for HiFiBerry codec control
+# I2C (optional peripherals)
 dtparam=i2c_arm=on
 
 # Enable UART (for DMX over RS485)
@@ -34,12 +34,7 @@ dtoverlay=disable-bt
 # Audio
 # -----------------------
 
-# HiFiBerry DAC+ ADC Pro (replaces onboard audio)
-# Provides high-quality stereo ADC input and DAC output
-# NOTE: Use "hifiberry-dacplusadcpro" NOT "hifiberry-dacplusadc"
-dtoverlay=hifiberry-dacplusadcpro
-
-# Disable onboard audio (conflicts with HiFiBerry HAT)
+# USB capture — no HiFiBerry overlay. Onboard analog disabled (USB is separate card).
 dtparam=audio=off
 
 

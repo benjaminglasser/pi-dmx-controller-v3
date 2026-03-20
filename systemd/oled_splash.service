@@ -7,9 +7,9 @@ Before=multi-user.target
 [Service]
 Type=oneshot
 # Run as same user as dmx (adjust User/WorkingDirectory to match your install)
-User=benglasser
-WorkingDirectory=/home/benglasser/pi-dmx-controller-v2
-ExecStart=/home/benglasser/pi-dmx-controller-v2/.venv/bin/python /home/benglasser/pi-dmx-controller-v2/oled_boot.py
+User=pi
+WorkingDirectory=/home/pi/pi-dmx-controller-v2
+ExecStart=/home/pi/pi-dmx-controller-v2/.venv/bin/python /home/pi/pi-dmx-controller-v2/oled_boot.py
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal

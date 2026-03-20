@@ -7,76 +7,76 @@ Audio-reactive DMX lighting controller for Raspberry Pi with OLED UI, rotary enc
 | Component | Description |
 |-----------|-------------|
 | **Raspberry Pi** | 4 or 5 recommended |
-| **HiFiBerry DAC+ ADC** | Stereo ADC for microphone/line input (DAC+ ADC or DAC+ ADC Pro) |
+| **Audio input** | **USB** mic/interface, **or** HiFiBerry DAC+ ADC / DAC+ ADC Pro |
 | **OLED** | EastRising 3.2" SSD1322 SPI (256×64), CE1, RST=GPIO12, DC=GPIO24 |
-| **DMX** | UART RS485 (DMXKing or similar) |
+| **DMX** | UART RS485 (e.g. DMXKing on `/dev/serial0`); optional USB DMX via OLA |
 | **Encoders** | 5 rotary encoders on GPIO |
 
 ## Quick Start (Fresh SD Card)
 
-See **[docs/QUICKSTART.md](docs/QUICKSTART.md)** for the step-by-step guide to get from a blank SD card to a running system.
+See **[docs/QUICKSTART.md](docs/QUICKSTART.md)** for the full path from a blank SD card to a running system (order of steps, USB vs HiFiBerry, OLA patching, headless `apt`).
+
+Short version:
+
+1. Clone to **`~/pi-dmx-controller-v2`** (required by `bootstrap_pi.sh`).
+2. Edit **`systemd/pi-dmx.service`** and **`systemd/oled_splash.service`** if your user is not **`pi`** or your path is not **`/home/pi/pi-dmx-controller-v2`**.
+3. **`sudo cp config/boot/config.txt /boot/firmware/config.txt`** — add HiFiBerry `dtoverlay=...` in that file first if you use the HAT.
+4. **`sudo cp config/alsa/asound.conf /etc/asound.conf`** — **HiFiBerry only**; skip for USB-only capture.
+5. **`./scripts/bootstrap_pi.sh`** then **`sudo scripts/install_oled_splash.sh`**, then **`sudo reboot`**.
 
 ---
 
-## Installation
+## Installation (reference)
 
-### 1. Clone & bootstrap
+### 1. Clone
 
 ```bash
 git clone https://github.com/benjaminglasser/pi-dmx-controller-v2.git
 cd pi-dmx-controller-v2
-./scripts/bootstrap_pi.sh
 ```
 
-This installs system packages, creates a Python venv, configures OLA, enables SPI/I2C, and sets up systemd services (if present).
+### 2. Systemd templates
 
-### 2. Firmware config
+Adjust **`systemd/pi-dmx.service`** and **`systemd/oled_splash.service`** before bootstrap so the copied units match your account (defaults in-repo assume **`pi`**).
 
-Copy the Pi firmware config (enables HiFiBerry, SPI, UART, disables BT for DMX):
+### 3. Firmware
 
 ```bash
 sudo cp config/boot/config.txt /boot/firmware/config.txt
 ```
 
-### 3. ALSA config
+The shipped **`config/boot/config.txt`** is tuned for **SPI + UART DMX + USB-style audio** (no HiFiBerry overlay). For a HiFiBerry HAT, edit the overlay lines *before* copying (see **Configuration**).
 
-Set HiFiBerry as the default audio device:
+### 4. ALSA (HiFiBerry only)
 
 ```bash
 sudo cp config/alsa/asound.conf /etc/asound.conf
 ```
 
-### 4. OLED boot splash & early display (optional)
+Not needed for USB-only input.
 
-**Splash (CSW logo, 3s):**
+### 5. Bootstrap
 
 ```bash
-# Adjust User/WorkingDirectory in systemd/oled_splash.service if your path differs
+./scripts/bootstrap_pi.sh
+```
+
+Installs packages, venv + **`requirements.txt`**, enables SPI/I2C, configures OLA, and installs systemd units. Uses non-interactive **`apt-get`** with **`--force-confold`** for headless safety. Does **not** rewrite HiFiBerry settings in **`/boot/firmware/config.txt`** after you copy it — keep overlays and audio options in **`config/boot/config.txt`**.
+
+### 6. OLED splash (recommended)
+
+```bash
 sudo scripts/install_oled_splash.sh
 ```
 
-**Early initramfs display (gray bar ~5s into boot):**
+### 7. Early OLED (optional)
 
 ```bash
-# Edit config/initramfs/hook-oled-boot: set BINARY to your project path/utils/oled_early
+# Edit config/initramfs/hook-oled-boot: BINARY must point to your utils/oled_early
 sudo scripts/install_oled_initramfs.sh
 ```
 
-### 5. DMX service
-
-Create a systemd service for the DMX app. Copy and adapt from `deploy/pi-dmx.service`:
-
-```bash
-# Example: create systemd/pi-dmx.service with your user and paths
-# After=network-online.target olad.service oled_splash.service
-# ExecStart=/home/YOUR_USER/pi-dmx-controller-v2/.venv/bin/python .../dmx_audio_react.py
-sudo cp systemd/pi-dmx.service /etc/systemd/system/
-sudo systemctl enable pi-dmx.service
-```
-
-Bootstrap will install `systemd/pi-dmx.service` and `systemd/oled_splash.service` if they exist.
-
-### 6. Reboot
+### 8. Reboot
 
 ```bash
 sudo reboot
@@ -92,7 +92,7 @@ source .venv/bin/activate
 python dmx_audio_react.py
 ```
 
-Or use `./run_dmx.sh` (uses DEV_NO_HW=1 and DMX_BACKEND=uart by default).
+Or use **`./run_dmx.sh`** (uses `DEV_NO_HW=1` and `DMX_BACKEND=uart` by default).
 
 ---
 
@@ -116,8 +116,8 @@ pi-dmx-controller-v2/
 ├── oled_boot.py            # Boot splash (CSW logo, CRT reveal)
 ├── requirements.txt
 ├── config/
-│   ├── boot/config.txt     # Pi firmware
-│   ├── alsa/asound.conf    # HiFiBerry default device
+│   ├── boot/config.txt     # Pi firmware (SPI / UART / audio overlays)
+│   ├── alsa/asound.conf    # HiFiBerry default device (optional)
 │   └── initramfs/          # Early OLED display
 ├── scripts/
 │   ├── bootstrap_pi.sh     # Full system setup
@@ -125,9 +125,10 @@ pi-dmx-controller-v2/
 │   ├── install_oled_initramfs.sh
 │   └── dmx-dev             # Toggle autostart
 ├── systemd/
+│   ├── pi-dmx.service
 │   └── oled_splash.service
 ├── deploy/
-│   └── pi-dmx.service      # Template for DMX service
+│   └── pi-dmx.service      # Alternate template
 └── utils/
     └── oled_initramfs.c    # C source for early display
 ```
@@ -137,7 +138,8 @@ pi-dmx-controller-v2/
 ## Configuration
 
 - **`.dmx_config`** – JSON runtime config (auto-created).
-- **`config/boot/config.txt`** – Overlay choices: `hifiberry-dacplusadc` or `hifiberry-dacplusadcpro` depending on your HAT.
+- **`config/boot/config.txt`** – For HiFiBerry, set **`dtoverlay=hifiberry-dacplusadc`** or **`hifiberry-dacplusadcpro`**. For USB input, omit HiFiBerry overlays; USB cards appear separately in ALSA.
+- **Audio device selection** – See env vars in **`dmx_audio_react.py`** (e.g. **`AUDIO_DEVICE`**, **`AUDIO_DEVICE_NAME`**). Use **`arecord -l`** to list hardware.
 
 ---
 
@@ -145,8 +147,11 @@ pi-dmx-controller-v2/
 
 | Issue | Fix |
 |-------|-----|
-| No audio input | `sudo cp config/alsa/asound.conf /etc/asound.conf` and reboot |
-| OLED blank | Check SPI enabled, `spidev0.1` exists. Run `python oled_boot.py` to test |
-| DMX no output | Patch OLA universe: `ola_patch -d <device_id> -p 0 -u 0` |
-| Splash uses wrong user | Edit `systemd/oled_splash.service` User and paths |
-| Initramfs hook fails | Edit `config/initramfs/hook-oled-boot` BINARY path, run install again |
+| No audio input (USB) | `arecord -l`; set **`AUDIO_DEVICE`** / **`AUDIO_DEVICE_NAME`** in **`pi-dmx.service`** `Environment=` if the wrong card is chosen |
+| No audio input (HiFiBerry) | `sudo cp config/alsa/asound.conf /etc/asound.conf`, correct **`dtoverlay`** in **`config.txt`**, reboot |
+| OLED blank | SPI enabled, **`spidev0.1`** present; test with **`python oled_boot.py`** |
+| DMX no output (OLA) | **`ola_dev_info`** then **`ola_patch --patch --device <id> --port 0 --universe 0`** |
+| Splash / service wrong user | Edit repo **`systemd/*.service`**, then **`sudo scripts/install_oled_splash.sh`** and **`sudo cp systemd/pi-dmx.service /etc/systemd/system/`**, **`systemctl daemon-reload`** |
+| Initramfs hook fails | Edit **`config/initramfs/hook-oled-boot`** **`BINARY`** path, reinstall |
+| **`apt`** / **`dpkg`** stuck on conffile prompts over SSH | Bootstrap uses **`DEBIAN_FRONTEND=noninteractive`** and **`--force-confold`**; if you run **`apt`** by hand, use the same or **`sudo dpkg --configure -a --force-confold`** |
+| **`pi-dmx`** errors in **`journalctl`** | Check traceback; verify venv path and audio device |
