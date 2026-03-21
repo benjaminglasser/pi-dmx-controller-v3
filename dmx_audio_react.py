@@ -688,10 +688,10 @@ PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "SWAP", "RANDOM", "AMBIENT"]
 
 # ===================== FFT Display =====================
 
-# FFT settings - 32 bands, 20Hz–16kHz (smooth EQ-style spectrum, similar feel to a DAW analyzer)
+# FFT settings - 64 bands, 20Hz–16kHz (smooth EQ-style spectrum with display smoothing)
 FFT_MIN_FREQ = 20
 FFT_MAX_FREQ = 16000
-FFT_NUM_BANDS = 32
+FFT_NUM_BANDS = 64
 FFT_SIZE = 1024  # Zero-pad to 1024 for ~43Hz resolution (tradeoff: faster FFT vs freq precision)
 
 # Optional DSP on the FFT path (defaults off for “normal” full-range analyzer like EQ Eight spectrum)
@@ -835,6 +835,12 @@ FFT_LOW_DECAY_MULT = 0.86   # per hop when falling; mids use 0.92 below
 FFT_LOW_BAND_COUNT = int(os.environ.get("FFT_LOW_BAND_COUNT", "0"))
 FFT_LOW_SMOOTH_COEF = float(os.environ.get("FFT_LOW_SMOOTH_COEF", "0.62"))
 
+# Display smoothing: EMA applied to fft_bands → fft_display_bands for drawing only (no effect on triggers).
+# 0.70 = smoother, less choppy; 0.85 = snappier; 1.0 = no smoothing (draw raw fft_bands).
+FFT_DISPLAY_SMOOTH = float(os.environ.get("FFT_DISPLAY_SMOOTH", "0.72"))
+# Spatial smoothing: 3-point [0.25,0.5,0.25] kernel across adjacent bands for a softer curve. 0=off, 1=on.
+FFT_SPATIAL_SMOOTH = int(os.environ.get("FFT_SPATIAL_SMOOTH", "1"))
+
 # High-pass state (rumble / DC)
 _fft_hp_y = 0.0
 _fft_hp_x_prev = 0.0
@@ -844,6 +850,9 @@ prev_band_energies = np.zeros(len(FFT_BANDS), dtype=np.float32)
 fft_flux = np.zeros(len(FFT_BANDS), dtype=np.float32)
 _fft_low_smooth = np.zeros(len(FFT_BANDS), dtype=np.float32)
 
+# Display-only smoothed bands (EMA + optional spatial); triggers use raw fft_bands
+fft_display_bands = np.zeros(len(FFT_BANDS), dtype=np.float32)
+
 # Per-band normalization state (spectral whitening)
 band_running_mean = [0.01] * len(FFT_BANDS)
 band_running_max = [0.1] * len(FFT_BANDS)
@@ -852,6 +861,18 @@ BAND_NORM_DECAY = 0.995
 def get_spectral_flux(current_energies, prev_energies):
     """Calculate half-wave rectified spectral flux per band (vectorized)."""
     return np.maximum(0.0, current_energies - prev_energies)
+
+def _smooth_fft_display_bands(bands):
+    """Apply 3-point [0.25, 0.5, 0.25] kernel for softer band-to-band curve.
+    Returns a new array; leaves bands unchanged."""
+    if not FFT_SPATIAL_SMOOTH or len(bands) < 2:
+        return bands
+    out = np.empty_like(bands)
+    out[0] = 0.75 * bands[0] + 0.25 * bands[1]
+    for i in range(1, len(bands) - 1):
+        out[i] = 0.25 * bands[i - 1] + 0.5 * bands[i] + 0.25 * bands[i + 1]
+    out[-1] = 0.25 * bands[-2] + 0.75 * bands[-1]
+    return out
 
 def normalize_band(energy, band_idx):
     """Normalize band energy relative to its own history (spectral whitening).
@@ -909,6 +930,7 @@ encoder1_value = 0
 encoder1_button = False
 _reset_last_state = 1  # Reset button state (1 = not pressed)
 _reset_press_time = 0  # Timestamp when reset button was pressed (for long-press detection)
+_fft_reset_msg_until = 0.0  # Show "reset!" overlay on FFT until this timestamp
 
 # Encoder state for all 5 encoders
 # Encoders 1-4: Page, Param A, Param B, Param C (indices 0-3)
@@ -2111,9 +2133,11 @@ def toggle_brightness():
 # ===================== GPIO / Rotary Encoders =====================
 
 def save_current_as_default():
-    """Save current band params and modes as the selected default preset."""
+    """Save current band params and modes as the selected default preset.
+    Called when 'saved!' appears after 1..2..3 countdown - captures trigger mode
+    (THRESH_MODE_INDEX) and release mode (RELEASE_MODE_INDEX) at that moment."""
     mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-    # Update in-memory preset with all 6 values
+    # Update in-memory preset with all 6 values (incl. trigger + release mode)
     DEFAULTS_PRESETS[mode_name] = (band.center, band.thresh, band.decay_ms, band.q,
                                     THRESH_MODE_INDEX, RELEASE_MODE_INDEX)
     # Persist to config file
@@ -2571,7 +2595,7 @@ def encoder_reader():
                                 # Long press complete - save current settings to selected preset
                                 save_current_as_default()
                                 _enc1_press_time = 0.0
-                                _enc1_save_progress = 2.0  # Special value to show "saved"
+                                _enc1_save_progress = 2.0  # Special value to show "saved!"
                                 _enc1_save_complete = time.time()
                                 # Non-blocking: mark awaiting release to prevent toggle
                                 _enc_awaiting_release[0] = True
@@ -2722,6 +2746,7 @@ def encoder_reader():
                         hold_duration = time.time() - _reset_press_time
                         if hold_duration >= 2.0:
                             # Long press detected - reset to defaults
+                            global _fft_reset_msg_until
                             mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
                             preset = DEFAULTS_PRESETS[mode_name]
                             if len(preset) >= 6:
@@ -2731,6 +2756,7 @@ def encoder_reader():
                             band.center = center_hz
                             band.thresh = thresh
                             band.decay_ms = decay_ms
+                            _fft_reset_msg_until = time.time() + 1.0  # Show "reset!" on FFT for 1s
                             ui_flash("Reset to defaults", 1.0)
                             _reset_press_time = 0  # Prevent repeated triggers
                 elif reset_btn == 1 and _reset_last_state == 0:
@@ -2829,6 +2855,7 @@ def audio_loop():
         global last_trigger_ts, chase_idx, group34_phase, group12_phase
         global PROGRAM, BASE_PROGRAM, CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLE_AMBIENT_START
         global fft_bands, fft_peaks, fft_peak_times, fft_recent_max
+        global fft_display_bands
         global _recent_min, _effective_thresh
         global _reactive_brightness_scale, _effective_release_display, _effective_brightness_display
         global _trigger_speed_multiplier
@@ -2941,6 +2968,12 @@ def audio_loop():
             c = FFT_LOW_SMOOTH_COEF
             _fft_low_smooth[:nls] = c * _fft_low_smooth[:nls] + (1.0 - c) * fft_bands[:nls]
             fft_bands[:nls] = _fft_low_smooth[:nls]
+        
+        # Display smoothing: EMA so drawn bars are less choppy (triggers still use raw fft_bands)
+        if FFT_DISPLAY_SMOOTH < 1.0:
+            fft_display_bands[:] = FFT_DISPLAY_SMOOTH * fft_display_bands + (1.0 - FFT_DISPLAY_SMOOTH) * fft_bands
+        else:
+            fft_display_bands[:] = fft_bands
         
         # Vectorized peak tracking
         new_peak_mask = fft_bands > fft_peaks
@@ -3426,11 +3459,13 @@ class OledUI:
         # thresh=0 (UI 0) = line at bottom, thresh=1.0 (UI 99) = line at top
         thresh_y = y + height - int(_effective_thresh * height)
         
+        # Use display-smoothed bands (temporal EMA + optional spatial); triggers still use raw fft_bands
+        draw_bands = _smooth_fft_display_bands(fft_display_bands)
         # Calculate bar positions to fill the entire width (no gaps)
         bar_step = fft_width / num_bands
         any_q_above_thresh = False
         
-        for i, level in enumerate(fft_bands):
+        for i, level in enumerate(draw_bands):
             bx_start = fft_x + int(i * bar_step)
             bx_end = fft_x + int((i + 1) * bar_step) - 1
             
@@ -3503,6 +3538,18 @@ class OledUI:
                 x_right,
                 emphasis=any_q_above_thresh,
             )
+
+        # "reset!" overlay when reset button long-press completes
+        if time.time() < _fft_reset_msg_until:
+            msg = "reset!"
+            try:
+                bbox = draw.textbbox((0, 0), msg, font=self._font_small)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            except (TypeError, AttributeError):
+                tw, th = 30, 8  # Fallback for older Pillow
+            tx = fft_x + (fft_width - tw) // 2
+            ty = y + (height - th) // 2
+            draw.text((tx, ty), msg, font=self._font_small, fill=OLED_WHITE)
 
     def _format_freq_range(self, f_lo, f_hi):
         """Format frequency range for display (e.g., '2.5k-4.5k')."""
@@ -3578,6 +3625,7 @@ class OledUI:
         fft_width = width - meter_width - 4  # Use more of the available width
         fft_height = height
         num_bands = len(fft_bands)
+        draw_bands = _smooth_fft_display_bands(fft_display_bands)
         
         # Calculate bar positions to fill the entire width (no gaps)
         bar_step = fft_width / num_bands
@@ -3587,7 +3635,7 @@ class OledUI:
         sel_high_x = self._freq_to_x(sel_f_hi, fft_x, fft_width)
         
         # Draw FFT bars
-        for i, level in enumerate(fft_bands):
+        for i, level in enumerate(draw_bands):
             bx_start = fft_x + int(i * bar_step)
             bx_end = fft_x + int((i + 1) * bar_step) - 1
             
@@ -4104,7 +4152,7 @@ class OledUI:
                         dots = int(elapsed) % 4
                         val_str = "." * (dots + 1)  # 1-4 dots
                     elif time.time() - _enc2_save_complete < 1.0:
-                        val_str = "Saved"
+                        val_str = "Saved!"
                     else:
                         val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
                 elif i == 1:  # FFT threshold or Detection Mode (based on toggle)
@@ -4347,9 +4395,9 @@ class OledUI:
                 if i == 0:  # Gain (dB)
                     val_str = format_input_gain_display()
                 elif i == 1:  # Reset - show current preset name or countdown
-                    # Check if "saved" should be shown (progress=2.0 for 0.8s after save)
+                    # Check if "saved!" should be shown (progress=2.0 for 0.8s after save)
                     if _enc1_save_progress >= 2.0 and (time.time() - _enc1_save_complete) < 0.8:
-                        val_str = "saved"
+                        val_str = "saved!"
                     elif _enc1_save_progress > 0 and _enc1_save_progress < 2.0 and is_selected and submenu_editing:
                         # Show countdown replacing preset name: 3 -> 2 -> 1 based on progress
                         if _enc1_save_progress < 0.33:

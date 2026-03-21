@@ -72,24 +72,36 @@ def crt_reveal(base_img, t, reveal_seconds=2.0):
 
 
 def load_logo():
-    """Render CSW logo SVG to PIL Image (256x64) with retro dither effect."""
-    try:
-        import cairosvg
-    except ImportError:
-        return None
-    logo_path = os.path.join(os.path.dirname(__file__), "assets", "csw_logo.svg")
-    if not os.path.isfile(logo_path):
-        return None
-    try:
-        png_bytes = cairosvg.svg2png(
-            url=logo_path,
-            output_width=OLED_WIDTH,
-            output_height=OLED_HEIGHT,
-        )
-        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        return bayer_dither(img)
-    except Exception:
-        return None
+    """Render CSW logo to PIL Image (256x64) with retro dither effect.
+    Tries pre-rendered PNG first (no deps), then SVG via cairosvg."""
+    assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+    png_path = os.path.join(assets_dir, "csw_logo.png")
+    svg_path = os.path.join(assets_dir, "csw_logo.svg")
+
+    # 1) Pre-rendered PNG (reliable, no cairosvg needed)
+    if os.path.isfile(png_path):
+        try:
+            img = Image.open(png_path).convert("RGB")
+            if img.size == (OLED_WIDTH, OLED_HEIGHT):
+                return img
+        except Exception:
+            pass
+
+    # 2) Render from SVG (requires cairosvg)
+    if os.path.isfile(svg_path):
+        try:
+            import cairosvg
+            png_bytes = cairosvg.svg2png(
+                url=svg_path,
+                output_width=OLED_WIDTH,
+                output_height=OLED_HEIGHT,
+            )
+            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            return bayer_dither(img)
+        except Exception:
+            pass
+
+    return None
 
 
 def main():
