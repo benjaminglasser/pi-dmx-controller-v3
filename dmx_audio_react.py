@@ -40,6 +40,10 @@
 #   AUDIO_DEVICE_NAME="USB Audio"
 
 import os, sys, time, math, threading, curses, re, random
+
+# Set gpiozero to use RPi.GPIO backend (avoids conflict with RPi.GPIO pin setup)
+os.environ.setdefault('GPIOZERO_PIN_FACTORY', 'rpigpio')
+
 from dataclasses import dataclass
 from collections import deque
 
@@ -4453,6 +4457,15 @@ def main():
             if oled_ui and oled_ui.device is not None:
                 oled_ui.device.hide()
                 oled_ui.device.cleanup()
+        except Exception:
+            pass
+        
+        # Close gpiozero encoders BEFORE GPIO.cleanup() to avoid errors
+        try:
+            if _gz_enc1 is not None:
+                _gz_enc1.close()
+            for enc in _gz_encoders.values():
+                enc.close()
         except Exception:
             pass
         

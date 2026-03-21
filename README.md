@@ -86,13 +86,24 @@ sudo reboot
 
 ## Manual run
 
+Stop the service first, then run with sudo (required for GPIO access):
+
 ```bash
-cd ~/pi-dmx-controller-v2
-source .venv/bin/activate
-python dmx_audio_react.py
+sudo systemctl stop pi-dmx.service
+sudo .venv/bin/python dmx_audio_react.py
 ```
 
-Or use **`./run_dmx.sh`** (uses `DEV_NO_HW=1` and `DMX_BACKEND=uart` by default).
+### Optional: Add a `dmx` alias
+
+Add this to your **`~/.bashrc`** for a quick command:
+
+```bash
+alias dmx='sudo /home/pi/pi-dmx-controller-v2/.venv/bin/python /home/pi/pi-dmx-controller-v2/dmx_audio_react.py'
+```
+
+Then reload: **`source ~/.bashrc`**
+
+Now you can just run **`dmx`** from anywhere (after stopping the service).
 
 ---
 

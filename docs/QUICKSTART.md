@@ -200,6 +200,23 @@ See **`journalctl -u pi-dmx.service`** for a line like:
 - **`sudo systemctl stop pi-dmx.service`** freezes the OLED on the last image until you **`start`** the service again — expected.
 - To **prevent autostart on boot** while you debug, use **`./scripts/dmx-dev disable`** (runs **`systemctl disable`**). **`./scripts/dmx-dev enable`** turns autostart back on.
 
+### Manual run (with `dmx` alias)
+
+For quick manual testing, add this alias to **`~/.bashrc`**:
+
+```bash
+alias dmx='sudo /home/pi/pi-dmx-controller-v2/.venv/bin/python /home/pi/pi-dmx-controller-v2/dmx_audio_react.py'
+```
+
+Then **`source ~/.bashrc`** and run:
+
+```bash
+sudo systemctl stop pi-dmx.service
+dmx
+```
+
+Press **`q`** to quit. Restart the service with **`sudo systemctl start pi-dmx.service`**.
+
 ---
 
 ## Verify
