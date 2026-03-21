@@ -68,18 +68,6 @@ except Exception:
     _OLED_AVAILABLE = False
 
 
-def _agent_debug_append(rel_filename: str, line: str) -> None:
-    """Best-effort NDJSON debug log under ~/.cursor/ (ignore failures)."""
-    try:
-        base = os.path.join(os.path.expanduser("~"), ".cursor")
-        os.makedirs(base, exist_ok=True)
-        path = os.path.join(base, rel_filename)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line if line.endswith("\n") else line + "\n")
-    except OSError:
-        pass
-
-
 # ===================== Config =====================
 
 DEV_NO_HW = os.environ.get("DEV_NO_HW", "0").strip() == "1"
@@ -581,11 +569,11 @@ PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "SWAP", "RANDOM", "AMBIENT"]
 
 # ===================== FFT Display =====================
 
-# FFT settings - 64 bands, 20Hz to 16kHz
+# FFT settings - 32 bands, 20Hz to 16kHz
 FFT_MIN_FREQ = 20
 FFT_MAX_FREQ = 16000
-FFT_NUM_BANDS = 64
-FFT_SIZE = 2048  # Zero-pad to 2048 for ~21Hz resolution (4x better than 512 samples)
+FFT_NUM_BANDS = 32
+FFT_SIZE = 1024  # Zero-pad to 1024 for ~43Hz resolution (tradeoff: faster FFT vs freq precision)
 
 def generate_log_bands(num_bands, min_freq, max_freq):
     """Generate logarithmically spaced frequency bands with low-end compression.
@@ -637,19 +625,29 @@ FFT_COMPENSATION = calculate_freq_compensation()
 # Pre-compute FFT bin indices for each band (PERFORMANCE OPTIMIZATION)
 # This avoids creating numpy masks on every audio callback
 _FFT_BIN_INDICES = None  # Will be computed on first use with actual freqs array
+_FFT_BIN_STARTS = None   # Numpy array of start indices for vectorized computation
+_FFT_BIN_ENDS = None     # Numpy array of end indices
+_FFT_BIN_COUNTS = None   # Numpy array of bin counts per band
 
 def _precompute_bin_indices(freqs):
     """Pre-compute start/end bin indices for each FFT band."""
-    global _FFT_BIN_INDICES
+    global _FFT_BIN_INDICES, _FFT_BIN_STARTS, _FFT_BIN_ENDS, _FFT_BIN_COUNTS
     indices = []
+    starts = []
+    ends = []
     for low_hz, high_hz in FFT_BANDS:
-        # Find bin indices for this band
         start_idx = np.searchsorted(freqs, low_hz)
         end_idx = np.searchsorted(freqs, high_hz)
         if end_idx <= start_idx:
-            end_idx = start_idx + 1  # At least one bin
-        indices.append((start_idx, min(end_idx, len(freqs))))
+            end_idx = start_idx + 1
+        end_idx = min(end_idx, len(freqs))
+        indices.append((start_idx, end_idx))
+        starts.append(start_idx)
+        ends.append(end_idx)
     _FFT_BIN_INDICES = indices
+    _FFT_BIN_STARTS = np.array(starts, dtype=np.int32)
+    _FFT_BIN_ENDS = np.array(ends, dtype=np.int32)
+    _FFT_BIN_COUNTS = np.maximum(1, _FFT_BIN_ENDS - _FFT_BIN_STARTS).astype(np.float32)
     return indices
 
 def get_band_energy_fast(fft_magnitudes, band_idx):
@@ -658,6 +656,13 @@ def get_band_energy_fast(fft_magnitudes, band_idx):
     if end > start:
         return float(np.mean(fft_magnitudes[start:end]))
     return float(fft_magnitudes[start]) if start < len(fft_magnitudes) else 0.0
+
+def get_all_band_energies_vectorized(fft_mag):
+    """Compute all band energies in one vectorized pass using cumsum."""
+    cumsum = np.zeros(len(fft_mag) + 1, dtype=np.float64)
+    cumsum[1:] = np.cumsum(fft_mag)
+    band_sums = cumsum[_FFT_BIN_ENDS] - cumsum[_FFT_BIN_STARTS]
+    return (band_sums / _FFT_BIN_COUNTS).astype(np.float32)
 
 # Visual gain for FFT display (makes bars appear taller within fixed view)
 FFT_VISUAL_GAIN = 1.0
@@ -671,8 +676,8 @@ fft_recent_max = 0.3
 fft_max_decay = 0.995
 
 # Spectral flux state for onset/transient detection
-prev_band_energies = [0.0] * len(FFT_BANDS)
-fft_flux = [0.0] * len(FFT_BANDS)  # Per-band spectral flux values
+prev_band_energies = np.zeros(len(FFT_BANDS), dtype=np.float32)
+fft_flux = np.zeros(len(FFT_BANDS), dtype=np.float32)
 
 # Per-band normalization state (spectral whitening)
 band_running_mean = [0.01] * len(FFT_BANDS)
@@ -680,13 +685,8 @@ band_running_max = [0.1] * len(FFT_BANDS)
 BAND_NORM_DECAY = 0.995
 
 def get_spectral_flux(current_energies, prev_energies):
-    """Calculate half-wave rectified spectral flux per band.
-    Returns only positive changes (onsets), which helps detect transients."""
-    flux = []
-    for curr, prev in zip(current_energies, prev_energies):
-        diff = curr - prev
-        flux.append(max(0, diff))  # Only positive changes (onsets)
-    return flux
+    """Calculate half-wave rectified spectral flux per band (vectorized)."""
+    return np.maximum(0.0, current_energies - prev_energies)
 
 def normalize_band(energy, band_idx):
     """Normalize band energy relative to its own history (spectral whitening).
@@ -751,7 +751,8 @@ _reset_press_time = 0  # Timestamp when reset button was pressed (for long-press
 _enc_last_clk = [None, None, None, None, None]
 _enc_last_dt = [None, None, None, None, None]  # Track DT state too for quadrature
 _enc_last_sw = [1, 1, 1, 1, 1]  # Switch states (1 = not pressed)
-# Encoder deltas - accumulated since last update call
+_enc_awaiting_release = [False, False, False, False, False]  # Non-blocking button release tracking
+# Encoder deltas - accumulated since last update call (legacy, _apply_encoder_delta now used)
 _enc_delta = [0, 0, 0, 0, 0]
 
 # Quadrature state machine for reliable direction detection
@@ -1568,25 +1569,6 @@ class ThreeBandOnsetDetector:
             else:
                 self.trigger[i] = False
             
-            # #region agent log
-            # Log kick detection details (band 0 = LOW)
-            if i == 0 and (self.normalized_slope[i] > 0.05 or self.trigger[i]):
-                import json as _json
-                _agent_debug_append(
-                    "debug.log",
-                    _json.dumps({
-                        "ts": int(now*1000), "type": "TD_KICK",
-                        "energy": round(float(self.energy[i]), 4),
-                        "lagged": round(float(self.lagged_energy[i]), 4),
-                        "slope": round(float(self.slope[i]), 4),
-                        "norm_slope": round(float(self.normalized_slope[i]), 3),
-                        "thresh": round(float(band.trigger_thresh), 2),
-                        "cooldown_ok": cooldown_ok,
-                        "trig": self.trigger[i]
-                    }) + "\n",
-                )
-            # #endregion
-            
             # Update display values for UI
             # normalized_slope is already 0-1, perfect for display
             self.display_flux[i] = self.normalized_slope[i]
@@ -1777,42 +1759,130 @@ def choose_input_device():
 
 DEVICE_INDEX, DEVICE_NAME, DEVICE_CHANNELS = choose_input_device()
 
+# Lock for thread-safe parameter updates between encoder_reader and OLED loop
+import threading
+_param_lock = threading.Lock()
 
-def update_encoders():
-    """Apply encoder deltas for HOME controls (Freq, Trigger, Release, Brightness).
+
+def _apply_encoder_delta(enc_idx, direction):
+    """Apply a single encoder click immediately (called from encoder_reader at 200Hz).
     
-    New UI: Encoders 2-4 always control HOME parameters, encoder 5 controls brightness.
-    Submenu controls (PRE, SET) are handled via encoder 1 in _handle_submenu_value_change().
+    This decouples parameter updates from the OLED refresh rate for snappier feel.
+    
+    Args:
+        enc_idx: 1=Freq/Q, 2=Thresh/ThreshMode, 3=Release/ReleaseMode, 4=Brightness
+        direction: 1 for CW, -1 for CCW
     """
-    global BRIGHTNESS, THRESH_MODE_INDEX
-    global _enc_delta, _brightness_target, _brightness_fading
-    global _discrete_last_change
-    global RELEASE_MODE_INDEX
+    global BRIGHTNESS, THRESH_MODE_INDEX, RELEASE_MODE_INDEX
+    global _brightness_target, _discrete_last_change
+    global _reactive_brightness_scale, _effective_brightness_display, _brightness_knob_last_turn
     global _effective_release_display, _release_knob_last_turn
+    global ambient_speed, ambient_fade_time
     
     if DEV_NO_HW:
         return
     if time.time() < IGNORE_KNOBS_UNTIL:
         return
     
-    # Get raw encoder deltas (direction only: -1, 0, or 1 per click)
-    # Indices: 1=Freq, 2=Trigger, 3=Release, 4=Brightness
-    raw_deltas = _enc_delta[1:4]  # Freq, Trigger, Release deltas
-    brightness_raw = _enc_delta[4]
-    _enc_delta = [0, 0, 0, 0, 0]
+    with _param_lock:
+        # Each click = exactly 1 step (no sub-1x velocity, always at least 1)
+        # Velocity only adds acceleration for fast spins, never reduces below 1x
+        base_delta = 1 if direction > 0 else -1
+        
+        # ===== Encoder 5 (enc_idx=4): Brightness =====
+        if enc_idx == 4:
+            if not _brightness_off:
+                mult = max(1.0, _calc_velocity_multiplier(4, VELOCITY_MAX_BRIGHTNESS))
+                delta = base_delta * mult
+                BRIGHTNESS = max(0.0, min(0.99, BRIGHTNESS + delta * 0.01))
+                _brightness_target = BRIGHTNESS
+                if RELEASE_MODES[RELEASE_MODE_INDEX] in ("bright", "both"):
+                    _reactive_brightness_scale = BRIGHTNESS
+                    _effective_brightness_display = int(BRIGHTNESS * 99)
+                    _brightness_knob_last_turn = time.time()
+            return
+        
+        # ===== Encoder 2 (enc_idx=1): Frequency/Q or Speed in AMBIENT mode =====
+        if enc_idx == 1:
+            if BASE_PROGRAM == 6:
+                ambient_speed = max(0.2, min(8.0, ambient_speed + base_delta * 0.2))
+            elif _home_enc2_alt:
+                mult = max(1.0, _calc_velocity_multiplier(1, VELOCITY_MAX_Q))
+                delta = base_delta * mult
+                factor = 1.02 ** (-delta)
+                q_min = get_q_min(band.center)
+                band.q = max(q_min, min(Q_MAX, band.q * factor))
+            else:
+                mult = max(1.0, _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ))
+                delta = base_delta * mult
+                factor = 1.008 ** delta
+                new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
+                band.center = new_center
+            return
+        
+        # ===== Encoder 3 (enc_idx=2): Trigger Threshold/ThreshMode (disabled in AMBIENT) =====
+        if enc_idx == 2:
+            if BASE_PROGRAM == 6:
+                return
+            if _home_enc3_alt:
+                now = time.time()
+                elapsed_ms = (now - _discrete_last_change[2]) * 1000
+                if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                    delta = 1 if direction > 0 else -1
+                    new_idx = max(0, min(len(THRESH_MODES) - 1, THRESH_MODE_INDEX + delta))
+                    if new_idx != THRESH_MODE_INDEX:
+                        THRESH_MODE_INDEX = new_idx
+                        _discrete_last_change[2] = now
+                        save_current_as_default()
+            else:
+                mult = max(1.0, _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH))
+                delta = base_delta * mult
+                band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
+            return
+        
+        # ===== Encoder 4 (enc_idx=3): Release/ReleaseMode or Fade in AMBIENT mode =====
+        if enc_idx == 3:
+            if BASE_PROGRAM == 6:
+                mult = max(1.0, _calc_velocity_multiplier(3, VELOCITY_MAX_AMBIENT))
+                delta = base_delta * mult
+                ambient_fade_time = max(0.1, min(10.0, ambient_fade_time + delta * 0.1))
+            elif _home_enc4_alt:
+                now = time.time()
+                elapsed_ms = (now - _discrete_last_change[3]) * 1000
+                if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                    delta = 1 if direction > 0 else -1
+                    new_idx = max(0, min(len(RELEASE_MODES) - 1, RELEASE_MODE_INDEX + delta))
+                    if new_idx != RELEASE_MODE_INDEX:
+                        RELEASE_MODE_INDEX = new_idx
+                        _discrete_last_change[3] = now
+            else:
+                mult = max(1.0, _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY))
+                delta = base_delta * mult
+                band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 20.0))
+                release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
+                if release_mode in ("react", "rand", "both"):
+                    _effective_release_display = int(band.decay_ms)
+                    _release_knob_last_turn = time.time()
+            return
+
+
+def update_encoders():
+    """Handle time-based animations (brightness fade) for the OLED loop.
     
-    # ===== Encoder 5: Brightness =====
-    if brightness_raw != 0 and not _brightness_off:
-        base_delta = 1 if brightness_raw > 0 else -1
-        mult = _calc_velocity_multiplier(4, VELOCITY_MAX_BRIGHTNESS)
-        delta = base_delta * mult
-        BRIGHTNESS = max(0.0, min(0.99, BRIGHTNESS + delta * 0.01))
-        _brightness_target = BRIGHTNESS
-        global _reactive_brightness_scale, _effective_brightness_display, _brightness_knob_last_turn
-        if RELEASE_MODES[RELEASE_MODE_INDEX] in ("bright", "both"):
-            _reactive_brightness_scale = BRIGHTNESS
-            _effective_brightness_display = int(BRIGHTNESS * 99)
-            _brightness_knob_last_turn = time.time()
+    Parameter updates are now handled immediately in _apply_encoder_delta() which is
+    called directly from encoder_reader() at 200Hz for snappier response.
+    
+    This function only handles:
+    - Brightness fade animation (time-based, needs to run at OLED rate)
+    - Clearing any legacy _enc_delta writes for backward compatibility
+    """
+    global BRIGHTNESS, _enc_delta, _brightness_fading
+    
+    if DEV_NO_HW:
+        return
+    
+    # Clear any legacy delta writes (parameter updates now happen in _apply_encoder_delta)
+    _enc_delta = [0, 0, 0, 0, 0]
     
     # Animate brightness fade (time-based linear interpolation)
     if _brightness_fading:
@@ -1820,87 +1890,18 @@ def update_encoders():
         elapsed = now - _brightness_fade_start_time
         t = min(1.0, elapsed / BRIGHTNESS_FADE_DURATION)  # 0.0 to 1.0 over duration
         
-        # Linear interpolation from start value to target
-        BRIGHTNESS = _brightness_fade_start_value + t * (_brightness_target - _brightness_fade_start_value)
+        # Use lock for thread-safe BRIGHTNESS update (also modified by _apply_encoder_delta)
+        with _param_lock:
+            # Linear interpolation from start value to target
+            BRIGHTNESS = _brightness_fade_start_value + t * (_brightness_target - _brightness_fade_start_value)
+            
+            if t >= 1.0:
+                BRIGHTNESS = _brightness_target
+                _brightness_fading = False
         
-        if t >= 1.0:
-            BRIGHTNESS = _brightness_target
-            _brightness_fading = False
-            # Show "OFF" message only after fade to zero completes
-            if _brightness_off and _brightness_target == 0.0:
-                ui_flash("Brightness: OFF", 0.8)
-    
-    # ===== Encoder 2: Frequency OR Q (toggle with click), or Speed in AMBIENT mode =====
-    if raw_deltas[0] != 0:
-        global ambient_speed
-        base_delta = 1 if raw_deltas[0] > 0 else -1
-        if BASE_PROGRAM == 6:
-            # AMBIENT mode: control speed (0.2x to 8x in 0.2 steps, 1 step per click)
-            ambient_speed = max(0.2, min(8.0, ambient_speed + base_delta * 0.2))
-        elif _home_enc2_alt:
-            # Q mode: Q factor - logarithmic scaling
-            mult = _calc_velocity_multiplier(1, VELOCITY_MAX_Q)
-            delta = base_delta * mult
-            factor = 1.02 ** (-delta)
-            q_min = get_q_min(band.center)
-            band.q = max(q_min, min(Q_MAX, band.q * factor))
-        else:
-            # Freq mode: Center frequency (log scale)
-            mult = _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ)
-            delta = base_delta * mult
-            factor = 1.008 ** delta
-            new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
-            band.center = new_center
-    
-    # ===== Encoder 3: Trigger Threshold OR ThreshMode (toggle with click), disabled in AMBIENT mode =====
-    if raw_deltas[1] != 0 and BASE_PROGRAM != 6:
-        if _home_enc3_alt:
-            # ThreshMode: cycle through threshold detection modes
-            now = time.time()
-            elapsed_ms = (now - _discrete_last_change[2]) * 1000
-            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                delta = 1 if raw_deltas[1] > 0 else -1
-                new_idx = max(0, min(len(THRESH_MODES) - 1, THRESH_MODE_INDEX + delta))
-                if new_idx != THRESH_MODE_INDEX:
-                    THRESH_MODE_INDEX = new_idx
-                    _discrete_last_change[2] = now
-                    # Auto-save threshold mode change to current preset
-                    save_current_as_default()
-        else:
-            # Threshold mode: (0-1, display 0-99)
-            base_delta = 1 if raw_deltas[1] > 0 else -1
-            mult = _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH)
-            delta = base_delta * mult
-            band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
-    
-    # ===== Encoder 4: Release OR ReleaseMode (toggle with click), or Fade in AMBIENT mode =====
-    if raw_deltas[2] != 0:
-        global ambient_fade_time
-        base_delta = 1 if raw_deltas[2] > 0 else -1
-        if BASE_PROGRAM == 6:
-            # AMBIENT mode: control fade time (0.1s to 10s in 0.1 steps)
-            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_AMBIENT)
-            delta = base_delta * mult
-            ambient_fade_time = max(0.1, min(10.0, ambient_fade_time + delta * 0.1))
-        elif _home_enc4_alt:
-            # ReleaseMode: cycle through release modes
-            now = time.time()
-            elapsed_ms = (now - _discrete_last_change[3]) * 1000
-            if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                delta = 1 if raw_deltas[2] > 0 else -1
-                new_idx = max(0, min(len(RELEASE_MODES) - 1, RELEASE_MODE_INDEX + delta))
-                if new_idx != RELEASE_MODE_INDEX:
-                    RELEASE_MODE_INDEX = new_idx
-                    _discrete_last_change[3] = now
-        else:
-            # Release mode: (40-5000ms, display in ms)
-            mult = _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY, VELOCITY_MIN_DECAY)
-            delta = base_delta * mult
-            band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 20.0))
-            release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
-            if release_mode in ("react", "rand", "both"):
-                _effective_release_display = int(band.decay_ms)
-                _release_knob_last_turn = time.time()
+        # Show "OFF" message outside lock (ui_flash doesn't need protection)
+        if t >= 1.0 and _brightness_off and _brightness_target == 0.0:
+            ui_flash("Brightness: OFF", 0.8)
 
 def toggle_brightness():
     """Toggle brightness between current value and zero with fade animation."""
@@ -2081,109 +2082,89 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10, min_mult=1.0):
     return max(min_mult, min(float(max_mult), mult))
 
 
-ENC_DEBOUNCE_MS = 20  # Minimum ms between valid clicks for encoders 2-5
+# ===== gpiozero-based encoder handling (interrupt-driven, more reliable) =====
+from gpiozero import RotaryEncoder as GpioZeroEncoder
+
+# Encoder objects (initialized in setup_gpiozero_encoders)
+_gz_encoders = {}  # {enc_idx: GpioZeroEncoder}
+_gz_last_steps = {}  # {enc_idx: last_steps_value}
+
+def setup_gpiozero_encoders():
+    """Initialize gpiozero RotaryEncoder objects for encoders 2-5."""
+    global _gz_encoders, _gz_last_steps
+    
+    # Encoder pin mappings (CLK, DT) - BCM pins
+    enc_pins = {
+        1: (ENC2_CLK, ENC2_DT),  # Encoder 2
+        2: (ENC3_CLK, ENC3_DT),  # Encoder 3
+        3: (ENC4_CLK, ENC4_DT),  # Encoder 4
+        4: (ENC5_CLK, ENC5_DT),  # Encoder 5 (brightness)
+    }
+    
+    for enc_idx, (clk, dt) in enc_pins.items():
+        try:
+            enc = GpioZeroEncoder(clk, dt, wrap=False, max_steps=0)
+            _gz_encoders[enc_idx] = enc
+            _gz_last_steps[enc_idx] = 0
+            enc.steps = 0
+        except Exception as e:
+            import sys
+            print(f"Failed to init gpiozero encoder {enc_idx+1}: {e}", file=sys.stderr)
 
 def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
-    """Read encoder using detent-based detection for clean 1:1 click response.
-    
-    Accumulates rotation direction while encoder is away from rest position.
-    Triggers exactly once when encoder returns to detent (rest state 3).
-    This matches the physical "click" feel of the encoder.
+    """Read encoder using gpiozero (interrupt-driven).
     
     Returns: 1 for CW, -1 for CCW, 0 for no change
     """
-    global _enc_state, _enc_rotation_dir, _enc_last_click_time, _enc_prev_click_time
+    global _gz_last_steps
     
-    clk = GPIO.input(clk_pin)
-    dt = GPIO.input(dt_pin)
-    
-    new_state = (clk << 1) | dt
-    old_state = _enc_state[enc_idx]
-    
-    if new_state == old_state:
+    if enc_idx not in _gz_encoders:
         return 0
     
-    _enc_state[enc_idx] = new_state
+    enc = _gz_encoders[enc_idx]
+    current_steps = enc.steps
+    last_steps = _gz_last_steps[enc_idx]
     
-    # Quadrature transition table: [old_state][new_state] -> direction
-    transition = [
-        [  0, -1,  1,  0],  # old = 0
-        [  1,  0,  0, -1],  # old = 1
-        [ -1,  0,  0,  1],  # old = 2
-        [  0,  1, -1,  0],  # old = 3
-    ]
-    
-    direction = transition[old_state][new_state]
-    
-    if direction != 0:
-        _enc_rotation_dir[enc_idx] += direction
-    
-    # Trigger when returning to rest/detent position (state 3) with accumulated rotation
-    if new_state == 3 and _enc_rotation_dir[enc_idx] != 0:
-        now = time.time()
-        if (now - _enc_last_click_time[enc_idx]) * 1000 >= ENC_DEBOUNCE_MS:
-            result = 1 if _enc_rotation_dir[enc_idx] > 0 else -1
-            _enc_prev_click_time[enc_idx] = _enc_last_click_time[enc_idx]
-            _enc_last_click_time[enc_idx] = now
-            _enc_rotation_dir[enc_idx] = 0
-            return result
-        _enc_rotation_dir[enc_idx] = 0
+    if current_steps != last_steps:
+        diff = current_steps - last_steps
+        _gz_last_steps[enc_idx] = current_steps
+        return 1 if diff > 0 else -1
     
     return 0
 
 
-# Encoder 1 state (detent-based detection for reliable 1:1 clicks)
-# Triggers when encoder returns to rest position (state 3) after rotation
-_enc1_state = 3               # Current quadrature state (0-3), 3 = rest (both high)
-_enc1_rotation_dir = 0        # Accumulated rotation direction since leaving rest
-_enc1_last_click = 0.0        # Timestamp of last valid click for debouncing
-ENC1_DEBOUNCE_MS = 20         # Minimum ms between valid clicks
+# Encoder 1 - also use gpiozero
+_gz_enc1 = None
+_gz_enc1_last_steps = 0
 
-# Quadrature transition table: [old_state][new_state] -> direction
-# State encoding: (CLK << 1) | DT
-# State 0 = both low, State 1 = CLK low/DT high, State 2 = CLK high/DT low, State 3 = both high (rest/detent)
-_ENC1_QUAD_TRANSITION = [
-    [  0, -1,  1,  0],  # old = 0 (both low)
-    [  1,  0,  0, -1],  # old = 1 (CLK low, DT high)
-    [ -1,  0,  0,  1],  # old = 2 (CLK high, DT low)
-    [  0,  1, -1,  0],  # old = 3 (both high - rest/detent)
-]
+def setup_gpiozero_enc1():
+    """Initialize gpiozero encoder for encoder 1."""
+    global _gz_enc1, _gz_enc1_last_steps
+    try:
+        _gz_enc1 = GpioZeroEncoder(ENC1_CLK, ENC1_DT, wrap=False, max_steps=0)
+        _gz_enc1.steps = 0
+        _gz_enc1_last_steps = 0
+    except Exception as e:
+        import sys
+        print(f"Failed to init gpiozero encoder 1: {e}", file=sys.stderr)
 
 def _read_enc1_quadrature(clk_pin, dt_pin):
-    """Read Encoder 1 using detent-based detection for clean 1:1 click response.
-    
-    Accumulates rotation direction while encoder is away from rest position.
-    Triggers exactly once when encoder returns to detent (rest state 3).
-    This matches the physical "click" feel of the encoder.
+    """Read Encoder 1 using gpiozero (interrupt-driven).
     
     Returns: 1 for CW, -1 for CCW, 0 for no change
     """
-    global _enc1_state, _enc1_rotation_dir, _enc1_last_click
+    global _gz_enc1_last_steps
     
-    clk = GPIO.input(clk_pin)
-    dt = GPIO.input(dt_pin)
-    
-    new_state = (clk << 1) | dt
-    old_state = _enc1_state
-    
-    if new_state == old_state:
+    if _gz_enc1 is None:
         return 0
     
-    _enc1_state = new_state
+    current_steps = _gz_enc1.steps
+    last_steps = _gz_enc1_last_steps
     
-    direction = _ENC1_QUAD_TRANSITION[old_state][new_state]
-    
-    if direction != 0:
-        _enc1_rotation_dir += direction
-    
-    if new_state == 3 and _enc1_rotation_dir != 0:
-        now = time.time()
-        if (now - _enc1_last_click) * 1000 >= ENC1_DEBOUNCE_MS:
-            result = 1 if _enc1_rotation_dir > 0 else -1
-            _enc1_rotation_dir = 0
-            _enc1_last_click = now
-            return result
-        _enc1_rotation_dir = 0
+    if current_steps != last_steps:
+        diff = current_steps - last_steps
+        _gz_enc1_last_steps = current_steps
+        return 1 if diff > 0 else -1
     
     return 0
 
@@ -2294,6 +2275,7 @@ def encoder_reader():
     """Read all 5 rotary encoders for page selection, parameters, and brightness.
     
     Encoder 5's switch toggles brightness on/off with a fade animation.
+    Uses non-blocking state machine for button release tracking.
     """
     global encoder1_value, encoder1_button
     global current_page
@@ -2302,6 +2284,7 @@ def encoder_reader():
     global _home_enc2_alt, _home_enc3_alt, _home_enc4_alt
     global _enc2_press_time, _enc2_saving, _enc2_save_complete
     global submenu_tab, submenu_column, submenu_editing
+    global _enc_awaiting_release
     
     if DEV_NO_HW:
         return
@@ -2369,62 +2352,72 @@ def encoder_reader():
                 enc1_sw = GPIO.input(ENC1_SW)
                 global _enc1_press_time, _enc1_save_progress, _enc1_save_complete
                 
-                # Check if we're on Settings tab with Reset column in EDITING mode (showing preset names)
-                # Only allow long-press save when editing (viewing LOW/MID/HIGH/USR 1-3)
-                is_settings_reset_editing = (SUBMENU_TABS[submenu_tab] == "Settings" and 
-                                             submenu_column == 1 and submenu_editing)
-                
-                if enc1_sw == 0 and _enc_last_sw[0] == 1:
-                    # Button just pressed - start timing
-                    time.sleep(0.02)  # Debounce
-                    if GPIO.input(ENC1_SW) == 0:
-                        _enc1_press_time = time.time()
-                        _enc1_save_progress = 0.0
-                elif enc1_sw == 0 and _enc_last_sw[0] == 0:
-                    # Button still held - check for long press on Settings/Reset (editing mode only)
-                    if _enc1_press_time > 0 and is_settings_reset_editing:
-                        hold_duration = time.time() - _enc1_press_time
-                        # Only start showing progress after 150ms delay
-                        if hold_duration >= 0.15:
-                            # Progress starts after 150ms, completes at ENC1_SAVE_HOLD_DURATION
-                            adjusted_duration = hold_duration - 0.15
-                            _enc1_save_progress = min(1.0, adjusted_duration / ENC1_SAVE_HOLD_DURATION)
-                        
-                        if hold_duration >= (ENC1_SAVE_HOLD_DURATION + 0.15):
-                            # Long press complete - save current settings to selected preset
-                            save_current_as_default()
-                            _enc1_press_time = 0.0
-                            _enc1_save_progress = 2.0  # Special value to show "saved"
-                            _enc1_save_complete = time.time()
-                            # Wait for button release to prevent toggle
-                            while GPIO.input(ENC1_SW) == 0 and not STOP_THREADS:
-                                time.sleep(0.01)
-                            time.sleep(0.05)
-                elif enc1_sw == 1 and _enc_last_sw[0] == 0:
-                    # Button just released
-                    if _enc1_press_time > 0:
-                        # If countdown was showing (progress > 0), just cancel - don't toggle
-                        if _enc1_save_progress > 0:
-                            # Countdown was active - cancel save, stay in current mode
-                            pass
-                        else:
-                            # No countdown was showing - normal short press toggle
-                            submenu_editing = not submenu_editing
-                            if submenu_editing:
-                                ui_flash("Edit", 0.3)
+                # Non-blocking: check if waiting for button release
+                if _enc_awaiting_release[0]:
+                    if enc1_sw == 1:  # Button released
+                        _enc_awaiting_release[0] = False
+                        time.sleep(0.02)  # Post-release debounce
+                    _enc_last_sw[0] = enc1_sw
+                else:
+                    # Check if we're on Settings tab with Reset column in EDITING mode (showing preset names)
+                    # Only allow long-press save when editing (viewing LOW/MID/HIGH/USR 1-3)
+                    is_settings_reset_editing = (SUBMENU_TABS[submenu_tab] == "Settings" and 
+                                                 submenu_column == 1 and submenu_editing)
+                    
+                    if enc1_sw == 0 and _enc_last_sw[0] == 1:
+                        # Button just pressed - start timing
+                        time.sleep(0.02)  # Debounce
+                        if GPIO.input(ENC1_SW) == 0:
+                            _enc1_press_time = time.time()
+                            _enc1_save_progress = 0.0
+                    elif enc1_sw == 0 and _enc_last_sw[0] == 0:
+                        # Button still held - check for long press on Settings/Reset (editing mode only)
+                        if _enc1_press_time > 0 and is_settings_reset_editing:
+                            hold_duration = time.time() - _enc1_press_time
+                            # Only start showing progress after 150ms delay
+                            if hold_duration >= 0.15:
+                                # Progress starts after 150ms, completes at ENC1_SAVE_HOLD_DURATION
+                                adjusted_duration = hold_duration - 0.15
+                                _enc1_save_progress = min(1.0, adjusted_duration / ENC1_SAVE_HOLD_DURATION)
+                            
+                            if hold_duration >= (ENC1_SAVE_HOLD_DURATION + 0.15):
+                                # Long press complete - save current settings to selected preset
+                                save_current_as_default()
+                                _enc1_press_time = 0.0
+                                _enc1_save_progress = 2.0  # Special value to show "saved"
+                                _enc1_save_complete = time.time()
+                                # Non-blocking: mark awaiting release to prevent toggle
+                                _enc_awaiting_release[0] = True
+                    elif enc1_sw == 1 and _enc_last_sw[0] == 0:
+                        # Button just released
+                        if _enc1_press_time > 0:
+                            # If countdown was showing (progress > 0), just cancel - don't toggle
+                            if _enc1_save_progress > 0:
+                                # Countdown was active - cancel save, stay in current mode
+                                pass
                             else:
-                                ui_flash("Select", 0.3)
-                    _enc1_press_time = 0.0
-                    _enc1_save_progress = 0.0
-                _enc_last_sw[0] = enc1_sw
+                                # No countdown was showing - normal short press toggle
+                                submenu_editing = not submenu_editing
+                                if submenu_editing:
+                                    ui_flash("Edit", 0.3)
+                                else:
+                                    ui_flash("Select", 0.3)
+                        _enc1_press_time = 0.0
+                        _enc1_save_progress = 0.0
+                    _enc_last_sw[0] = enc1_sw
                 
                 # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
                 direction = _read_encoder_quadrature(1, ENC2_CLK, ENC2_DT)
                 if direction != 0:
-                    _enc_delta[1] += direction
+                    _apply_encoder_delta(1, direction)  # Immediate update at 200Hz
                 
                 enc2_sw = GPIO.input(ENC2_SW)
-                if enc2_sw == 0 and _enc_last_sw[1] == 1:
+                # Non-blocking: check if waiting for button release
+                if _enc_awaiting_release[1]:
+                    if enc2_sw == 1:  # Button released
+                        _enc_awaiting_release[1] = False
+                        time.sleep(0.02)  # Post-release debounce
+                elif enc2_sw == 0 and _enc_last_sw[1] == 1:
                     time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC2_SW) == 0:
                         # Toggle Freq/Q mode for HOME controls
@@ -2433,19 +2426,22 @@ def encoder_reader():
                             ui_flash("Mode: Range", 0.5)
                         else:
                             ui_flash("Mode: Freq", 0.5)
-                        # Wait for button release to prevent double-toggle
-                        while GPIO.input(ENC2_SW) == 0 and not STOP_THREADS:
-                            time.sleep(0.01)
-                        time.sleep(0.05)  # Additional debounce after release
+                        # Non-blocking: mark awaiting release to prevent double-toggle
+                        _enc_awaiting_release[1] = True
                 _enc_last_sw[1] = enc2_sw
                 
                 # ===== Encoder 3 - Param B (Thresh/Beats) =====
                 direction = _read_encoder_quadrature(2, ENC3_CLK, ENC3_DT)
                 if direction != 0:
-                    _enc_delta[2] += direction
+                    _apply_encoder_delta(2, direction)  # Immediate update at 200Hz
                 
                 enc3_sw = GPIO.input(ENC3_SW)
-                if enc3_sw == 0 and _enc_last_sw[2] == 1:
+                # Non-blocking: check if waiting for button release
+                if _enc_awaiting_release[2]:
+                    if enc3_sw == 1:  # Button released
+                        _enc_awaiting_release[2] = False
+                        time.sleep(0.02)  # Post-release debounce
+                elif enc3_sw == 0 and _enc_last_sw[2] == 1:
                     time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC3_SW) == 0:
                         # Toggle Thresh/ThreshMode for HOME controls
@@ -2454,19 +2450,22 @@ def encoder_reader():
                             ui_flash("Mode: Th-Mode", 0.5)
                         else:
                             ui_flash("Mode: Trigger", 0.5)
-                        # Wait for button release to prevent double-toggle
-                        while GPIO.input(ENC3_SW) == 0 and not STOP_THREADS:
-                            time.sleep(0.01)
-                        time.sleep(0.05)  # Additional debounce after release
+                        # Non-blocking: mark awaiting release to prevent double-toggle
+                        _enc_awaiting_release[2] = True
                 _enc_last_sw[2] = enc3_sw
                 
                 # ===== Encoder 4 - Param C (Release/Mode) =====
                 direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
                 if direction != 0:
-                    _enc_delta[3] += direction
+                    _apply_encoder_delta(3, direction)  # Immediate update at 200Hz
                 
                 enc4_sw = GPIO.input(ENC4_SW)
-                if enc4_sw == 0 and _enc_last_sw[3] == 1:
+                # Non-blocking: check if waiting for button release
+                if _enc_awaiting_release[3]:
+                    if enc4_sw == 1:  # Button released
+                        _enc_awaiting_release[3] = False
+                        time.sleep(0.02)  # Post-release debounce
+                elif enc4_sw == 0 and _enc_last_sw[3] == 1:
                     time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC4_SW) == 0:
                         # Toggle Release/ReleaseMode for HOME controls
@@ -2475,16 +2474,14 @@ def encoder_reader():
                             ui_flash("Mode: R-Mode", 0.5)
                         else:
                             ui_flash("Mode: Release", 0.5)
-                        # Wait for button release to prevent double-toggle
-                        while GPIO.input(ENC4_SW) == 0 and not STOP_THREADS:
-                            time.sleep(0.01)
-                        time.sleep(0.05)  # Additional debounce after release
+                        # Non-blocking: mark awaiting release to prevent double-toggle
+                        _enc_awaiting_release[3] = True
                 _enc_last_sw[3] = enc4_sw
                 
                 # ===== Encoder 5 - Brightness =====
                 direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
                 if direction != 0:
-                    _enc_delta[4] += direction
+                    _apply_encoder_delta(4, direction)  # Immediate update at 200Hz
                 
                 # Encoder 5 switch - toggle brightness on/off with fade
                 global _brightness_click_flash, _brightness_gpio8_state
@@ -2570,7 +2567,7 @@ _ambient_next_time = 0.0  # Time when next channel switch happens
 
 # Trigger indicator for UI
 trigger_flash = 0.0  # Decays over time, >0 means recently triggered
-TRIGGER_FLASH_DECAY = 0.86  # Decay rate for ~100ms visible at 86Hz audio callback rate
+TRIGGER_FLASH_DECAY = 0.3  # Very fast decay for quick flash on trigger
 
 bp   = None
 envd = None
@@ -2616,10 +2613,6 @@ def audio_loop():
     frame_dt_ms = (HOP / SR) * 1000.0
     was_above = False
 
-    # #region agent log
-    _cb_slow_count = [0]
-    # #endregion
-
     def cb(indata, frames, time_info, status):
         nonlocal was_above
         global live_band_env, live_threshold, input_rms
@@ -2633,10 +2626,6 @@ def audio_loop():
 
         if not RUNNING:
             return
-
-        # #region agent log
-        _cb_start = time.time()
-        # #endregion
 
         # Handle mono vs stereo input
         # For stereo: use channel 1 (Input 2 on Scarlett Solo - the line input on back)
@@ -2665,17 +2654,12 @@ def audio_loop():
         
         now = time.time()
         
-        # Calculate FFT band energies with compensation (OPTIMIZED)
-        raw_levels = []
-        for i in range(len(FFT_BANDS)):
-            energy = get_band_energy_fast(fft_mag, i)
-            energy *= FFT_COMPENSATION[i]
-            if energy > 1e-10:
-                db = 20 * math.log10(energy + 1e-10)
-                normalized = max(0, (db + 60) / 50)
-            else:
-                normalized = 0
-            raw_levels.append(normalized)
+        # Calculate FFT band energies with compensation (VECTORIZED)
+        band_energies = get_all_band_energies_vectorized(fft_mag)
+        band_energies *= np.array(FFT_COMPENSATION, dtype=np.float32)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            db_vals = np.where(band_energies > 1e-10, 20.0 * np.log10(band_energies + 1e-10), -100.0)
+        raw_levels = np.clip((db_vals + 60.0) / 50.0, 0.0, None)
         
         # Calculate spectral flux (onset detection) before updating prev_band_energies
         fft_flux = get_spectral_flux(raw_levels, prev_band_energies)
@@ -2689,36 +2673,22 @@ def audio_loop():
             # Run detector at THREEBAND_UPDATE_HZ (100 Hz)
             dt = now - _last_3band_update
             if dt >= 1.0 / THREEBAND_UPDATE_HZ:
-                # Use normalized fft_bands (0-1 scale) instead of raw FFT
-                # #region agent log
-                _3band_start = time.time()
-                # #endregion
                 three_band_detector.update_from_fft_bands(fft_bands, FFT_BANDS, dt)
                 _last_3band_update = now
-                # #region agent log
-                _3band_elapsed = time.time() - _3band_start
-                if _3band_elapsed > 0.005:  # >5ms is slow for this operation
-                    import json as _json
-                    _agent_debug_append(
-                        "debug.log",
-                        _json.dumps({"ts": int(now*1000), "type": "SLOW_3BAND", "ms": int(_3band_elapsed*1000)}) + "\n",
-                    )
-                # #endregion
         
         # Apply per-band normalization (spectral whitening) - SKIPPED for performance
         # The raw_levels are already compensated and work well enough
         whitened_levels = raw_levels  # Use raw levels directly
         
         # Auto-normalize FFT (vectorized for performance)
-        raw_arr = np.array(raw_levels, dtype=np.float32)
-        current_max = float(np.max(raw_arr)) if len(raw_arr) > 0 else 0
+        current_max = float(np.max(raw_levels)) if len(raw_levels) > 0 else 0
         if current_max > fft_recent_max:
             fft_recent_max = current_max
         else:
             fft_recent_max = fft_recent_max * fft_max_decay
         
         norm_factor = max(0.1, fft_recent_max)
-        normalized = np.minimum(1.0, raw_arr / norm_factor)
+        normalized = np.minimum(1.0, raw_levels / norm_factor)
         
         # Vectorized attack/decay
         attack_mask = normalized > fft_bands
@@ -2981,17 +2951,6 @@ def audio_loop():
         send_dmx(update_lights(frame_dt_ms))
         was_above = above
 
-        # #region agent log
-        _cb_elapsed = time.time() - _cb_start
-        if _cb_elapsed > 0.012 and _cb_slow_count[0] < 30:  # >12ms is slow (buffer is 11.6ms)
-            _cb_slow_count[0] += 1
-            import json as _json
-            _agent_debug_append(
-                "debug.log",
-                _json.dumps({"ts": int(_cb_start*1000), "type": "SLOW_CB", "ms": int(_cb_elapsed*1000)}) + "\n",
-            )
-        # #endregion
-
     # Try to open audio stream, falling back to 1 channel if multi-channel fails
     stream_opened = False
     last_error = None
@@ -3045,7 +3004,7 @@ class OledUI:
             serial = luma_spi(
                 device=OLED_SPI_DEV,
                 port=0,
-                bus_speed_hz=4000000,  # 4MHz - faster OLED updates
+                bus_speed_hz=8000000,  # 8MHz SPI (reduce to 4MHz if display glitches)
                 gpio_DC=OLED_DC_PIN,
                 gpio_RST=OLED_RST_PIN,
             )
@@ -3120,14 +3079,15 @@ class OledUI:
         return int(x_start + t_display * (width - 1))
 
     def _draw_fft_spectrum(self, draw, x, y, width, height):
-        """Draw FFT spectrum with Q band highlighting.
-        - Bars inside Q range above threshold: crosshatch/dashed (triggering zone)
+        """Draw FFT spectrum with Q band highlighting and beat indicator.
+        - Left: Beat indicator bar showing live_band_env with trigger flash
+        - Bars inside Q range above threshold: horizontal stripes (triggering zone)
         - Bars inside Q range below threshold: solid fill
         - Bars outside Q range: single-pixel outline
         - Q range boundaries: vertical lines
         - Threshold line: horizontal within Q range"""
         
-        # FFT spectrum uses full width (VU meter removed)
+        # FFT spectrum uses full width
         fft_x = x
         fft_width = width
         
@@ -3177,14 +3137,12 @@ class OledUI:
             if in_q_range:
                 # Check if bar crosses threshold line
                 if bar_top < thresh_y:
-                    # Part above threshold - crosshatch (triggering zone)
+                    # Part above threshold - horizontal stripes (triggering zone)
                     above_top = bar_top
                     above_bottom = min(thresh_y - 1, bar_bottom)
                     if above_top <= above_bottom:
-                        for py in range(above_top, above_bottom + 1):
-                            for px in range(bx_start, bx_end + 1):
-                                if (px + py) % 2 == 0:
-                                    draw.point((px, py), fill=OLED_WHITE)
+                        for py in range(above_top, above_bottom + 1, 2):
+                            draw.line((bx_start, py, bx_end, py), fill=OLED_WHITE)
                     
                     # Part below threshold - solid fill
                     if thresh_y <= bar_bottom:
@@ -3193,11 +3151,8 @@ class OledUI:
                     # Entirely below threshold - solid fill
                     draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
             else:
-                # Single pixel outline for bands outside Q range
-                draw.line((bx_start, bar_top, bx_end, bar_top), fill=OLED_WHITE)
-                if bar_h > 1:
-                    draw.line((bx_start, bar_top, bx_start, bar_bottom), fill=OLED_WHITE)
-                    draw.line((bx_end, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
+                # Solid fill for bands outside Q range
+                draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
         
         # Draw Q range boundary lines (vertical)
         draw.line((low_x, y, low_x, y + height - 1), fill=OLED_WHITE)
@@ -3206,11 +3161,6 @@ class OledUI:
         # Threshold line (horizontal within Q range)
         if y <= thresh_y < y + height:
             draw.line((low_x, thresh_y, high_x, thresh_y), fill=OLED_WHITE)
-        
-        # Trigger flash - filled bar at top of Q range when triggered
-        if trigger_flash > 0.2:
-            flash_height = 3
-            draw.rectangle((low_x + 1, y, high_x - 1, y + flash_height), fill=OLED_WHITE)
 
     def _format_freq_range(self, f_lo, f_hi):
         """Format frequency range for display (e.g., '2.5k-4.5k')."""
@@ -4033,23 +3983,9 @@ class OledUI:
                         # Show neighbor preset in parentheses when in x+1 neighbor phase
                         _, neighbor = program_pair_for_base(BASE_PROGRAM)
                         val_str = f"({PROGRAM_NAMES[neighbor - 1]})"
-                        # #region agent log
-                        import json as _json
-                        _agent_debug_append(
-                            "debug-4c4bbd.log",
-                            _json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3625","message":"x+1 showing neighbor","data":{"val_str":val_str,"phase":CYCLE_PHASE,"base":BASE_PROGRAM},"timestamp":int(time.time()*1000)})+"\n",
-                        )
-                        # #endregion
                     elif current_mode == "rnd/amb" and CYCLE_PHASE == 1:
                         # Show AMB in brackets when in rnd/amb ambient phase
                         val_str = "[AMB]"
-                        # #region agent log
-                        import json as _json
-                        _agent_debug_append(
-                            "debug-4c4bbd.log",
-                            _json.dumps({"sessionId":"4c4bbd","hypothesisId":"DISPLAY","location":"dmx_audio_react.py:3631","message":"rnd/amb showing AMB","data":{"val_str":val_str,"phase":CYCLE_PHASE},"timestamp":int(time.time()*1000)})+"\n",
-                        )
-                        # #endregion
                     else:
                         # Normal: show base preset name
                         val_str = PROGRAM_NAMES[BASE_PROGRAM - 1]
@@ -4094,7 +4030,7 @@ class OledUI:
                 val_str = "--"
             
             # Draw value - invert when editing (white bg, black text), otherwise white/gray
-            val_y = y + 9
+            val_y = y + 11  # Extra spacing between label and value rows
             val_kern = 0  # Tighter kerning for values
             if is_selected and submenu_editing:
                 # Editing mode: invert colors (white background, black text)
@@ -4119,32 +4055,46 @@ class OledUI:
             draw.text((0, 0), "ERROR", font=self._font, fill=OLED_WHITE)
             draw.text((0, 14), (APP_ERROR or "See logs")[:20], font=self._font, fill=OLED_WHITE)
         else:
-            # New layout: 256x64 split into quadrants
-            # Top-left (128x32): FFT visualization
-            # Top-right (128x32): Submenu tabs + content
-            # Bottom (256x32): HOME controls (4 columns)
+            # Trigger border around entire screen
+            border_width = 2
             
-            half_width = W // 2  # 128px
-            half_height = H // 2  # 32px
+            if trigger_flash > 0.2:
+                # Draw border on all 4 sides
+                draw.rectangle((0, 0, W - 1, border_width - 1), fill=OLED_WHITE)  # Top
+                draw.rectangle((0, H - border_width, W - 1, H - 1), fill=OLED_WHITE)  # Bottom
+                draw.rectangle((0, 0, border_width - 1, H - 1), fill=OLED_WHITE)  # Left
+                draw.rectangle((W - border_width, 0, W - 1, H - 1), fill=OLED_WHITE)  # Right
             
-            # Top-left: FFT spectrum (always FFT mode now, no 3-band)
-            # Draw box around FFT area first, then draw FFT inside with 1px margin
-            draw.rectangle((0, 0, half_width - 1, half_height - 1), outline=OLED_WHITE)
-            self._draw_fft_spectrum(draw, 1, 1, half_width - 2, half_height - 2)
+            # Content area inset by border width
+            cx = border_width  # Content x start
+            cy = border_width  # Content y start
+            cw = W - border_width * 2  # Content width
+            ch = H - border_width * 2  # Content height
             
-            # Top-right: Submenu area
-            submenu_x = half_width + 2
+            # Layout inside content area
+            # Top section (FFT + Submenu): ~38px tall
+            # Bottom section (HOME controls): ~22px tall
+            
+            half_width = cw // 2  # ~125px
+            top_height = 38  # Taller top section for submenu content
+            
+            # Top-left: FFT spectrum
+            draw.rectangle((cx, cy, cx + half_width - 1, cy + top_height - 1), outline=OLED_WHITE)
+            self._draw_fft_spectrum(draw, cx + 1, cy + 1, half_width - 2, top_height - 2)
+            
+            # Top-right: Submenu area (taller to fit 3 lines)
+            submenu_x = cx + half_width + 2
             submenu_width = half_width - 4
-            content_height = half_height - 11  # Height of content area below tabs
+            content_height = top_height - 11  # Height of content area below tabs
             
             # Draw folder-style tabs with border enclosing content
-            self._draw_submenu_tabs_and_border(draw, submenu_x, 0, submenu_width, content_height)
+            self._draw_submenu_tabs_and_border(draw, submenu_x, cy, submenu_width, content_height)
             
-            # Submenu content inside the bordered area (offset by 1 for border)
-            self._draw_submenu_content(draw, submenu_x + 2, 12, submenu_width - 4, content_height - 2)
+            # Submenu content inside the bordered area
+            self._draw_submenu_content(draw, submenu_x + 2, cy + 12, submenu_width - 4, content_height - 2)
             
-            # Bottom: HOME controls (4 columns)
-            self._draw_home_controls(draw, 0, half_height + 2, W)
+            # Bottom: HOME controls (4 columns) - pushed down
+            self._draw_home_controls(draw, cx, cy + top_height + 2, cw)
 
         try:
             self.device.display(image)
@@ -4153,28 +4103,13 @@ class OledUI:
             pass
 
     def loop(self):
-        target_fps = 12  # Reduced from 15 for smoother Pi performance
-        frame_time = 1.0 / target_fps
-        # #region agent log
-        _oled_slow_count = [0]
-        # #endregion
-        
         while not STOP_THREADS:
-            start = time.time()
+            start = time.monotonic()
             update_encoders()
             self.render_once()
             
-            elapsed = time.time() - start
-            # #region agent log
-            if elapsed > 0.12 and _oled_slow_count[0] < 30:  # >120ms is a freeze
-                _oled_slow_count[0] += 1
-                import json as _json
-                _agent_debug_append(
-                    "debug.log",
-                    _json.dumps({"ts": int(start*1000), "type": "SLOW_OLED", "ms": int(elapsed*1000)}) + "\n",
-                )
-            # #endregion
-            sleep_time = frame_time - elapsed
+            elapsed = time.monotonic() - start
+            sleep_time = self.period - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
         self.clear()
@@ -4464,6 +4399,11 @@ def main():
         gpio_ok = setup_gpio_inputs()
         if not gpio_ok:
             print("[WARN] GPIO init failed - continuing without hardware controls")
+        else:
+            # Initialize gpiozero encoders (interrupt-driven, more reliable)
+            setup_gpiozero_enc1()
+            setup_gpiozero_encoders()
+            print("[OK] gpiozero encoders initialized")
 
     # DMX backend + sender thread
     dmx_backend = make_dmx_backend()
@@ -4488,6 +4428,7 @@ def main():
     threading.Thread(target=audio_loop, daemon=True).start()
 
     # TUI thread (enabled by default if running in a TTY)
+    # For smoother OLED/audio in production: run with ENABLE_TUI=0 to skip curses overhead
     use_tui = sys.stdout.isatty() and os.environ.get("ENABLE_TUI", "1") != "0"
     if use_tui:
         threading.Thread(target=lambda: curses.wrapper(tui), daemon=True).start()
