@@ -424,6 +424,10 @@ THRESH_MODE_INDEX = 0  # Default to fixed threshold (current behavior)
 _recent_min = 1.0           # Tracks recent minimum for adaptive mode
 _effective_thresh = 0.3     # Effective threshold for display (varies by mode)
 
+# Transient detection state
+_q_band_running_avg = 0.1   # Running average for onset ratio calculation
+_flux_recent_max = 0.001    # Tracks recent max flux for auto-normalization
+
 # Release modes
 RELEASE_MODES = ["fixed", "react", "bright", "both", "rand"]
 RELEASE_MODE_INDEX = 0  # Default to fixed (current behavior)
@@ -443,7 +447,8 @@ TRIGGER_SPEED_MAX_MULT = 2.0  # Maximum multiplier for slow triggers
 # - "level": Uses absolute energy level (original behavior)
 # - "flux": Uses spectral flux (onset detection, better for drums/transients)
 # - "hybrid": Combines level with flux boost (default, best of both)
-DETECT_MODES = ["level", "flux", "hybrid"]
+# - "transient": Onset detection comparing instantaneous vs running average (best for kicks)
+DETECT_MODES = ["level", "flux", "hybrid", "transient"]
 DETECT_MODE_INDEX = 2  # Default to hybrid mode
 
 # Beat detection method: 0 = FFT_STANDARD (Q-band analysis)
@@ -536,6 +541,10 @@ SETUP_BAND_OPTIONS = ["LOW", "MID", "HIGH"]
 _home_enc2_alt = False  # False = Freq, True = Q
 _home_enc3_alt = False  # False = Thresh, True = ThreshMode
 _home_enc4_alt = False  # False = Release, True = ReleaseMode
+
+# Encoder toggle states for Settings submenu tab
+_setup_enc3_detect = False    # False = Input Gain, True = Detection Mode
+_setup_enc4_channels = False  # False = DMX Output Mode, True = Channel Count
 
 # Legacy compatibility - keep current_page and get_pages() for remaining references
 current_page = 0
@@ -727,10 +736,10 @@ def get_band_energy_with_q(fft_mag, freqs, center_hz, q):
 
 def get_envelope_times(center_hz):
     """Return (attack_ms, release_ms) based on frequency.
-    Low frequencies need slower attack to avoid false triggers from transient leakage,
-    while highs need faster response."""
+    Low frequencies use fast attack to capture kick transients (2-5ms),
+    while highs need even faster response."""
     if center_hz < 200:      # Lows
-        return (12.0, 100.0)  # Slower attack, longer release
+        return (3.0, 60.0)   # Fast attack for kick transients, moderate release
     elif center_hz < 2000:   # Mids
         return (8.0, 80.0)    # Default
     else:                    # Highs
@@ -1438,7 +1447,7 @@ class ThreeBandOnsetDetector:
         
         # Stage 5: Trigger state
         self.trigger = [False, False, False]
-        self.trigger_flash = [0.0, 0.0, 0.0]
+        self.trigger_flash_time = [0.0, 0.0, 0.0]  # Timestamps when each band last triggered
         self.last_trigger_time = [0.0, 0.0, 0.0]
         
         # Display values for UI
@@ -1567,7 +1576,7 @@ class ThreeBandOnsetDetector:
             
             if above_threshold and cooldown_ok and not suppressed and (is_dominant or significantly_above):
                 self.trigger[i] = True
-                self.trigger_flash[i] = 1.0
+                self.trigger_flash_time[i] = now
                 self.last_trigger_time[i] = now
                 self.suppression_time[i] = now  # Start suppressing other bands
             else:
@@ -1585,10 +1594,6 @@ class ThreeBandOnsetDetector:
             self.onset[i] = self.normalized_slope[i]
             self.lagged[i] = self.lagged_energy[i]
             self.lagged_prev[i] = self.prev_lagged[i]
-            
-            # Decay flash for UI (~100ms visible at 50Hz update rate)
-            if not self.trigger[i]:
-                self.trigger_flash[i] *= 0.78
             
             # Update history for UI graphs
             self.onset_history[i].append(self.scaled_onset[i])
@@ -1639,7 +1644,7 @@ class ThreeBandOnsetDetector:
             
             if above_threshold and cooldown_ok:
                 self.trigger[i] = True
-                self.trigger_flash[i] = 1.0
+                self.trigger_flash_time[i] = now
                 self.last_trigger_time[i] = now
             else:
                 self.trigger[i] = False
@@ -1655,10 +1660,6 @@ class ThreeBandOnsetDetector:
             self.lagged[i] = self.lagged_energy[i]
             self.lagged_prev[i] = self.prev_lagged[i]
             
-            # Decay flash for UI (~100ms visible at 50Hz update rate)
-            if not self.trigger[i]:
-                self.trigger_flash[i] *= 0.78
-            
             self.onset_history[i].append(self.scaled_onset[i])
             self.trigger_history[i].append(self.trigger[i])
         
@@ -1669,6 +1670,10 @@ class ThreeBandOnsetDetector:
         """Get the current trigger threshold for a band (for UI display)."""
         band = self.bands[band_idx]
         return band.trigger_thresh
+    
+    def is_flash_active(self, band_idx):
+        """Check if trigger flash is active for a band (time-based)."""
+        return (time.time() - self.trigger_flash_time[band_idx]) < TRIGGER_FLASH_DURATION
     
     def adjust_width(self, band_idx, delta_pct):
         """Adjust band width with band-specific cropping behavior.
@@ -2570,8 +2575,8 @@ ambient_fade_time = 1.0  # Fade time in seconds - default 1s (range 0.1s to 10s)
 _ambient_next_time = 0.0  # Time when next channel switch happens
 
 # Trigger indicator for UI
-trigger_flash = 0.0  # Decays over time, >0 means recently triggered
-TRIGGER_FLASH_DECAY = 0.3  # Very fast decay for quick flash on trigger
+trigger_flash = 0.0  # Timestamp when last triggered (time.time())
+TRIGGER_FLASH_DURATION = 0.08  # How long the flash stays visible (seconds)
 
 bp   = None
 envd = None
@@ -2627,6 +2632,7 @@ def audio_loop():
         global _reactive_brightness_scale, _effective_release_display, _effective_brightness_display
         global _trigger_speed_multiplier
         global prev_band_energies, fft_flux, band_running_mean, band_running_max
+        global _q_band_running_avg, _flux_recent_max
 
         if not RUNNING:
             return
@@ -2732,14 +2738,38 @@ def audio_loop():
         elif detect_mode == "flux":
             # Pure flux mode - uses spectral flux for onset/transient detection
             # Better for drums and percussive sounds
-            q_band_max = min(1.0, q_flux_max * 3.0)  # Scale flux to usable range
-        else:  # "hybrid" (default)
+            # Auto-normalized so threshold values make sense (0-1 range)
+            _flux_recent_max = max(_flux_recent_max * 0.99, q_flux_max)  # Track recent max
+            q_band_max = q_flux_max / max(0.001, _flux_recent_max)  # Normalized 0-1
+        elif detect_mode == "hybrid":
             # Hybrid mode - use display level but boost with flux for transients
             flux_boost = min(0.15, q_flux_max * 1.5)  # Flux adds up to 0.15 boost
             q_band_max = min(1.0, display_max_in_q + flux_boost)
+        else:  # "transient"
+            # Transient mode - onset detection optimized for kicks/drums
+            # Compares instantaneous energy to running average
+            
+            # Onset ratio: how much current exceeds recent average
+            # Kicks have high ratio (sudden spike), sustained bass has low ratio
+            onset_ratio = display_max_in_q / max(0.01, _q_band_running_avg)
+            
+            # Update running average (slow decay = remembers recent energy)
+            _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * display_max_in_q
+            
+            # Normalize onset_ratio to 0-1 range (ratio of 3+ = strong transient)
+            onset_score = min(1.0, max(0.0, (onset_ratio - 1.0) / 2.0))
+            
+            # Also use flux as a secondary transient indicator
+            flux_score = min(1.0, q_flux_max * 4.0)
+            
+            # Take max of onset and flux (either indicates transient)
+            q_band_max = max(onset_score, flux_score)
         
-        # Get frequency-dependent envelope smoothing
-        attack_ms, release_ms = get_envelope_times(clamped_center)
+        # Get envelope smoothing - transient mode uses faster timing for sharp transient tracking
+        if detect_mode == "transient":
+            attack_ms, release_ms = (2.0, 40.0)  # Very fast attack/release for transients
+        else:
+            attack_ms, release_ms = get_envelope_times(clamped_center)
         # Calculate EMA coefficient based on attack time (faster attack = lower coefficient)
         freq_ema = math.exp(-1.0 / (max(1e-3, attack_ms) * 1e-3 * SR / HOP))
         
@@ -2779,9 +2809,8 @@ def audio_loop():
 
         PROGRAM = active_prog
 
-        # Decay trigger flash indicator
+        # Decay brightness click indicator (trigger_flash is now time-based, no decay needed)
         global trigger_flash, _brightness_click_flash
-        trigger_flash = trigger_flash * TRIGGER_FLASH_DECAY
         _brightness_click_flash = _brightness_click_flash * 0.9  # Decay click indicator
 
         # Determine trigger based on detection method and threshold mode
@@ -2826,7 +2855,7 @@ def audio_loop():
                 _trigger_speed_multiplier = TRIGGER_SPEED_MIN_MULT + t * (TRIGGER_SPEED_MAX_MULT - TRIGGER_SPEED_MIN_MULT)
             
             last_trigger_ts = now
-            trigger_flash = 1.0  # Flash on trigger
+            trigger_flash = now  # Record trigger time for flash
             if TRIG_DEBUG:
                 print(f"[TRIG] mode={thresh_mode} env={live_band_env:.5f} thr={band.thresh:.5f} prog={active_prog} mult={_trigger_speed_multiplier:.2f}")
 
@@ -3209,7 +3238,7 @@ class OledUI:
         # Use display_thresh which moves with threshold adjustment
         threshold = three_band_detector.display_thresh[sel]
         onset = three_band_detector.display_flux[sel]  # Use display_flux to match threshold scale
-        triggered = three_band_detector.trigger_flash[sel] > 0.3
+        triggered = three_band_detector.is_flash_active(sel)
         
         # === Left side: Small onset meter (10px wide) ===
         meter_width = 10
@@ -3311,7 +3340,7 @@ class OledUI:
         for i in range(3):
             rect_x = x + padding + i * (rect_width + gap)
             is_selected = (i == THREEBAND_SELECTED)
-            triggered = three_band_detector.trigger_flash[i] > 0.3
+            triggered = three_band_detector.is_flash_active(i)
             
             # Selected band: double border (outer indicator)
             if is_selected:
@@ -3351,7 +3380,7 @@ class OledUI:
         onset = three_band_detector.display_flux[sel]
         f_lo = band_cfg.f_lo
         f_hi = band_cfg.f_hi
-        triggered = three_band_detector.trigger_flash[sel] > 0.3
+        triggered = three_band_detector.is_flash_active(sel)
         
         # === Left side: VU meter (12px wide) ===
         meter_width = 12
@@ -3488,7 +3517,8 @@ class OledUI:
     
     def _draw_trigger_indicator(self, draw, x, y):
         """Draw trigger indicator dot at specified position."""
-        if trigger_flash > 0.2:
+        flash_active = (time.time() - trigger_flash) < TRIGGER_FLASH_DURATION
+        if flash_active:
             # Draw filled circle (trigger active)
             draw.ellipse((x, y, x + 6, y + 6), fill=OLED_WHITE)
         else:
@@ -4059,21 +4089,25 @@ class OledUI:
             draw.text((0, 0), "ERROR", font=self._font, fill=OLED_WHITE)
             draw.text((0, 14), (APP_ERROR or "See logs")[:20], font=self._font, fill=OLED_WHITE)
         else:
-            # Trigger border around entire screen
-            border_width = 2
+            # Trigger border: 1px thick with 1px gap to content
+            border_thickness = 1
+            content_inset = 2  # 1px border + 1px gap
             
-            if trigger_flash > 0.2:
-                # Draw border on all 4 sides
-                draw.rectangle((0, 0, W - 1, border_width - 1), fill=OLED_WHITE)  # Top
-                draw.rectangle((0, H - border_width, W - 1, H - 1), fill=OLED_WHITE)  # Bottom
-                draw.rectangle((0, 0, border_width - 1, H - 1), fill=OLED_WHITE)  # Left
-                draw.rectangle((W - border_width, 0, W - 1, H - 1), fill=OLED_WHITE)  # Right
+            # Check if flash is active (time-based)
+            flash_active = (time.time() - trigger_flash) < TRIGGER_FLASH_DURATION
             
-            # Content area inset by border width
-            cx = border_width  # Content x start
-            cy = border_width  # Content y start
-            cw = W - border_width * 2  # Content width
-            ch = H - border_width * 2  # Content height
+            if flash_active:
+                # Draw 1px border on all 4 sides
+                draw.line((0, 0, W - 1, 0), fill=OLED_WHITE)  # Top
+                draw.line((0, H - 1, W - 1, H - 1), fill=OLED_WHITE)  # Bottom
+                draw.line((0, 0, 0, H - 1), fill=OLED_WHITE)  # Left
+                draw.line((W - 1, 0, W - 1, H - 1), fill=OLED_WHITE)  # Right
+            
+            # Content area inset by border + gap
+            cx = content_inset  # Content x start
+            cy = content_inset  # Content y start
+            cw = W - content_inset * 2  # Content width
+            ch = H - content_inset * 2  # Content height
             
             # Layout inside content area
             # Top section (FFT + Submenu): ~38px tall
