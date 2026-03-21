@@ -87,6 +87,10 @@ DEV_NO_HW = os.environ.get("DEV_NO_HW", "0").strip() == "1"
 DMX_BACKEND = os.environ.get("DMX_BACKEND", "uart").strip().lower()  # Default to uart for RS485 transceiver
 DMX_UART_DEVICE = os.environ.get("DMX_UART_DEVICE", "/dev/serial0")
 DMX_UART_BAUD = 250000  # DMX: 250k 8N2
+# Pad past your channel count with zeros. Many dimmer packs (e.g. Chauvet) need ≥128–256+ slots to decode.
+DMX_UART_MIN_SLOTS = max(1, int(os.environ.get("DMX_UART_MIN_SLOTS", "256").strip() or "256"))
+# DMX break: "ioctl" (UART BREAK) or "baud" (9600-byte trick). Match scripts/dmx_probe.py if one works and the other does not.
+DMX_BREAK_STYLE = os.environ.get("DMX_BREAK_STYLE", "ioctl").strip().lower()
 
 UNIVERSE   = 0
 DMX_CHANS  = 24  # Max supported channels (actual count controlled by DMX_CHANNEL_COUNT)
@@ -936,6 +940,10 @@ class NullDmx(DmxBackendBase):
         pass
 
 class UartDmx(DmxBackendBase):
+    # Linux: start/stop UART BREAK for DMX (pyserial's send_break() uses coarse tcsendbreak steps).
+    _TIOCSBRK = 0x5427
+    _TIOCCBRK = 0x5428
+
     def __init__(self, device="/dev/serial0"):
         try:
             import serial
@@ -950,10 +958,14 @@ class UartDmx(DmxBackendBase):
             stopbits=serial.STOPBITS_TWO,
             timeout=0,
             write_timeout=0,
+            exclusive=True,
         )
-        print(f"[DMX] Backend: uart ({device}) @ {DMX_UART_BAUD} 8N2")
+        print(
+            f"[DMX] Backend: uart ({device}) @ {DMX_UART_BAUD} 8N2 "
+            f"(min_slots={DMX_UART_MIN_SLOTS} break={DMX_BREAK_STYLE})"
+        )
 
-    def _send_break(self):
+    def _send_break_baud(self):
         try:
             self.serial.baudrate = 9600
             self.serial.write(b"\x00")
@@ -962,14 +974,31 @@ class UartDmx(DmxBackendBase):
         finally:
             self.serial.baudrate = DMX_UART_BAUD
 
+    def _send_break(self):
+        import fcntl
+
+        if DMX_BREAK_STYLE == "baud":
+            self._send_break_baud()
+            return
+        fd = self.serial.fileno()
+        try:
+            fcntl.ioctl(fd, self._TIOCSBRK, 0)
+            time.sleep(0.000092)  # ≥88µs break (DMX512)
+            fcntl.ioctl(fd, self._TIOCCBRK, 0)
+            time.sleep(0.000012)  # short MAB before start code
+        except OSError:
+            self._send_break_baud()
+
     def send(self, vals):
-        # Build buffer dynamically based on vals length
-        buf = bytearray(1 + len(vals))
+        n = len(vals)
+        payload_slots = max(n, DMX_UART_MIN_SLOTS)
+        buf = bytearray(1 + payload_slots)
         buf[0] = 0x00  # DMX start code
-        for i, v in enumerate(vals):
-            buf[1 + i] = max(0, min(255, int(v)))
+        for i in range(n):
+            buf[1 + i] = max(0, min(255, int(vals[i])))
         self._send_break()
         self.serial.write(buf)
+        self.serial.flush()
 
     def close(self):
         try:

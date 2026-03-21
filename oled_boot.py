@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""OLED boot splash: shows CSW logo with VHS/retro animation, then exits.
-DMX service has After=oled_splash.service.
+"""OLED boot splash: shows CSW logo with CRT-style reveal, then exits.
+
+oled_splash.service runs this before pi-dmx. On exit we set persist=True so
+luma cleanup does not DISPLAYOFF/clear the panel — avoids a long black gap
+until dmx_audio_react reopens SPI and draws the UI.
+
+Timing: LOGO_SECONDS (total); CRT reveal uses reveal_seconds inside the loop.
 """
 import io
 import os
 import sys
 import time
 
-LOGO_SECONDS = 3
+LOGO_SECONDS = 3.5  # Total splash (CRT reveal ~2s, then hold); tweak if needed
 FPS = 15
 
 try:
@@ -117,8 +122,10 @@ def main():
     except Exception:
         pass
 
+    # Leave the last frame visible while SPI is released. Default cleanup() calls
+    # hide()+clear() which blanks the panel until dmx_audio_react re-inits — long gap.
     try:
-        device.hide()
+        device.persist = True
         device.cleanup()
     except Exception:
         pass

@@ -118,12 +118,15 @@ pi-dmx-controller-v2/
 ├── config/
 │   ├── boot/config.txt     # Pi firmware (SPI / UART / audio overlays)
 │   ├── alsa/asound.conf    # HiFiBerry default device (optional)
+│   ├── udev/               # e.g. ttyAMA0 → dialout when UART is for DMX
 │   └── initramfs/          # Early OLED display
 ├── scripts/
 │   ├── bootstrap_pi.sh     # Full system setup
+│   ├── dmx_probe.py        # Sweep frame length + break style (Chauvet / picky dimmers)
 │   ├── install_oled_splash.sh
 │   ├── install_oled_initramfs.sh
-│   └── dmx-dev             # Toggle autostart
+│   └── dmx-dev             # systemctl disable/enable pi-dmx (autostart)
+├── dmx_uart_test.py        # Quick UART DMX chase test (stop pi-dmx first)
 ├── systemd/
 │   ├── pi-dmx.service
 │   └── oled_splash.service
@@ -135,11 +138,29 @@ pi-dmx-controller-v2/
 
 ---
 
+## DMX output: what usually breaks (and what we fixed)
+
+The main app sends DMX on **`/dev/serial0`** (GPIO UART → RS485 → XLR), **not** through OLA. Typical failures on a fresh Pi OS image:
+
+| Problem | Symptom | Fix |
+|---------|---------|-----|
+| **Serial console** on the UART | `console=serial0,115200` in **`cmdline.txt`** + **`serial-getty@ttyAMA0`** | Remove serial console from **`cmdline.txt`**, **`disable --now serial-getty@ttyAMA0`**, reboot. |
+| **`ttyAMA0` not `dialout`** | Permission denied opening **`/dev/serial0`** | Install **`config/udev/99-dmx-ttyAMA0-dialout.rules`**, **`udevadm trigger`**. |
+| **Short DMX frames** | Wiring OK but Chauvet / some packs never react | Many decoders need **many trailing slot bytes** (not just start + 4 channels). Defaults: **`DMX_UART_MIN_SLOTS=256`** in code and **`pi-dmx.service`**. |
+| **Break timing** | Probe works only on **baud9600** half | Set **`Environment=DMX_BREAK_STYLE=baud`** in **`pi-dmx.service`**. |
+
+**Diagnose without the main app:** **`sudo systemctl stop pi-dmx.service`** then **`python3 scripts/dmx_probe.py`**. If the dimmer reacts during the sweep, align **`pi-dmx.service`** with **`DMX_UART_MIN_SLOTS`** / **`DMX_BREAK_STYLE`** as in **`systemd/pi-dmx.service`** comments.
+
+**Note:** Stopping **`pi-dmx`** leaves the OLED on the last frame until you **`start`** the service again — that is normal.
+
+---
+
 ## Configuration
 
 - **`.dmx_config`** – JSON runtime config (auto-created).
 - **`config/boot/config.txt`** – For HiFiBerry, set **`dtoverlay=hifiberry-dacplusadc`** or **`hifiberry-dacplusadcpro`**. For USB input, omit HiFiBerry overlays; USB cards appear separately in ALSA.
 - **Audio device selection** – See env vars in **`dmx_audio_react.py`** (e.g. **`AUDIO_DEVICE`**, **`AUDIO_DEVICE_NAME`**). Use **`arecord -l`** to list hardware.
+- **DMX UART (Chauvet / picky dimmers)** – **`DMX_UART_MIN_SLOTS`** (default **256**): longer padded frames like **`scripts/dmx_probe.py`**. **`DMX_BREAK_STYLE=baud`** if only the probe’s **baud9600** half worked; default **`ioctl`**. Set in **`pi-dmx.service`** `Environment=` or shell when testing.
 
 ---
 
@@ -150,7 +171,8 @@ pi-dmx-controller-v2/
 | No audio input (USB) | `arecord -l`; set **`AUDIO_DEVICE`** / **`AUDIO_DEVICE_NAME`** in **`pi-dmx.service`** `Environment=` if the wrong card is chosen |
 | No audio input (HiFiBerry) | `sudo cp config/alsa/asound.conf /etc/asound.conf`, correct **`dtoverlay`** in **`config.txt`**, reboot |
 | OLED blank | SPI enabled, **`spidev0.1`** present; test with **`python oled_boot.py`** |
-| DMX no output (OLA) | **`ola_dev_info`** then **`ola_patch --patch --device <id> --port 0 --universe 0`** |
+| **Fixtures ignore DMX (Chauvet / RS485)** | See **DMX output: what usually breaks** above. Quick sweep: **`sudo systemctl stop pi-dmx.service`** then **`python3 scripts/dmx_probe.py`**. If **nothing** ever flickers: **hardware** (RS485 **not** raw TTL to XLR, **DE/RE**, **A/B swap**, ground, cable, dimmer **start address**). |
+| DMX no output (OLA only) | **`ola_dev_info`** then **`ola_patch --patch --device <id> --port 0 --universe 0`** (OLA does not feed the Python app’s stream to the UART) |
 | Splash / service wrong user | Edit repo **`systemd/*.service`**, then **`sudo scripts/install_oled_splash.sh`** and **`sudo cp systemd/pi-dmx.service /etc/systemd/system/`**, **`systemctl daemon-reload`** |
 | Initramfs hook fails | Edit **`config/initramfs/hook-oled-boot`** **`BINARY`** path, reinstall |
 | **`apt`** / **`dpkg`** stuck on conffile prompts over SSH | Bootstrap uses **`DEBIAN_FRONTEND=noninteractive`** and **`--force-confold`**; if you run **`apt`** by hand, use the same or **`sudo dpkg --configure -a --force-confold`** |

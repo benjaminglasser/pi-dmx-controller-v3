@@ -9,6 +9,9 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/pi-dmx-controller-v2
 Environment=PYTHONUNBUFFERED=1
+# Match scripts/dmx_probe.py if needed: longer frames / alternate break for picky dimmers (Chauvet).
+Environment=DMX_UART_MIN_SLOTS=256
+# Environment=DMX_BREAK_STYLE=baud
 ExecStart=/home/pi/pi-dmx-controller-v2/.venv/bin/python /home/pi/pi-dmx-controller-v2/dmx_audio_react.py
 Restart=on-failure
 RestartSec=2

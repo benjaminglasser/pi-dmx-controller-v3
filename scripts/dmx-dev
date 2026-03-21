@@ -1,40 +1,33 @@
 #!/bin/bash
-# dmx-dev: Toggle development mode for DMX controller
-# When dev mode is enabled, the DMX service won't auto-start on boot
+# Toggle pi-dmx.service autostart (systemd). Use while troubleshooting DMX/hardware.
 
-DEV_MODE_FLAG="/tmp/dmx-dev-mode"
+set -euo pipefail
 
-case "$1" in
-    disable|off)
-        touch "$DEV_MODE_FLAG"
-        sudo systemctl stop pi-dmx.service 2>/dev/null || true
-        echo "Dev mode ENABLED - DMX autostart disabled"
-        echo "The DMX controller has been stopped."
-        echo "Run 'dmx-dev enable' to re-enable autostart."
-        ;;
-    enable|on)
-        rm -f "$DEV_MODE_FLAG"
-        echo "Dev mode DISABLED - DMX will autostart on next boot"
-        echo "To start the service now, run: sudo systemctl start pi-dmx.service"
-        ;;
-    status)
-        if [ -f "$DEV_MODE_FLAG" ]; then
-            echo "Dev mode: ENABLED (autostart disabled)"
-        else
-            echo "Dev mode: DISABLED (autostart enabled)"
-        fi
-        # Also show service status
-        echo ""
-        echo "Service status:"
-        systemctl is-active pi-dmx.service 2>/dev/null || echo "pi-dmx.service is not running"
-        ;;
-    *)
-        echo "Usage: dmx-dev {disable|enable|status}"
-        echo ""
-        echo "Commands:"
-        echo "  disable, off  - Stop DMX service and prevent autostart"
-        echo "  enable, on    - Allow DMX service to autostart on boot"
-        echo "  status        - Show current dev mode and service status"
-        exit 1
-        ;;
+case "${1:-}" in
+  disable|off)
+    sudo systemctl stop pi-dmx.service 2>/dev/null || true
+    sudo systemctl disable pi-dmx.service
+    echo "pi-dmx.service stopped and disabled — it will NOT start on boot."
+    echo "Re-enable with: ./scripts/dmx-dev enable"
+    ;;
+  enable|on)
+    sudo systemctl enable pi-dmx.service
+    sudo systemctl start pi-dmx.service
+    echo "pi-dmx.service enabled and started."
+    ;;
+  status)
+    echo "Autostart (enabled = starts on boot):"
+    systemctl is-enabled pi-dmx.service 2>/dev/null || true
+    echo ""
+    echo "Running now:"
+    systemctl is-active pi-dmx.service 2>/dev/null || echo "inactive"
+    ;;
+  *)
+    echo "Usage: ./scripts/dmx-dev {disable|enable|status}"
+    echo ""
+    echo "  disable, off  - Stop service and disable autostart (for DMX troubleshooting)"
+    echo "  enable, on    - Enable autostart and start the service"
+    echo "  status        - Show enabled/active state"
+    exit 1
+    ;;
 esac

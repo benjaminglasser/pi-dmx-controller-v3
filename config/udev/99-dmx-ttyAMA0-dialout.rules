@@ -1,0 +1,4 @@
+# Primary UART (/dev/serial0 -> ttyAMA0 on Pi 4) for DMX after serial console is disabled.
+# Install: sudo cp config/udev/99-dmx-ttyAMA0-dialout.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules && sudo udevadm trigger /dev/ttyAMA0
+KERNEL=="ttyAMA0", GROUP="dialout", MODE="0660"
