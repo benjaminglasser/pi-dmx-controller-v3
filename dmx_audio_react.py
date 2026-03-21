@@ -120,6 +120,12 @@ DEFAULTS_PRESETS = {
 # Config file for persisting settings
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dmx_config")
 
+# Input gain applied to audio (absolute dB). UI shows relative dB with 0 = INPUT_GAIN_REF_DB (calmer default).
+INPUT_GAIN_REF_DB = -12
+INPUT_GAIN_MIN_DB = INPUT_GAIN_REF_DB - 24  # -36
+INPUT_GAIN_MAX_DB = INPUT_GAIN_REF_DB + 24  # +12
+INPUT_GAIN_DB = INPUT_GAIN_REF_DB
+
 def load_defaults_mode():
     """Load defaults mode, DMX output mode, channel count, input gain, and any custom preset values from config."""
     global DEFAULTS_PRESETS, DMX_OUTPUT_MODE, DMX_CHANNEL_COUNT, INPUT_GAIN_DB
@@ -147,7 +153,7 @@ def load_defaults_mode():
                     elif line.startswith("input_gain_db="):
                         try:
                             gain = int(line.split("=")[1])
-                            if -24 <= gain <= 24:
+                            if INPUT_GAIN_MIN_DB <= gain <= INPUT_GAIN_MAX_DB:
                                 INPUT_GAIN_DB = gain
                         except ValueError:
                             pass
@@ -177,6 +183,7 @@ def save_defaults_mode(idx):
         dmx_output = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
         channel_count = DMX_CHANNEL_COUNT
         input_gain = INPUT_GAIN_DB
+        detect_line = None
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 for line in f:
@@ -193,6 +200,8 @@ def save_defaults_mode(idx):
                             input_gain = int(line.split("=")[1])
                         except ValueError:
                             pass
+                    elif line.startswith("detect_mode_index="):
+                        detect_line = line
                     elif "=" in line and not line.startswith("defaults_mode="):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -203,6 +212,8 @@ def save_defaults_mode(idx):
             f.write(f"dmx_output_mode={dmx_output}\n")
             f.write(f"dmx_channel_count={channel_count}\n")
             f.write(f"input_gain_db={input_gain}\n")
+            if detect_line:
+                f.write(f"{detect_line}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -216,6 +227,7 @@ def save_dmx_output_mode(mode_idx):
         defaults_mode = "LOW"
         channel_count = DMX_CHANNEL_COUNT
         input_gain = INPUT_GAIN_DB
+        detect_line = None
         preset_overrides = {}
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -233,6 +245,8 @@ def save_dmx_output_mode(mode_idx):
                             input_gain = int(line.split("=")[1])
                         except ValueError:
                             pass
+                    elif line.startswith("detect_mode_index="):
+                        detect_line = line
                     elif "=" in line and not line.startswith("dmx_output_mode="):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -243,6 +257,8 @@ def save_dmx_output_mode(mode_idx):
             f.write(f"dmx_output_mode={output_mode}\n")
             f.write(f"dmx_channel_count={channel_count}\n")
             f.write(f"input_gain_db={input_gain}\n")
+            if detect_line:
+                f.write(f"{detect_line}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -255,6 +271,7 @@ def save_dmx_channel_count(count):
         defaults_mode = "LOW"
         output_mode = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
         input_gain = INPUT_GAIN_DB
+        detect_line = None
         preset_overrides = {}
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -269,6 +286,8 @@ def save_dmx_channel_count(count):
                             input_gain = int(line.split("=")[1])
                         except ValueError:
                             pass
+                    elif line.startswith("detect_mode_index="):
+                        detect_line = line
                     elif "=" in line and not line.startswith("dmx_channel_count="):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -279,6 +298,8 @@ def save_dmx_channel_count(count):
             f.write(f"dmx_output_mode={output_mode}\n")
             f.write(f"dmx_channel_count={count}\n")
             f.write(f"input_gain_db={input_gain}\n")
+            if detect_line:
+                f.write(f"{detect_line}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -291,6 +312,7 @@ def save_input_gain(gain_db):
         defaults_mode = "LOW"
         output_mode = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
         channel_count = DMX_CHANNEL_COUNT
+        detect_line = None
         preset_overrides = {}
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -305,6 +327,8 @@ def save_input_gain(gain_db):
                             channel_count = int(line.split("=")[1])
                         except ValueError:
                             pass
+                    elif line.startswith("detect_mode_index="):
+                        detect_line = line
                     elif "=" in line and not line.startswith("input_gain_db="):
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -315,6 +339,8 @@ def save_input_gain(gain_db):
             f.write(f"dmx_output_mode={output_mode}\n")
             f.write(f"dmx_channel_count={channel_count}\n")
             f.write(f"input_gain_db={gain_db}\n")
+            if detect_line:
+                f.write(f"{detect_line}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -328,6 +354,7 @@ def save_preset_values(mode_name, center_hz, thresh, decay_ms, q, thresh_mode, r
         dmx_output = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
         channel_count = DMX_CHANNEL_COUNT
         input_gain = INPUT_GAIN_DB
+        detect_line = None
         preset_overrides = {}
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
@@ -347,6 +374,8 @@ def save_preset_values(mode_name, center_hz, thresh, decay_ms, q, thresh_mode, r
                             input_gain = int(line.split("=")[1])
                         except ValueError:
                             pass
+                    elif line.startswith("detect_mode_index="):
+                        detect_line = line
                     elif "=" in line:
                         key, val = line.split("=", 1)
                         if key in DEFAULTS_PRESETS:
@@ -359,6 +388,8 @@ def save_preset_values(mode_name, center_hz, thresh, decay_ms, q, thresh_mode, r
             f.write(f"dmx_output_mode={dmx_output}\n")
             f.write(f"dmx_channel_count={channel_count}\n")
             f.write(f"input_gain_db={input_gain}\n")
+            if detect_line:
+                f.write(f"{detect_line}\n")
             for key, val in preset_overrides.items():
                 f.write(f"{key}={val}\n")
     except Exception:
@@ -406,17 +437,47 @@ HOP = 512  # Smaller for more responsive FFT
 _HANNING_WINDOW = None  # Pre-computed, initialized on first use
 
 # Detection / logic
-ENV_EMA       = 0.55
+ENV_EMA       = 0.62   # Slower release for calmer envelope, fewer threshold bounces (was 0.55)
 AGC_ON        = True
 AGC_TARGET    = 0.020
-REFRACTORY_MS = 110.0
+REFRACTORY_MS = 130.0  # Slightly longer minimum spacing to reduce double-fires (was 110)
+# Hysteresis for fixed threshold: re-arm when env falls below thresh - margin;
+# fire only when crossing above thresh (optionally thresh + small margin). Reduces threshold chatter.
+HYST_REARM_MARGIN = 0.035   # Must fall this far below thresh before next trigger can fire
+HYST_FIRE_MARGIN = 0.02     # Must cross this far above thresh to fire (rejects noise on the line)
+Q_BAND_SMOOTH_COEF = 0.65   # One-pole EMA on q_band_max before envelope; dampens single-hop FFT spikes
+# Adaptive threshold: hysteresis and smoother floor
+ADAPT_REARM_MARGIN = 0.03   # Must fall this far below floor before next trigger can fire
+ADAPT_FLOOR_EMA = 0.93      # EMA for floor when env below floor; averaged baseline, not instant
+ADAPT_FIRE_MARGIN = 0.015   # Extra rise above adapt_thresh required to fire
 WEIGHTING_ON  = False
-INPUT_GAIN_DB = 0  # Input gain in dB (-24 to +24), 0 = unity gain
+# INPUT_GAIN_DB / limits defined with CONFIG_FILE (loaded by load_defaults_mode)
 BRIGHTNESS    = DEFAULT_BRIGHT
+
+# Which stereo channel feeds the FFT/trigger (many USB interfaces use Input 1 = left, not right).
+# Set env AUDIO_INPUT_CHANNEL=left | right | mix  (default right = index 1, legacy Scarlett line-in note)
+_ai_ch = os.environ.get("AUDIO_INPUT_CHANNEL", "right").strip().lower()
+if _ai_ch in ("0", "l", "left", "1l"):
+    AUDIO_INPUT_CHANNEL_MODE = "left"
+elif _ai_ch in ("mix", "mono", "both", "avg", "stereo"):
+    AUDIO_INPUT_CHANNEL_MODE = "mix"
+else:
+    AUDIO_INPUT_CHANNEL_MODE = "right"
 
 def db_to_linear(db):
     """Convert dB to linear gain multiplier."""
     return 10 ** (db / 20.0)
+
+def input_gain_relative_db():
+    """UI gain relative to INPUT_GAIN_REF_DB (0 = default calmer level)."""
+    return INPUT_GAIN_DB - INPUT_GAIN_REF_DB
+
+def format_input_gain_display():
+    """e.g. '0dB' at ref, '+6dB' hotter, '-6dB' quieter."""
+    r = input_gain_relative_db()
+    if r == 0:
+        return "0dB"
+    return f"{r:+d}dB"
 
 # Threshold detection modes
 THRESH_MODES = ["fixed", "adapt"]
@@ -444,12 +505,57 @@ TRIGGER_SPEED_MIN_MULT = 0.3  # Minimum multiplier for fast triggers (dampens ef
 TRIGGER_SPEED_MAX_MULT = 2.0  # Maximum multiplier for slow triggers
 
 # Detection modes for FFT analysis
-# - "level": Uses absolute energy level (original behavior)
-# - "flux": Uses spectral flux (onset detection, better for drums/transients)
-# - "hybrid": Combines level with flux boost (default, best of both)
-# - "transient": Onset detection comparing instantaneous vs running average (best for kicks)
+# - "level": Uses absolute energy level — matches FFT bars vs threshold (WYSIWYG); default
+# - "flux": Spectral flux (onset-heavy)
+# - "hybrid": Level + onset/flux boost
+# - "transient": Onset ratio + flux
 DETECT_MODES = ["level", "flux", "hybrid", "transient"]
-DETECT_MODE_INDEX = 2  # Default to hybrid mode
+
+
+def load_detect_mode_index():
+    """Load detect_mode_index from .dmx_config; default 0 = level."""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("detect_mode_index="):
+                        idx = int(line.split("=", 1)[1].strip())
+                        if 0 <= idx < len(DETECT_MODES):
+                            return idx
+    except Exception:
+        pass
+    return 0
+
+
+def save_detect_mode_index():
+    """Persist detect mode to config (merge line into existing file)."""
+    try:
+        new_line = f"detect_mode_index={DETECT_MODE_INDEX}\n"
+        lines = []
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                lines = f.readlines()
+        out = []
+        found = False
+        for line in lines:
+            if line.strip().startswith("detect_mode_index="):
+                out.append(new_line)
+                found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append(new_line)
+        with open(CONFIG_FILE, "w") as f:
+            f.writelines(out)
+    except Exception:
+        pass
+
+
+DETECT_MODE_INDEX = load_detect_mode_index()
+# Optional: FORCE_DETECT_LEVEL=1 always use level (WYSIWYG with threshold line)
+if os.environ.get("FORCE_DETECT_LEVEL", "").strip() in ("1", "true", "yes"):
+    DETECT_MODE_INDEX = 0
 
 # Beat detection method: 0 = FFT_STANDARD (Q-band analysis)
 # 3-band mode has been removed - now using FFT-only mode
@@ -522,7 +628,7 @@ OLED_GRAY = (128, 128, 128)
 # Submenu tabs (cycled by reset button)
 SUBMENU_TABS = ["Presets", "Settings", "Setup"]
 submenu_tab = 0        # 0=PRE, 1=SET, 2=SETUP
-submenu_column = 0     # 0-2 for which column is selected
+submenu_column = 0     # Column index; max depends on tab (Settings: 0–1 only)
 submenu_editing = False  # True when encoder 1 is editing selected column value
 
 # Submenu column labels for each tab
@@ -543,7 +649,7 @@ _home_enc3_alt = False  # False = Thresh, True = ThreshMode
 _home_enc4_alt = False  # False = Release, True = ReleaseMode
 
 # Encoder toggle states for Settings submenu tab
-_setup_enc3_detect = False    # False = Input Gain, True = Detection Mode
+_setup_enc3_detect = False    # Settings: enc3 button toggles Trigger vs Detect; rotation matches selected mode
 _setup_enc4_channels = False  # False = DMX Output Mode, True = Channel Count
 
 # Legacy compatibility - keep current_page and get_pages() for remaining references
@@ -582,11 +688,36 @@ PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "SWAP", "RANDOM", "AMBIENT"]
 
 # ===================== FFT Display =====================
 
-# FFT settings - 32 bands, 20Hz to 16kHz
+# FFT settings - 32 bands, 20Hz–16kHz (smooth EQ-style spectrum, similar feel to a DAW analyzer)
 FFT_MIN_FREQ = 20
 FFT_MAX_FREQ = 16000
 FFT_NUM_BANDS = 32
 FFT_SIZE = 1024  # Zero-pad to 1024 for ~43Hz resolution (tradeoff: faster FFT vs freq precision)
+
+# Optional DSP on the FFT path (defaults off for “normal” full-range analyzer like EQ Eight spectrum)
+FFT_HPF_HZ = float(os.environ.get("FFT_HPF_HZ", "0"))  # 0 = off; set e.g. 40 to cut sub rumble
+FFT_SPECTRAL_FLOOR = float(os.environ.get("FFT_SPECTRAL_FLOOR", "0"))  # After auto-scale; 0 = no squashing
+FFT_FLUX_DEADZONE = float(os.environ.get("FFT_FLUX_DEADZONE", "0"))  # 0 = raw spectral flux
+FFT_HYBRID_MIN_LEVEL = float(os.environ.get("FFT_HYBRID_MIN_LEVEL", "0.07"))  # Hybrid detect mode only
+
+def apply_fft_highpass(x, sr, hz, y_prev, x_prev):
+    """Stateful first-order high-pass (RC) across callbacks. hz<=0 returns x unchanged."""
+    if hz <= 0.0 or x is None or len(x) == 0:
+        return x, y_prev, x_prev
+    rc = 1.0 / (2.0 * math.pi * max(hz, 1.0))
+    dt = 1.0 / sr
+    alpha = rc / (rc + dt)
+    y = float(y_prev)
+    xp = float(x_prev)
+    out = np.empty(x.shape[0], dtype=np.float32)
+    xv = np.asarray(x, dtype=np.float32)
+    n = int(xv.shape[0])
+    for i in range(n):
+        xi = float(xv[i])
+        y = alpha * (y + xi - xp)
+        out[i] = y
+        xp = xi
+    return out, y, xp
 
 def generate_log_bands(num_bands, min_freq, max_freq):
     """Generate logarithmically spaced frequency bands with low-end compression.
@@ -596,9 +727,9 @@ def generate_log_bands(num_bands, min_freq, max_freq):
     """
     bands = []
     
-    # Warp factor: higher values compress low frequencies more
-    # 0.0 = pure log scale, 0.3 = moderate compression
-    warp = 0.3
+    # Warp factor: lower = closer to pure log (cleaner, more “EQ analyzer” spread); higher compresses lows
+    # 0.0 = pure log; ~0.12 = mild low-end emphasis without heavy bunching
+    warp = 0.12
     
     for i in range(num_bands):
         # Linear position 0-1
@@ -679,6 +810,8 @@ def get_all_band_energies_vectorized(fft_mag):
 
 # Visual gain for FFT display (makes bars appear taller within fixed view)
 FFT_VISUAL_GAIN = 1.0
+# Solid gray fill for Q-band energy above threshold (SSD1322 grayscale; distinct from white body)
+FFT_ABOVE_THRESH_FILL = (168, 168, 168)
 
 # FFT state (numpy arrays for faster vectorized operations)
 fft_bands = np.zeros(len(FFT_BANDS), dtype=np.float32)
@@ -686,11 +819,30 @@ fft_peaks = np.zeros(len(FFT_BANDS), dtype=np.float32)
 fft_peak_times = np.zeros(len(FFT_BANDS), dtype=np.float64)
 PEAK_HOLD_TIME = 0.4
 fft_recent_max = 0.3
-fft_max_decay = 0.995
+fft_max_decay = 0.995  # Classic analyzer: smooth level changes, stable overall scale
+# Cap per-hop rise of the auto-scale max — stops one loud band from instantly rescaling everything (low-end “glitch”)
+FFT_SCALE_MAX_JUMP_RATIO = 1.32  # looser = scale catches loud hits faster (better short kicks)
+FFT_SCALE_MAX_JUMP_ABS = 0.018
+# When the whole spectrum drops a lot (kick gone), pull the scale down faster so lows don’t “stutter” against a stale peak
+FFT_SCALE_COLLAPSE_RATIO = 0.48   # if current_max < this * fft_recent_max, accelerate scale down
+FFT_SCALE_COLLAPSE_PULL = 0.984   # multiply stale peak each hop while collapsed (higher = gentler)
+FFT_SCALE_COLLAPSE_FLOOR_MUL = 1.07  # don’t sit below current_max * this (headroom)
+# Faster bar decay on the lowest columns only (same smoothing as mids on attack)
+FFT_LOW_DECAY_BANDS = 4
+FFT_LOW_DECAY_MULT = 0.86   # per hop when falling; mids use 0.92 below
+# Optional extra EMA on the lowest N bands. Default 0: same attack/decay as rest of spectrum
+# (old default 4 @ 0.62 made <~100Hz columns fall much slower). Set FFT_LOW_BAND_COUNT=4 to restore.
+FFT_LOW_BAND_COUNT = int(os.environ.get("FFT_LOW_BAND_COUNT", "0"))
+FFT_LOW_SMOOTH_COEF = float(os.environ.get("FFT_LOW_SMOOTH_COEF", "0.62"))
+
+# High-pass state (rumble / DC)
+_fft_hp_y = 0.0
+_fft_hp_x_prev = 0.0
 
 # Spectral flux state for onset/transient detection
 prev_band_energies = np.zeros(len(FFT_BANDS), dtype=np.float32)
 fft_flux = np.zeros(len(FFT_BANDS), dtype=np.float32)
+_fft_low_smooth = np.zeros(len(FFT_BANDS), dtype=np.float32)
 
 # Per-band normalization state (spectral whitening)
 band_running_mean = [0.01] * len(FFT_BANDS)
@@ -1830,10 +1982,32 @@ def _apply_encoder_delta(enc_idx, direction):
             return
         
         # ===== Encoder 3 (enc_idx=2): Trigger Threshold/ThreshMode (disabled in AMBIENT) =====
+        # On Settings tab: Detection Mode when _setup_enc3_detect; else same Trigger knob as HOME (band.thresh).
+        # Input gain is encoder 1 edit on Settings "Gain" column only.
         if enc_idx == 2:
+            global DETECT_MODE_INDEX
             if BASE_PROGRAM == 6:
                 return
-            if _home_enc3_alt:
+            # Check if on Settings submenu tab
+            if SUBMENU_TABS[submenu_tab] == "Settings":
+                if _setup_enc3_detect:
+                    # Detection mode (level/flux/hybrid/transient)
+                    now = time.time()
+                    elapsed_ms = (now - _discrete_last_change[2]) * 1000
+                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
+                        delta = 1 if direction > 0 else -1
+                        new_idx = max(0, min(len(DETECT_MODES) - 1, DETECT_MODE_INDEX + delta))
+                        if new_idx != DETECT_MODE_INDEX:
+                            DETECT_MODE_INDEX = new_idx
+                            _discrete_last_change[2] = now
+                            save_detect_mode_index()
+                            ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.5)
+                else:
+                    # Trigger threshold (matches bottom-row "Trigger" label while on Settings)
+                    mult = max(1.0, _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH))
+                    delta = base_delta * mult
+                    band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
+            elif _home_enc3_alt:
                 now = time.time()
                 elapsed_ms = (now - _discrete_last_change[2]) * 1000
                 if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
@@ -2236,10 +2410,9 @@ def _handle_submenu_value_change(direction):
     elif tab == "Settings":
         if col == 0:
             # Input gain in dB (-24 to +24, step by 1dB) - saved to config for persistence
-            INPUT_GAIN_DB = max(-24, min(24, INPUT_GAIN_DB + direction))
+            INPUT_GAIN_DB = max(INPUT_GAIN_MIN_DB, min(INPUT_GAIN_MAX_DB, INPUT_GAIN_DB + direction))
             save_input_gain(INPUT_GAIN_DB)
-            sign = "+" if INPUT_GAIN_DB > 0 else ""
-            ui_flash(f"Gain: {sign}{INPUT_GAIN_DB}dB", 0.5)
+            ui_flash(f"Gain: {format_input_gain_display()}", 0.5)
         elif col == 1:
             # Reset - cycle through presets (clamped, no looping)
             global DEFAULTS_MODE_INDEX
@@ -2355,8 +2528,13 @@ def encoder_reader():
                         # Editing mode: adjust the selected column's value
                         _handle_submenu_value_change(direction)
                     else:
-                        # Selection mode: move between columns 0-2
-                        submenu_column = max(0, min(2, submenu_column + direction))
+                        # Selection mode: move between columns (Settings has only Gain + Defaults)
+                        _max_submenu_col = (
+                            1 if SUBMENU_TABS[submenu_tab] == "Settings" else 2
+                        )
+                        submenu_column = max(
+                            0, min(_max_submenu_col, submenu_column + direction)
+                        )
                 
                 enc1_sw = GPIO.input(ENC1_SW)
                 global _enc1_press_time, _enc1_save_progress, _enc1_save_complete
@@ -2453,12 +2631,22 @@ def encoder_reader():
                 elif enc3_sw == 0 and _enc_last_sw[2] == 1:
                     time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC3_SW) == 0:
-                        # Toggle Thresh/ThreshMode for HOME controls
-                        _home_enc3_alt = not _home_enc3_alt
-                        if _home_enc3_alt:
-                            ui_flash("Mode: Th-Mode", 0.5)
+                        global _setup_enc3_detect
+                        # Check if on Settings submenu tab
+                        if SUBMENU_TABS[submenu_tab] == "Settings":
+                            # Toggle Trigger (FFT thresh) vs Detect mode for Settings tab
+                            _setup_enc3_detect = not _setup_enc3_detect
+                            if _setup_enc3_detect:
+                                ui_flash("Mode: Detect", 0.5)
+                            else:
+                                ui_flash("Mode: Trigger", 0.5)
                         else:
-                            ui_flash("Mode: Trigger", 0.5)
+                            # Toggle Thresh/ThreshMode for HOME controls
+                            _home_enc3_alt = not _home_enc3_alt
+                            if _home_enc3_alt:
+                                ui_flash("Mode: Th-Mode", 0.5)
+                            else:
+                                ui_flash("Mode: Trigger", 0.5)
                         # Non-blocking: mark awaiting release to prevent double-toggle
                         _enc_awaiting_release[2] = True
                 _enc_last_sw[2] = enc3_sw
@@ -2477,12 +2665,22 @@ def encoder_reader():
                 elif enc4_sw == 0 and _enc_last_sw[3] == 1:
                     time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC4_SW) == 0:
-                        # Toggle Release/ReleaseMode for HOME controls
-                        _home_enc4_alt = not _home_enc4_alt
-                        if _home_enc4_alt:
-                            ui_flash("Mode: R-Mode", 0.5)
+                        global _setup_enc4_channels
+                        # Check if on Settings submenu tab
+                        if SUBMENU_TABS[submenu_tab] == "Settings":
+                            # Toggle Setup/Chans for Settings tab
+                            _setup_enc4_channels = not _setup_enc4_channels
+                            if _setup_enc4_channels:
+                                ui_flash("Mode: Chans", 0.5)
+                            else:
+                                ui_flash("Mode: Setup", 0.5)
                         else:
-                            ui_flash("Mode: Release", 0.5)
+                            # Toggle Release/ReleaseMode for HOME controls
+                            _home_enc4_alt = not _home_enc4_alt
+                            if _home_enc4_alt:
+                                ui_flash("Mode: R-Mode", 0.5)
+                            else:
+                                ui_flash("Mode: Release", 0.5)
                         # Non-blocking: mark awaiting release to prevent double-toggle
                         _enc_awaiting_release[3] = True
                 _enc_last_sw[3] = enc4_sw
@@ -2621,9 +2819,12 @@ def audio_loop():
     band.attack_ms = DEFAULT_ATTACK_MS
     frame_dt_ms = (HOP / SR) * 1000.0
     was_above = False
+    _hysteresis_armed = True
+    _adapt_armed = True
+    _q_band_smooth = 0.0
 
     def cb(indata, frames, time_info, status):
-        nonlocal was_above
+        nonlocal was_above, _hysteresis_armed, _adapt_armed, _q_band_smooth
         global live_band_env, live_threshold, input_rms
         global last_trigger_ts, chase_idx, group34_phase, group12_phase
         global PROGRAM, BASE_PROGRAM, CYCLE_STEPS, CYCLE_TRIGGER_COUNT, CYCLE_PHASE, CYCLE_AMBIENT_START
@@ -2633,18 +2834,26 @@ def audio_loop():
         global _trigger_speed_multiplier
         global prev_band_energies, fft_flux, band_running_mean, band_running_max
         global _q_band_running_avg, _flux_recent_max
+        global _fft_hp_y, _fft_hp_x_prev
+        global _fft_low_smooth
 
         if not RUNNING:
             return
 
-        # Handle mono vs stereo input
-        # For stereo: use channel 1 (Input 2 on Scarlett Solo - the line input on back)
-        # For mono: use the single channel available
+        # Mono vs stereo — channel selectable via AUDIO_INPUT_CHANNEL (see module constant)
         if indata.shape[1] >= 2:
-            x = indata[:, 1].astype(np.float32)
+            if AUDIO_INPUT_CHANNEL_MODE == "left":
+                x = indata[:, 0].astype(np.float32)
+            elif AUDIO_INPUT_CHANNEL_MODE == "mix":
+                x = (0.5 * (indata[:, 0].astype(np.float32) + indata[:, 1].astype(np.float32)))
+            else:
+                x = indata[:, 1].astype(np.float32)
         else:
             x = indata[:, 0].astype(np.float32)
         x = x * db_to_linear(INPUT_GAIN_DB)  # Apply input gain (dB)
+        # Optional high-pass before FFT (off by default for full-range EQ-style display)
+        if FFT_HPF_HZ > 0:
+            x, _fft_hp_y, _fft_hp_x_prev = apply_fft_highpass(x, SR, FFT_HPF_HZ, _fft_hp_y, _fft_hp_x_prev)
         input_rms = float(np.sqrt(np.mean(x*x)) + 1e-12)
 
         # FFT analysis for display - zero-padded for better frequency resolution
@@ -2671,8 +2880,9 @@ def audio_loop():
             db_vals = np.where(band_energies > 1e-10, 20.0 * np.log10(band_energies + 1e-10), -100.0)
         raw_levels = np.clip((db_vals + 60.0) / 50.0, 0.0, None)
         
-        # Calculate spectral flux (onset detection) before updating prev_band_energies
         fft_flux = get_spectral_flux(raw_levels, prev_band_energies)
+        if FFT_FLUX_DEADZONE > 0:
+            fft_flux = np.maximum(0.0, fft_flux - FFT_FLUX_DEADZONE)
         prev_band_energies = raw_levels.copy()
         
         # ===== 3-Band Onset Detector =====
@@ -2693,17 +2903,44 @@ def audio_loop():
         # Auto-normalize FFT (vectorized for performance)
         current_max = float(np.max(raw_levels)) if len(raw_levels) > 0 else 0
         if current_max > fft_recent_max:
-            fft_recent_max = current_max
+            # Rate-limit scale jumps: avoids full spectrum “twitch” when max bin changes abruptly (common on kicks)
+            jump_cap = fft_recent_max * FFT_SCALE_MAX_JUMP_RATIO + FFT_SCALE_MAX_JUMP_ABS
+            fft_recent_max = min(current_max, jump_cap)
         else:
             fft_recent_max = fft_recent_max * fft_max_decay
+            # Peak collapsed (typical after a kick): ease divisor down so normalized lows aren’t glued / stair-stepping
+            if fft_recent_max > 0.12 and current_max < fft_recent_max * FFT_SCALE_COLLAPSE_RATIO:
+                floor_from_peak = max(current_max * FFT_SCALE_COLLAPSE_FLOOR_MUL, 0.08)
+                fft_recent_max = max(floor_from_peak, fft_recent_max * FFT_SCALE_COLLAPSE_PULL)
         
         norm_factor = max(0.1, fft_recent_max)
         normalized = np.minimum(1.0, raw_levels / norm_factor)
+        if FFT_SPECTRAL_FLOOR > 0:
+            normalized = np.maximum(0.0, normalized - FFT_SPECTRAL_FLOOR)
         
-        # Vectorized attack/decay
+        # Bar motion: snappier attack so short kicks still reach threshold; smooth decay (EQ-like tail)
         attack_mask = normalized > fft_bands
-        fft_bands[attack_mask] = 0.7 * normalized[attack_mask] + 0.3 * fft_bands[attack_mask]
-        fft_bands[~attack_mask] = 0.88 * fft_bands[~attack_mask]
+        fft_bands[attack_mask] = 0.68 * normalized[attack_mask] + 0.32 * fft_bands[attack_mask]
+        # Slightly faster decay on lowest bands — they share few FFT bins and otherwise lag the rest of the spectrum
+        n_low_dec = min(FFT_LOW_DECAY_BANDS, len(fft_bands))
+        if n_low_dec > 0:
+            idx = np.arange(len(fft_bands), dtype=np.int32)
+            low_m = idx < n_low_dec
+            fall_m = (~attack_mask) & low_m
+            rest_fall = (~attack_mask) & (~low_m)
+            fft_bands[fall_m] = FFT_LOW_DECAY_MULT * fft_bands[fall_m]
+            fft_bands[rest_fall] = 0.92 * fft_bands[rest_fall]
+        else:
+            fft_bands[~attack_mask] = 0.92 * fft_bands[~attack_mask]
+        
+        # Soften lowest columns only (sub/kick share few bins; auto-scale + leakage = visible flicker)
+        nls = min(FFT_LOW_BAND_COUNT, len(fft_bands))
+        if nls > 0:
+            if _fft_low_smooth.shape[0] != fft_bands.shape[0]:
+                _fft_low_smooth = np.zeros_like(fft_bands)
+            c = FFT_LOW_SMOOTH_COEF
+            _fft_low_smooth[:nls] = c * _fft_low_smooth[:nls] + (1.0 - c) * fft_bands[:nls]
+            fft_bands[:nls] = _fft_low_smooth[:nls]
         
         # Vectorized peak tracking
         new_peak_mask = fft_bands > fft_peaks
@@ -2719,72 +2956,68 @@ def audio_loop():
         low_freq = max(FFT_MIN_FREQ, clamped_center - bandwidth / 2)
         high_freq = min(FFT_MAX_FREQ, clamped_center + bandwidth / 2)
         
-        # Use the SAME fft_bands values that are displayed on screen
-        # This ensures the trigger matches exactly what you see
-        display_max_in_q = 0.0
-        q_flux_max = 0.0
+        # Use the SAME fft_bands values that are displayed on screen.
+        # Mean across columns whose centers fall inside the Q window — wide bands no longer
+        # misfire from a single spiky bin (max was too twitchy); threshold compares to average energy.
+        sum_level_in_q = 0.0
+        sum_flux_in_q = 0.0
+        n_overlap = 0
         for i, (band_low, band_high) in enumerate(FFT_BANDS):
             band_center_freq = math.sqrt(band_low * band_high)
             if low_freq <= band_center_freq <= high_freq:
-                display_max_in_q = max(display_max_in_q, fft_bands[i])
-                q_flux_max = max(q_flux_max, fft_flux[i])
+                sum_level_in_q += float(fft_bands[i])
+                sum_flux_in_q += float(fft_flux[i])
+                n_overlap += 1
+        if n_overlap > 0:
+            display_mean_in_q = sum_level_in_q / n_overlap
+            q_flux_mean = sum_flux_in_q / n_overlap
+        else:
+            display_mean_in_q = 0.0
+            q_flux_mean = 0.0
         
-        # Combine level and flux based on detection mode
+        # Same scale as OLED (_draw_fft_spectrum uses level * FFT_VISUAL_GAIN vs thresh).
+        # Previously hybrid/flux/transient inflated q_band_max above the bars, and extra envelope lag
+        # caused triggers when bars looked below the line (or missed when they looked above).
+        q_band_max = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
+        
+        # Optional alternate detection (Settings): still compute for diagnostics / future use
         detect_mode = DETECT_MODES[DETECT_MODE_INDEX]
+        if detect_mode != "level":
+            if detect_mode == "flux":
+                _flux_recent_max = max(_flux_recent_max * 0.99, q_flux_mean)
+                q_band_max = q_flux_mean / max(0.001, _flux_recent_max)
+            elif detect_mode == "hybrid":
+                base = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
+                _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base
+                if base >= FFT_HYBRID_MIN_LEVEL:
+                    onset_ratio = base / max(0.01, _q_band_running_avg)
+                    onset_boost = min(0.3, max(0.0, (onset_ratio - 1.2) * 0.25))
+                    flux_boost = min(0.15, q_flux_mean * 2.0)
+                    q_band_max = min(1.0, base + onset_boost + flux_boost)
+                else:
+                    q_band_max = base
+            elif detect_mode == "transient":
+                base_vis = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
+                onset_ratio = base_vis / max(0.01, _q_band_running_avg)
+                _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base_vis
+                onset_score = min(1.0, max(0.0, (onset_ratio - 1.0) / 2.0))
+                flux_score = min(1.0, q_flux_mean * 4.0)
+                q_band_max = max(onset_score, flux_score)
         
-        if detect_mode == "level":
-            # Pure level mode - use display values directly (what you see = what triggers)
-            q_band_max = display_max_in_q
-        elif detect_mode == "flux":
-            # Pure flux mode - uses spectral flux for onset/transient detection
-            # Better for drums and percussive sounds
-            # Auto-normalized so threshold values make sense (0-1 range)
-            _flux_recent_max = max(_flux_recent_max * 0.99, q_flux_max)  # Track recent max
-            q_band_max = q_flux_max / max(0.001, _flux_recent_max)  # Normalized 0-1
-        elif detect_mode == "hybrid":
-            # Hybrid mode - use display level but boost with flux for transients
-            flux_boost = min(0.15, q_flux_max * 1.5)  # Flux adds up to 0.15 boost
-            q_band_max = min(1.0, display_max_in_q + flux_boost)
-        else:  # "transient"
-            # Transient mode - onset detection optimized for kicks/drums
-            # Compares instantaneous energy to running average
-            
-            # Onset ratio: how much current exceeds recent average
-            # Kicks have high ratio (sudden spike), sustained bass has low ratio
-            onset_ratio = display_max_in_q / max(0.01, _q_band_running_avg)
-            
-            # Update running average (slow decay = remembers recent energy)
-            _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * display_max_in_q
-            
-            # Normalize onset_ratio to 0-1 range (ratio of 3+ = strong transient)
-            onset_score = min(1.0, max(0.0, (onset_ratio - 1.0) / 2.0))
-            
-            # Also use flux as a secondary transient indicator
-            flux_score = min(1.0, q_flux_max * 4.0)
-            
-            # Take max of onset and flux (either indicates transient)
-            q_band_max = max(onset_score, flux_score)
-        
-        # Get envelope smoothing - transient mode uses faster timing for sharp transient tracking
-        if detect_mode == "transient":
-            attack_ms, release_ms = (2.0, 40.0)  # Very fast attack/release for transients
+        # Light temporal smoothing on q_band_max to dampen single-hop FFT spikes
+        _q_band_smooth = Q_BAND_SMOOTH_COEF * _q_band_smooth + (1.0 - Q_BAND_SMOOTH_COEF) * q_band_max
+        # Envelope: instant attack (track displayed bars), smooth release only (reduces threshold chatter)
+        if _q_band_smooth >= live_band_env:
+            live_band_env = _q_band_smooth
         else:
-            attack_ms, release_ms = get_envelope_times(clamped_center)
-        # Calculate EMA coefficient based on attack time (faster attack = lower coefficient)
-        freq_ema = math.exp(-1.0 / (max(1e-3, attack_ms) * 1e-3 * SR / HOP))
-        
-        # Smooth the trigger envelope with frequency-appropriate response
-        if q_band_max > live_band_env:
-            # Attack: use frequency-dependent faster response
-            v = freq_ema * live_band_env + (1.0 - freq_ema) * q_band_max
-        else:
-            # Release: use standard smoothing
-            v = ENV_EMA * live_band_env + (1.0 - ENV_EMA) * q_band_max
-        live_band_env = v
+            live_band_env = ENV_EMA * live_band_env + (1.0 - ENV_EMA) * _q_band_smooth
         live_threshold = band.thresh
 
         # Update tracking variable for adaptive threshold mode
-        _recent_min = min(_recent_min * 1.005, live_band_env)  # Slowly rise back up
+        if live_band_env < _recent_min:
+            _recent_min = ADAPT_FLOOR_EMA * _recent_min + (1.0 - ADAPT_FLOOR_EMA) * live_band_env
+        else:
+            _recent_min = min(_recent_min * 1.005, live_band_env)  # Slowly drift up when env above floor
 
         above = (live_band_env >= band.thresh)
         can_fire = ((now - last_trigger_ts)*1000.0 >= REFRACTORY_MS)
@@ -2824,18 +3057,30 @@ def audio_loop():
             # Use the selected band's adaptive threshold for display
             _effective_thresh = three_band_detector.get_adaptive_threshold(THREEBAND_SELECTED)
         elif thresh_mode == "fixed":
-            # FFT_STANDARD: Fixed edge-triggered (only triggers once when crossing above threshold)
+            # FFT_STANDARD: Fixed edge-triggered with hysteresis — re-arm when env falls below
+            # thresh - margin; fire only when crossing above thresh + margin. Reduces misfires.
+            fire_thresh = band.thresh + HYST_FIRE_MARGIN
+            rearm_thresh = band.thresh - HYST_REARM_MARGIN
+            if live_band_env < rearm_thresh:
+                _hysteresis_armed = True
+            above_hyst = live_band_env >= fire_thresh
             _effective_thresh = band.thresh
-            should_trigger = above and not was_above and can_fire
+            should_trigger = above_hyst and not was_above and can_fire and _hysteresis_armed
+            if should_trigger:
+                _hysteresis_armed = False
+            above = above_hyst  # For was_above: track hysteresis crossing, not simple thresh
         elif thresh_mode == "adapt":
-            # FFT_STANDARD: Adaptive - trigger on rise above recent minimum
-            # Scale threshold: 0=very sensitive (0.02 rise), 99=less sensitive (0.6 rise)
+            # FFT_STANDARD: Adaptive - trigger on rise above recent minimum, with hysteresis
             adapt_thresh = 0.02 + band.thresh * 0.58
+            fire_thresh = adapt_thresh + ADAPT_FIRE_MARGIN
+            if live_band_env < _recent_min - ADAPT_REARM_MARGIN:
+                _adapt_armed = True
             relative_rise = live_band_env - _recent_min
             _effective_thresh = min(1.0, _recent_min + adapt_thresh)  # Show where trigger point is
-            should_trigger = relative_rise >= adapt_thresh and can_fire
+            should_trigger = relative_rise >= fire_thresh and can_fire and _adapt_armed
             if should_trigger:
                 _recent_min = live_band_env  # Reset after trigger
+                _adapt_armed = False
 
         if should_trigger and active_prog in (1, 2, 3, 4, 5):
             # Calculate time since last trigger for speed multiplier
@@ -2996,8 +3241,14 @@ def audio_loop():
             with sd.InputStream(device=DEVICE_INDEX, channels=try_channels, samplerate=SR, blocksize=HOP, callback=cb):
                 stream_opened = True
                 APP_STATE = "ready"
-                if AUDIO_DEBUG or try_channels != DEVICE_CHANNELS:
-                    print(f"[AUDIO] Using device {DEVICE_INDEX}: {DEVICE_NAME} ({try_channels}ch)")
+                if try_channels >= 2:
+                    cap = f"stereo→{AUDIO_INPUT_CHANNEL_MODE} (env AUDIO_INPUT_CHANNEL=left|right|mix)"
+                else:
+                    cap = "mono single channel index 0 only (AUDIO_INPUT_CHANNEL ignored)"
+                print(
+                    f"[AUDIO] device {DEVICE_INDEX}: {DEVICE_NAME} ({try_channels}ch) {cap}",
+                    flush=True,
+                )
                 while not STOP_THREADS:
                     time.sleep(0.05)
         except Exception as e:
@@ -3111,14 +3362,49 @@ class OledUI:
         
         return int(x_start + t_display * (width - 1))
 
+    def _draw_fft_contrast_vline(self, draw, x, y0, y1, x_min, x_max):
+        """Single-pixel vertical dashed marker (visible on black and over white bars)."""
+        x = int(round(x))
+        x = max(x_min, min(x_max, x))
+        y0, y1 = int(y0), int(y1)
+        if y0 > y1:
+            y0, y1 = y1, y0
+        for yy in range(y0, y1 + 1):
+            fill = OLED_BLACK if yy % 3 == 2 else OLED_WHITE
+            draw.point((x, yy), fill=fill)
+
+    def _draw_fft_contrast_hline(
+        self, draw, x0, x1, y, y_min, y_max, x_min, x_max, emphasis=False
+    ):
+        """Dashed threshold ruler; when emphasis (level above line), thicker 2-row inverse band."""
+        y = int(round(y))
+        if y < y_min or y > y_max:
+            return
+        x0, x1 = int(x0), int(x1)
+        if x0 > x1:
+            x0, x1 = x1, x0
+        x0 = max(x_min, x0)
+        x1 = min(x_max, x1)
+        period = 4 if emphasis else 7
+        gap = 2 if emphasis else 2  # black run length at end of period
+        for px in range(x0, x1 + 1):
+            pos = (px + y) % period
+            main_white = pos < period - gap
+            draw.point((px, y), fill=OLED_WHITE if main_white else OLED_BLACK)
+            if emphasis and y - 1 >= y_min:
+                # Inverted row above: reads as a 2px-tall zipper, obvious vs idle single row
+                draw.point(
+                    (px, y - 1), fill=OLED_BLACK if main_white else OLED_WHITE
+                )
+
     def _draw_fft_spectrum(self, draw, x, y, width, height):
         """Draw FFT spectrum with Q band highlighting and beat indicator.
         - Left: Beat indicator bar showing live_band_env with trigger flash
-        - Bars inside Q range above threshold: horizontal stripes (triggering zone)
-        - Bars inside Q range below threshold: solid fill
-        - Bars outside Q range: single-pixel outline
-        - Q range boundaries: vertical lines
-        - Threshold line: horizontal within Q range"""
+        - Q styling (gray above threshold / white body) only in x between frequency markers
+          (same span as vertical lines; bars are equal-width so we clip per band to that x range)
+        - Outside that x span: solid white bars
+        - Q range boundaries: thin dashed vertical markers
+        - Threshold: dashed ruler; becomes a 2-row inverted band when Q audio crosses above it"""
         
         # FFT spectrum uses full width
         fft_x = x
@@ -3134,12 +3420,15 @@ class OledUI:
         
         low_x = self._freq_to_x(low_freq, fft_x, fft_width)
         high_x = self._freq_to_x(high_freq, fft_x, fft_width)
+        q_x0 = min(low_x, high_x)
+        q_x1 = max(low_x, high_x)
         # Threshold line position: _effective_thresh is 0.0-1.0, UI shows 0-99
         # thresh=0 (UI 0) = line at bottom, thresh=1.0 (UI 99) = line at top
         thresh_y = y + height - int(_effective_thresh * height)
         
         # Calculate bar positions to fill the entire width (no gaps)
         bar_step = fft_width / num_bands
+        any_q_above_thresh = False
         
         for i, level in enumerate(fft_bands):
             bx_start = fft_x + int(i * bar_step)
@@ -3157,43 +3446,63 @@ class OledUI:
             # Clip to view height (bars can exceed view with visual gain)
             bar_h = min(bar_h, height)
             
-            # Get the center frequency of this band
-            band_low, band_high = FFT_BANDS[i]
-            band_center = math.sqrt(band_low * band_high)
-            
-            # Check if this band is within the Q range
-            in_q_range = (band_center >= low_freq and band_center <= high_freq)
-            
             bar_top = y + height - bar_h
             bar_bottom = y + height - 1
             
-            if in_q_range:
-                # Check if bar crosses threshold line
+            # Q highlight must match vertical markers in *pixel* space. Bars are uniform width
+            # but markers use _freq_to_x; frequency-only tests misalign gray caps with lines.
+            sx = max(bx_start, q_x0)
+            ex = min(bx_end, q_x1)
+            q_overlap = sx <= ex
+            
+            # Outside-Q portions of this bar (same solid white as non-Q bars)
+            if bx_start < q_x0:
+                left_end = min(bx_end, q_x0 - 1)
+                if bx_start <= left_end:
+                    draw.rectangle(
+                        (bx_start, bar_top, left_end, bar_bottom), fill=OLED_WHITE
+                    )
+            if bx_end > q_x1:
+                right_start = max(bx_start, q_x1 + 1)
+                if right_start <= bx_end:
+                    draw.rectangle(
+                        (right_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE
+                    )
+            
+            if q_overlap:
                 if bar_top < thresh_y:
-                    # Part above threshold - horizontal stripes (triggering zone)
+                    any_q_above_thresh = True
                     above_top = bar_top
                     above_bottom = min(thresh_y - 1, bar_bottom)
                     if above_top <= above_bottom:
-                        for py in range(above_top, above_bottom + 1, 2):
-                            draw.line((bx_start, py, bx_end, py), fill=OLED_WHITE)
-                    
-                    # Part below threshold - solid fill
+                        draw.rectangle(
+                            (sx, above_top, ex, above_bottom),
+                            fill=FFT_ABOVE_THRESH_FILL,
+                        )
                     if thresh_y <= bar_bottom:
-                        draw.rectangle((bx_start, thresh_y, bx_end, bar_bottom), fill=OLED_WHITE)
+                        draw.rectangle((sx, thresh_y, ex, bar_bottom), fill=OLED_WHITE)
                 else:
-                    # Entirely below threshold - solid fill
-                    draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
-            else:
-                # Solid fill for bands outside Q range
-                draw.rectangle((bx_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
+                    draw.rectangle((sx, bar_top, ex, bar_bottom), fill=OLED_WHITE)
         
-        # Draw Q range boundary lines (vertical)
-        draw.line((low_x, y, low_x, y + height - 1), fill=OLED_WHITE)
-        draw.line((high_x, y, high_x, y + height - 1), fill=OLED_WHITE)
+        x_right = fft_x + fft_width - 1
+        y_bottom = y + height - 1
+        # Q range boundaries: contrast stripes (plain white vlines vanish on white bars)
+        self._draw_fft_contrast_vline(draw, low_x, y, y_bottom, fft_x, x_right)
+        self._draw_fft_contrast_vline(draw, high_x, y, y_bottom, fft_x, x_right)
         
-        # Threshold line (horizontal within Q range)
-        if y <= thresh_y < y + height:
-            draw.line((low_x, thresh_y, high_x, thresh_y), fill=OLED_WHITE)
+        # Threshold (horizontal within Q range, same x span as gray/white Q fill)
+        if y <= thresh_y <= y_bottom:
+            self._draw_fft_contrast_hline(
+                draw,
+                q_x0,
+                q_x1,
+                thresh_y,
+                y,
+                y_bottom,
+                fft_x,
+                x_right,
+                emphasis=any_q_above_thresh,
+            )
 
     def _format_freq_range(self, f_lo, f_hi):
         """Format frequency range for display (e.g., '2.5k-4.5k')."""
@@ -3314,9 +3623,14 @@ class OledUI:
                     draw.line((bx_start, bar_top, bx_start, bar_bottom), fill=OLED_WHITE)
                     draw.line((bx_end, bar_top, bx_end, bar_bottom), fill=OLED_WHITE)
         
-        # Draw vertical lines at band boundaries
-        draw.line((sel_low_x, y, sel_low_x, y + fft_height - 1), fill=OLED_WHITE)
-        draw.line((sel_high_x, y, sel_high_x, y + fft_height - 1), fill=OLED_WHITE)
+        fft_x_right = fft_x + fft_width - 1
+        fft_y_bottom = y + fft_height - 1
+        self._draw_fft_contrast_vline(
+            draw, sel_low_x, y, fft_y_bottom, fft_x, fft_x_right
+        )
+        self._draw_fft_contrast_vline(
+            draw, sel_high_x, y, fft_y_bottom, fft_x, fft_x_right
+        )
         
         # No threshold line in 3-band mode
         
@@ -3615,7 +3929,7 @@ class OledUI:
         elif page_name == "SET":
             labels = [
                 labels[0],  # Default
-                "Detect" if _setup_enc3_detect else "Gain",
+                "Detect" if _setup_enc3_detect else "Thresh",
                 "Chans" if _setup_enc4_channels else "Setup"
             ]
         # Override labels for COLOR page based on encoder 3 toggle state
@@ -3793,12 +4107,11 @@ class OledUI:
                         val_str = "Saved"
                     else:
                         val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                elif i == 1:  # Input Gain or Detection Mode (based on toggle)
+                elif i == 1:  # FFT threshold or Detection Mode (based on toggle)
                     if _setup_enc3_detect:
                         val_str = DETECT_MODES[DETECT_MODE_INDEX]
                     else:
-                        sign = "+" if INPUT_GAIN_DB > 0 else ""
-                        val_str = f"{sign}{INPUT_GAIN_DB}dB"
+                        val_str = f"{int(band.thresh * 99)}"
                 else:  # DMX Output Mode or Channel Count (based on toggle)
                     if _setup_enc4_channels:
                         val_str = str(DMX_CHANNEL_COUNT)
@@ -4032,8 +4345,7 @@ class OledUI:
                         val_str = f"{CYCLE_STEPS_OPTIONS[CYCLE_STEPS_INDEX]}"
             elif tab == "Settings":
                 if i == 0:  # Gain (dB)
-                    sign = "+" if INPUT_GAIN_DB > 0 else ""
-                    val_str = f"{sign}{INPUT_GAIN_DB}dB"
+                    val_str = format_input_gain_display()
                 elif i == 1:  # Reset - show current preset name or countdown
                     # Check if "saved" should be shown (progress=2.0 for 0.8s after save)
                     if _enc1_save_progress >= 2.0 and (time.time() - _enc1_save_complete) < 0.8:

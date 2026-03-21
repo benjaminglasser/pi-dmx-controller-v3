@@ -168,9 +168,9 @@ The main app sends DMX on **`/dev/serial0`** (GPIO UART → RS485 → XLR), **no
 
 ## Configuration
 
-- **`.dmx_config`** – JSON runtime config (auto-created).
+- **`.dmx_config`** – Runtime config (key=value, auto-created). Stores presets, input gain, detect mode, DMX output mode, etc.
 - **`config/boot/config.txt`** – For HiFiBerry, set **`dtoverlay=hifiberry-dacplusadc`** or **`hifiberry-dacplusadcpro`**. For USB input, omit HiFiBerry overlays; USB cards appear separately in ALSA.
-- **Audio device selection** – See env vars in **`dmx_audio_react.py`** (e.g. **`AUDIO_DEVICE`**, **`AUDIO_DEVICE_NAME`**). Use **`arecord -l`** to list hardware.
+- **Audio device selection** – Env vars in **`dmx_audio_react.py`** or **`pi-dmx.service`**: **`AUDIO_DEVICE`**, **`AUDIO_DEVICE_NAME`**. **`AUDIO_INPUT_CHANNEL`** = `left` \| `right` \| `mix` — which stereo channel feeds the FFT (default `right`; many USB interfaces use Input 1 = left). Use **`arecord -l`** to list hardware.
 - **DMX UART (Chauvet / picky dimmers)** – **`DMX_UART_MIN_SLOTS`** (default **256**): longer padded frames like **`scripts/dmx_probe.py`**. **`DMX_BREAK_STYLE=baud`** if only the probe’s **baud9600** half worked; default **`ioctl`**. Set in **`pi-dmx.service`** `Environment=` or shell when testing.
 
 ---

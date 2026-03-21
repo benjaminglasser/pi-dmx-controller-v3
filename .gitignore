@@ -9,6 +9,9 @@ venv/
 # Build artifacts
 utils/oled_early
 
+# Runtime config (user-specific; do not commit)
+.dmx_config
+
 # System files
 .DS_Store
 *.log

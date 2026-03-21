@@ -224,7 +224,7 @@ Press **`q`** to quit. Restart the service with **`sudo systemctl start pi-dmx.s
 After reboot:
 
 - **OLED:** CSW logo (~3.5 s), then DMX UI (splash keeps last frame during handoff to reduce blank gap)
-- **Audio:** `arecord -l` — USB card or HiFiBerry as expected
+- **Audio:** `arecord -l` — USB card or HiFiBerry as expected. If triggers use the wrong input (e.g. Input 1 = left on your interface), set **`AUDIO_INPUT_CHANNEL=left`** in **`pi-dmx.service`** `Environment=`.
 - **DMX / OLA:** `ola_dev_info`; fix patching if universe has no output (fixtures on **UART** follow **`pi-dmx`**, not OLA)
 - **DMX UART:** In logs, confirm **`min_slots=`** / **`break=`** match your **`pi-dmx.service`** `Environment=`
 - **Services:** `systemctl status oled_splash.service pi-dmx.service olad.service`
