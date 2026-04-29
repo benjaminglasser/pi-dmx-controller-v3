@@ -432,8 +432,11 @@ APP_STATE = "boot"   # "boot" | "loading" | "ready" | "error"
 APP_ERROR = ""
 
 # Audio
-SR  = 44100
-HOP = 512  # Smaller for more responsive FFT
+# Sample rate must match the audio device's native rate when asound.conf is
+# `type hw` (no software resampling). HiFiBerry DAC+ ADC defaults to 48000.
+# Override via AUDIO_SR env var (e.g. AUDIO_SR=44100 for USB audio interfaces).
+SR  = int(os.environ.get("AUDIO_SR", "48000").strip() or "48000")
+HOP = int(os.environ.get("AUDIO_HOP", "1024").strip() or "1024")  # Larger default for stability with OLED rendering
 _HANNING_WINDOW = None  # Pre-computed, initialized on first use
 
 # Detection / logic
@@ -463,6 +466,14 @@ elif _ai_ch in ("mix", "mono", "both", "avg", "stereo"):
     AUDIO_INPUT_CHANNEL_MODE = "mix"
 else:
     AUDIO_INPUT_CHANNEL_MODE = "right"
+
+# When using an I2S audio HAT (HiFiBerry, etc.), GPIO 18/19/20/21 are claimed by
+# the I2S controller. Encoders 3, 4, and 5 in this project happen to share those
+# pins (E3 CLK=19, E4 DT=20, E4 SW=21, E5 DT=18), so calling GPIO.setup() on them
+# rewrites the pin function from I2S to plain GPIO and silently kills audio.
+# Set DISABLE_I2S_ENCODERS=1 to skip all GPIO.setup / polling for E3, E4, E5.
+# E1, E2, and the Reset button keep working.
+DISABLE_I2S_ENCODERS = os.environ.get("DISABLE_I2S_ENCODERS", "0").strip() == "1"
 
 def db_to_linear(db):
     """Convert dB to linear gain multiplier."""
@@ -577,7 +588,14 @@ IGNORE_KNOBS_UNTIL = 0.0
 
 # Preferred device name patterns (fallback)
 PREFERRED_INPUTS = [
-    r"scarlett", r"focusrite", r"usb audio", r"codec", r"line", r"pulse"
+    r"scarlett",
+    r"focusrite",
+    r"usb audio",
+    r"hifiberry",
+    r"wm8960",
+    r"codec",
+    r"line",
+    r"pulse",
 ]
 
 # Rotary Encoder 1 (Page selection)
@@ -645,6 +663,9 @@ SETUP_BAND_OPTIONS = ["LOW", "MID", "HIGH"]
 # HOME controls (always visible on bottom half)
 # Encoder toggle states for HOME controls
 _home_enc2_alt = False  # False = Freq, True = Q
+# Integer 0–99 for Range (Q) mode only; None = sync from band.q on next turn. Avoids float round-trip
+# where two encoder steps re-map to the same rounded display value.
+_home_enc2_range_pct = None
 _home_enc3_alt = False  # False = Thresh, True = ThreshMode
 _home_enc4_alt = False  # False = Release, True = ReleaseMode
 
@@ -688,7 +709,7 @@ PROGRAM_NAMES = ["ALL", "CHASE", "GROUPS", "SWAP", "RANDOM", "AMBIENT"]
 
 # ===================== FFT Display =====================
 
-# FFT settings - 64 bands, 20Hz–16kHz (smooth EQ-style spectrum with display smoothing)
+# FFT settings - 64 bands, 20Hz–16kHz (EQ-style spectrum; set FFT_ANALYZER_RAW=1 for unsmoothed per-hop bars)
 FFT_MIN_FREQ = 20
 FFT_MAX_FREQ = 16000
 FFT_NUM_BANDS = 64
@@ -840,6 +861,12 @@ FFT_LOW_SMOOTH_COEF = float(os.environ.get("FFT_LOW_SMOOTH_COEF", "0.62"))
 FFT_DISPLAY_SMOOTH = float(os.environ.get("FFT_DISPLAY_SMOOTH", "0.72"))
 # Spatial smoothing: 3-point [0.25,0.5,0.25] kernel across adjacent bands for a softer curve. 0=off, 1=on.
 FFT_SPATIAL_SMOOTH = int(os.environ.get("FFT_SPATIAL_SMOOTH", "1"))
+# 1 = per-hop FFT levels only (no bar inertia / display EMA / spatial blur — looks jittery; for diagnostics).
+# Default 0 = EQ-style analyzer (usable spectrum). Override in env for experiments.
+FFT_ANALYZER_RAW = int(os.environ.get("FFT_ANALYZER_RAW", "0"))
+if FFT_ANALYZER_RAW:
+    FFT_DISPLAY_SMOOTH = 1.0
+    FFT_SPATIAL_SMOOTH = 0
 
 # High-pass state (rumble / DC)
 _fft_hp_y = 0.0
@@ -930,7 +957,7 @@ encoder1_value = 0
 encoder1_button = False
 _reset_last_state = 1  # Reset button state (1 = not pressed)
 _reset_press_time = 0  # Timestamp when reset button was pressed (for long-press detection)
-_fft_reset_msg_until = 0.0  # Show "reset!" overlay on FFT until this timestamp
+_fft_reset_msg_until = 0.0  # Show centered "reset!" modal until this timestamp
 
 # Encoder state for all 5 encoders
 # Encoders 1-4: Page, Param A, Param B, Param C (indices 0-3)
@@ -977,17 +1004,14 @@ _last_preset_before_ambient = 1  # Stores the preset to return to when toggling 
 # Simple velocity parameters - just max multiplier per parameter type
 # Velocity is calculated as clicks-per-second, then mapped logarithmically
 VELOCITY_MAX_FREQ = 50        # Frequency: large range, high acceleration for fast sweeps
-VELOCITY_MAX_THRESH = 20      # Threshold: 0-99 range
-VELOCITY_MAX_DECAY = 8        # Decay/Release: reduced for more precision
 VELOCITY_MAX_Q = 20           # Q factor: 0-99 range
-VELOCITY_MAX_BRIGHTNESS = 18  # Brightness: 0-99%
 VELOCITY_MAX_PRESET = 1       # Presets: no acceleration (always 1x)
 VELOCITY_MAX_PAGE = 1         # Pages: no acceleration (always 1x)
-VELOCITY_MAX_AMBIENT = 10     # Ambient params: moderate acceleration
 
-# Minimum velocity multiplier for precision mode (sub-1x for slow turning)
-# Set to 1.0 to disable precision mode, lower values = more precise at slow speeds
-VELOCITY_MIN_DECAY = 0.1      # Decay/Release: 10x more precise when turning slowly
+# Encoders 3–5: one quadrature step = one displayed unit (no velocity on these paths)
+ENC_STEP_TRIG_BRIGHT = 1.0 / 99.0  # HOME OLED uses int(val * 99) for Trigger and Brightness
+ENC_STEP_RELEASE_MS = 1.0  # Release readout is int(band.decay_ms) in ms
+ENC_STEP_AMBIENT_FADE_S = 0.1  # Ambient "Fade" column shows tenths of a second
 
 # Brightness fade toggle state
 _brightness_saved = DEFAULT_BRIGHT  # Saved brightness before fade-out
@@ -1018,6 +1042,7 @@ AUDIO_DEVICE_NAME = os.environ.get("AUDIO_DEVICE_NAME", "").strip()
 
 AUDIO_DEBUG = os.environ.get("AUDIO_DEBUG", "0").strip() == "1"
 TRIG_DEBUG  = os.environ.get("TRIG_DEBUG",  "0").strip() == "1"
+_audio_dbg_count = 0  # Throttle counter for AUDIO_DEBUG logging
 
 # --- TUI flash message ---
 _ui_flash_msg   = ""
@@ -1909,6 +1934,19 @@ three_band_detector = None
 
 # ===================== Input device pick =====================
 
+def _portaudio_devices_debug():
+    """Human-readable list of all PortAudio devices (for error messages)."""
+    try:
+        lines = []
+        for i, d in enumerate(sd.query_devices()):
+            inch = d.get("max_input_channels", 0)
+            outch = d.get("max_output_channels", 0)
+            lines.append(f"  [{i}] in={inch} out={outch} {d.get('name', '')!r}")
+        return "\n".join(lines) if lines else "  (empty device list)"
+    except Exception as e:
+        return f"  (could not list devices: {e})"
+
+
 def pick_input_device():
     devs = sd.query_devices()
     for pat in PREFERRED_INPUTS:
@@ -1919,16 +1957,40 @@ def pick_input_device():
     for i, d in enumerate(devs):
         if d.get("max_input_channels",0) >= 1:
             return i, d["name"], min(d.get("max_input_channels", 1), 2)
-    raise RuntimeError("No suitable input device (>=1ch) found")
+    raise RuntimeError(
+        "No suitable input device (>=1ch) found.\n"
+        "PortAudio sees:\n"
+        + _portaudio_devices_debug()
+        + "\nPlug in USB audio or enable your HAT, then retry. "
+        "Or pick a line above with in>0 and run: export AUDIO_DEVICE=<index>"
+    )
 
 def choose_input_device():
     devs = sd.query_devices()
 
     if AUDIO_DEVICE:
         idx = int(AUDIO_DEVICE)
-        d = sd.query_devices(idx)
+        n = len(devs)
+        if idx < 0 or idx >= n:
+            raise RuntimeError(
+                f"AUDIO_DEVICE={idx} is out of range (0..{n - 1}).\n"
+                "Unset AUDIO_DEVICE (export -n AUDIO_DEVICE) and use AUDIO_DEVICE_NAME=USB, "
+                "or pick a valid index from:\n"
+                + _portaudio_devices_debug()
+            )
+        try:
+            d = sd.query_devices(idx)
+        except sd.PortAudioError as e:
+            raise RuntimeError(
+                f"AUDIO_DEVICE={idx} is invalid ({e}).\n"
+                "Unset AUDIO_DEVICE and use AUDIO_DEVICE_NAME=USB, or fix the index:\n"
+                + _portaudio_devices_debug()
+            ) from e
         if d.get("max_input_channels", 0) <= 0:
-            raise RuntimeError(f"AUDIO_DEVICE={idx} has no input channels")
+            raise RuntimeError(
+                f"AUDIO_DEVICE={idx} has no input channels.\n"
+                + _portaudio_devices_debug()
+            )
         return idx, d["name"], min(d.get("max_input_channels", 1), 2)
 
     if AUDIO_DEVICE_NAME:
@@ -1936,7 +1998,12 @@ def choose_input_device():
         for i, d in enumerate(devs):
             if d.get("max_input_channels", 0) > 0 and needle in d.get("name", "").lower():
                 return i, d["name"], min(d.get("max_input_channels", 1), 2)
-        raise RuntimeError(f'No input device name contains "{AUDIO_DEVICE_NAME}"')
+        raise RuntimeError(
+            f'No input device name contains "{AUDIO_DEVICE_NAME}".\n'
+            "PortAudio sees:\n"
+            + _portaudio_devices_debug()
+            + "\nUnset AUDIO_DEVICE_NAME to auto-pick, or set AUDIO_DEVICE=<index>."
+        )
 
     return pick_input_device()
 
@@ -1948,9 +2015,11 @@ _param_lock = threading.Lock()
 
 
 def _apply_encoder_delta(enc_idx, direction):
-    """Apply a single encoder click immediately (called from encoder_reader at 200Hz).
+    """Apply a single encoder quadrature step immediately (called from encoder_reader at 200Hz).
     
     This decouples parameter updates from the OLED refresh rate for snappier feel.
+    Encoders 3–5 (trigger, release, brightness) use a fixed step of one OLED unit per tick
+    (no velocity scaling on those parameters).
     
     Args:
         enc_idx: 1=Freq/Q, 2=Thresh/ThreshMode, 3=Release/ReleaseMode, 4=Brightness
@@ -1968,16 +2037,15 @@ def _apply_encoder_delta(enc_idx, direction):
         return
     
     with _param_lock:
-        # Each click = exactly 1 step (no sub-1x velocity, always at least 1)
-        # Velocity only adds acceleration for fast spins, never reduces below 1x
         base_delta = 1 if direction > 0 else -1
         
         # ===== Encoder 5 (enc_idx=4): Brightness =====
         if enc_idx == 4:
             if not _brightness_off:
-                mult = max(1.0, _calc_velocity_multiplier(4, VELOCITY_MAX_BRIGHTNESS))
-                delta = base_delta * mult
-                BRIGHTNESS = max(0.0, min(0.99, BRIGHTNESS + delta * 0.01))
+                BRIGHTNESS = max(
+                    0.0,
+                    min(0.99, BRIGHTNESS + base_delta * ENC_STEP_TRIG_BRIGHT),
+                )
                 _brightness_target = BRIGHTNESS
                 if RELEASE_MODES[RELEASE_MODE_INDEX] in ("bright", "both"):
                     _reactive_brightness_scale = BRIGHTNESS
@@ -1990,11 +2058,20 @@ def _apply_encoder_delta(enc_idx, direction):
             if BASE_PROGRAM == 6:
                 ambient_speed = max(0.2, min(8.0, ambient_speed + base_delta * 0.2))
             elif _home_enc2_alt:
-                mult = max(1.0, _calc_velocity_multiplier(1, VELOCITY_MAX_Q))
-                delta = base_delta * mult
-                factor = 1.02 ** (-delta)
+                # Range (Q): one quadrature step = one OLED unit (0–99), no velocity.
+                # Use a stored integer step index so band.q round-trip cannot collapse two ticks to one.
+                global _home_enc2_range_pct
                 q_min = get_q_min(band.center)
-                band.q = max(q_min, min(Q_MAX, band.q * factor))
+                if _home_enc2_range_pct is None:
+                    q_clamped = max(q_min, min(Q_MAX, band.q))
+                    q_ratio = math.log(Q_MAX / q_clamped) / math.log(Q_MAX / q_min)
+                    _home_enc2_range_pct = int(
+                        round(max(0.0, min(1.0, q_ratio)) * 99.0)
+                    )
+                    _home_enc2_range_pct = max(0, min(99, _home_enc2_range_pct))
+                _home_enc2_range_pct = max(0, min(99, _home_enc2_range_pct + base_delta))
+                t = _home_enc2_range_pct / 99.0
+                band.q = max(q_min, min(Q_MAX, Q_MAX * (q_min / Q_MAX) ** t))
             else:
                 mult = max(1.0, _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ))
                 delta = base_delta * mult
@@ -2026,9 +2103,10 @@ def _apply_encoder_delta(enc_idx, direction):
                             ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.5)
                 else:
                     # Trigger threshold (matches bottom-row "Trigger" label while on Settings)
-                    mult = max(1.0, _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH))
-                    delta = base_delta * mult
-                    band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
+                    band.thresh = max(
+                        0.0,
+                        min(1.0, band.thresh + base_delta * ENC_STEP_TRIG_BRIGHT),
+                    )
             elif _home_enc3_alt:
                 now = time.time()
                 elapsed_ms = (now - _discrete_last_change[2]) * 1000
@@ -2040,17 +2118,19 @@ def _apply_encoder_delta(enc_idx, direction):
                         _discrete_last_change[2] = now
                         save_current_as_default()
             else:
-                mult = max(1.0, _calc_velocity_multiplier(2, VELOCITY_MAX_THRESH))
-                delta = base_delta * mult
-                band.thresh = max(0.0, min(1.0, band.thresh + delta * 0.01))
+                band.thresh = max(
+                    0.0,
+                    min(1.0, band.thresh + base_delta * ENC_STEP_TRIG_BRIGHT),
+                )
             return
         
         # ===== Encoder 4 (enc_idx=3): Release/ReleaseMode or Fade in AMBIENT mode =====
         if enc_idx == 3:
             if BASE_PROGRAM == 6:
-                mult = max(1.0, _calc_velocity_multiplier(3, VELOCITY_MAX_AMBIENT))
-                delta = base_delta * mult
-                ambient_fade_time = max(0.1, min(10.0, ambient_fade_time + delta * 0.1))
+                ambient_fade_time = max(
+                    0.1,
+                    min(10.0, ambient_fade_time + base_delta * ENC_STEP_AMBIENT_FADE_S),
+                )
             elif _home_enc4_alt:
                 now = time.time()
                 elapsed_ms = (now - _discrete_last_change[3]) * 1000
@@ -2061,9 +2141,10 @@ def _apply_encoder_delta(enc_idx, direction):
                         RELEASE_MODE_INDEX = new_idx
                         _discrete_last_change[3] = now
             else:
-                mult = max(1.0, _calc_velocity_multiplier(3, VELOCITY_MAX_DECAY))
-                delta = base_delta * mult
-                band.decay_ms = max(40.0, min(5000.0, band.decay_ms + delta * 20.0))
+                band.decay_ms = max(
+                    40.0,
+                    min(5000.0, band.decay_ms + base_delta * ENC_STEP_RELEASE_MS),
+                )
                 release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
                 if release_mode in ("react", "rand", "both"):
                     _effective_release_display = int(band.decay_ms)
@@ -2149,8 +2230,6 @@ def setup_gpio_inputs():
     
     Returns True on success, False on failure (with error set for TUI display).
     """
-    global DEV_NO_HW
-    
     if DEV_NO_HW:
         return True
     if GPIO is None:
@@ -2171,24 +2250,45 @@ def setup_gpio_inputs():
         GPIO.setup(ENC2_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.setup(ENC2_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         
-        # Rotary Encoder 3 (Param B - Thresh/Beats)
-        GPIO.setup(ENC3_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        
-        # Rotary Encoder 4 (Param C - Release/Mode)
-        GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC4_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC4_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        
-        # Rotary Encoder 5 (Brightness)
-        GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        if not ENC5_SW_DISABLED:
-            try:
-                GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            except Exception as e:
-                print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
+        if DISABLE_I2S_ENCODERS:
+            # I2S uses GPIO 18 (BCLK), 19 (LRCLK), 20 (DIN), 21 (DOUT).
+            # We can still set up the NON-conflicting pins for partial encoder function:
+            #   E3: CLK=19 (CONFLICT), DT=26 (safe), SW=23 (safe)
+            #   E4: CLK=16 (safe), DT=20 (CONFLICT), SW=21 (CONFLICT)
+            #   E5: CLK=4 (safe), DT=18 (CONFLICT), SW=8 (safe)
+            # Rotation won't work (needs both CLK+DT), but buttons on E3/E5 will work.
+            print("[GPIO] DISABLE_I2S_ENCODERS=1 - setting up safe pins only for E3/E4/E5")
+            # E3: DT and SW are safe
+            GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            # E4: only CLK is safe (rotation and buttons won't work)
+            GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            # E5: CLK and SW are safe
+            GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            if not ENC5_SW_DISABLED:
+                try:
+                    GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                except Exception as e:
+                    print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
+        else:
+            # Rotary Encoder 3 (Param B - Thresh/Beats)
+            GPIO.setup(ENC3_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            
+            # Rotary Encoder 4 (Param C - Release/Mode)
+            GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC4_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC4_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            
+            # Rotary Encoder 5 (Brightness)
+            GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            if not ENC5_SW_DISABLED:
+                try:
+                    GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                except Exception as e:
+                    print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
         
         # Reset button
         GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -2204,9 +2304,7 @@ def setup_gpio_inputs():
         else:
             set_error(f"GPIO error: {error_str[:50]}")
             print(f"\n[ERROR] GPIO setup failed: {e}\n")
-        
-        # Disable hardware mode and continue without GPIO
-        DEV_NO_HW = True
+        # Do not set DEV_NO_HW: SPI/OLED is independent; only skip encoders when gpio_ok is False.
         return False
 
 _enc_last_update_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time when delta was last consumed
@@ -2290,23 +2388,37 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10, min_mult=1.0):
 
 
 # ===== gpiozero-based encoder handling (interrupt-driven, more reliable) =====
-from gpiozero import RotaryEncoder as GpioZeroEncoder
+# NOTE: We import gpiozero lazily inside setup functions to avoid any
+# pin-factory initialization side effects at module load time.
 
 # Encoder objects (initialized in setup_gpiozero_encoders)
 _gz_encoders = {}  # {enc_idx: GpioZeroEncoder}
 _gz_last_steps = {}  # {enc_idx: last_steps_value}
 
 def setup_gpiozero_encoders():
-    """Initialize gpiozero RotaryEncoder objects for encoders 2-5."""
+    """Initialize gpiozero RotaryEncoder objects for encoders 2-5.
+    
+    NOTE: gpiozero's RotaryEncoder internally calls GPIO.setup() on each pin,
+    which rewrites the bcm2712 function-select register. For encoders 3, 4, 5
+    that share GPIO 18/19/20 with the I2S audio bus, this kills audio capture.
+    DISABLE_I2S_ENCODERS=1 skips those three to keep the I2S pins owned by the
+    kernel audio driver.
+    """
     global _gz_encoders, _gz_last_steps
     
+    # Lazy import to avoid pin-factory side effects at module load
+    from gpiozero import RotaryEncoder as GpioZeroEncoder
+    
     # Encoder pin mappings (CLK, DT) - BCM pins
+    # E2 (GPIO 17/27) is always safe; it does not overlap I2S.
     enc_pins = {
-        1: (ENC2_CLK, ENC2_DT),  # Encoder 2
-        2: (ENC3_CLK, ENC3_DT),  # Encoder 3
-        3: (ENC4_CLK, ENC4_DT),  # Encoder 4
-        4: (ENC5_CLK, ENC5_DT),  # Encoder 5 (brightness)
+        1: (ENC2_CLK, ENC2_DT),  # Encoder 2 - GPIO 17/27 (safe)
     }
+    if not DISABLE_I2S_ENCODERS:
+        # E3 CLK=GPIO19 (I2S LRCLK), E4 DT=GPIO20 (I2S DIN), E5 DT=GPIO18 (I2S BCLK).
+        enc_pins[2] = (ENC3_CLK, ENC3_DT)  # Encoder 3
+        enc_pins[3] = (ENC4_CLK, ENC4_DT)  # Encoder 4
+        enc_pins[4] = (ENC5_CLK, ENC5_DT)  # Encoder 5 (brightness)
     
     for enc_idx, (clk, dt) in enc_pins.items():
         try:
@@ -2319,23 +2431,49 @@ def setup_gpiozero_encoders():
             print(f"Failed to init gpiozero encoder {enc_idx+1}: {e}", file=sys.stderr)
 
 def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
-    """Read encoder using gpiozero (interrupt-driven).
+    """Read encoder using gpiozero (interrupt-driven) or RPi.GPIO fallback.
     
     Returns: 1 for CW, -1 for CCW, 0 for no change
     """
-    global _gz_last_steps
+    global _gz_last_steps, _enc_state
     
-    if enc_idx not in _gz_encoders:
+    # If gpiozero encoder is available for this index, use it
+    if enc_idx in _gz_encoders:
+        enc = _gz_encoders[enc_idx]
+        current_steps = enc.steps
+        last_steps = _gz_last_steps[enc_idx]
+        
+        if current_steps != last_steps:
+            diff = current_steps - last_steps
+            _gz_last_steps[enc_idx] = current_steps
+            return 1 if diff > 0 else -1
         return 0
     
-    enc = _gz_encoders[enc_idx]
-    current_steps = enc.steps
-    last_steps = _gz_last_steps[enc_idx]
+    # Fallback: RPi.GPIO polling-based quadrature decoding
+    if GPIO is None:
+        return 0
     
-    if current_steps != last_steps:
-        diff = current_steps - last_steps
-        _gz_last_steps[enc_idx] = current_steps
-        return 1 if diff > 0 else -1
+    try:
+        clk = GPIO.input(clk_pin)
+        dt = GPIO.input(dt_pin)
+    except Exception:
+        return 0
+    
+    new_state = (clk << 1) | dt
+    old_state = _enc_state[enc_idx]
+    
+    if new_state == old_state:
+        return 0
+    
+    _enc_state[enc_idx] = new_state
+    
+    # Quadrature state machine: detect direction from state transitions
+    # CW: 3->1->0->2->3  CCW: 3->2->0->1->3
+    if old_state == 0:
+        if new_state == 2:
+            return 1   # CW click complete
+        elif new_state == 1:
+            return -1  # CCW click complete
     
     return 0
 
@@ -2347,6 +2485,10 @@ _gz_enc1_last_steps = 0
 def setup_gpiozero_enc1():
     """Initialize gpiozero encoder for encoder 1."""
     global _gz_enc1, _gz_enc1_last_steps
+    
+    # Lazy import to avoid pin-factory side effects at module load
+    from gpiozero import RotaryEncoder as GpioZeroEncoder
+    
     try:
         _gz_enc1 = GpioZeroEncoder(ENC1_CLK, ENC1_DT, wrap=False, max_steps=0)
         _gz_enc1.steps = 0
@@ -2356,22 +2498,62 @@ def setup_gpiozero_enc1():
         print(f"Failed to init gpiozero encoder 1: {e}", file=sys.stderr)
 
 def _read_enc1_quadrature(clk_pin, dt_pin):
-    """Read Encoder 1 using gpiozero (interrupt-driven).
+    """Read Encoder 1 using gpiozero (interrupt-driven) or RPi.GPIO fallback.
     
     Returns: 1 for CW, -1 for CCW, 0 for no change
     """
-    global _gz_enc1_last_steps
+    global _gz_enc1_last_steps, _enc1_state, _enc1_rotation_dir
     
-    if _gz_enc1 is None:
+    # If gpiozero encoder is available, use it (more reliable, interrupt-driven)
+    if _gz_enc1 is not None:
+        current_steps = _gz_enc1.steps
+        last_steps = _gz_enc1_last_steps
+        
+        if current_steps != last_steps:
+            diff = current_steps - last_steps
+            _gz_enc1_last_steps = current_steps
+            return 1 if diff > 0 else -1
         return 0
     
-    current_steps = _gz_enc1.steps
-    last_steps = _gz_enc1_last_steps
+    # Fallback: RPi.GPIO polling-based quadrature decoding
+    if GPIO is None:
+        return 0
     
-    if current_steps != last_steps:
-        diff = current_steps - last_steps
-        _gz_enc1_last_steps = current_steps
-        return 1 if diff > 0 else -1
+    try:
+        clk = GPIO.input(clk_pin)
+        dt = GPIO.input(dt_pin)
+    except Exception:
+        return 0
+    
+    new_state = (clk << 1) | dt
+    old_state = _enc1_state
+    
+    if new_state == old_state:
+        return 0
+    
+    _enc1_state = new_state
+    
+    # Quadrature state machine: detect direction from state transitions
+    # CW: 3->1->0->2->3  CCW: 3->2->0->1->3
+    direction = 0
+    if old_state == 3:
+        if new_state == 1:
+            direction = 1   # CW start
+        elif new_state == 2:
+            direction = -1  # CCW start
+    elif old_state == 1:
+        if new_state == 0:
+            direction = 1   # CW continue
+    elif old_state == 2:
+        if new_state == 0:
+            direction = -1  # CCW continue
+    elif old_state == 0:
+        if new_state == 2:
+            direction = 1   # CW end - register click
+            return 1
+        elif new_state == 1:
+            direction = -1  # CCW end - register click
+            return -1
     
     return 0
 
@@ -2491,6 +2673,8 @@ def encoder_reader():
     global _enc2_press_time, _enc2_saving, _enc2_save_complete
     global submenu_tab, submenu_column, submenu_editing
     global _enc_awaiting_release
+    global _setup_enc3_detect, _setup_enc4_channels
+    global _brightness_click_flash, _brightness_gpio8_state
     
     if DEV_NO_HW:
         return
@@ -2528,8 +2712,13 @@ def encoder_reader():
     # Initialize switch states
     _enc_last_sw[0] = GPIO.input(ENC1_SW)
     _enc_last_sw[1] = GPIO.input(ENC2_SW)
-    _enc_last_sw[2] = GPIO.input(ENC3_SW)
-    _enc_last_sw[3] = GPIO.input(ENC4_SW)
+    if not DISABLE_I2S_ENCODERS:
+        _enc_last_sw[2] = GPIO.input(ENC3_SW)
+        _enc_last_sw[3] = GPIO.input(ENC4_SW)
+    else:
+        # E3/E4 not configured (I2S HAT owns their pins) - default to "not pressed"
+        _enc_last_sw[2] = 1
+        _enc_last_sw[3] = 1
     if not ENC5_SW_DISABLED:
         try:
             _enc_last_sw[4] = GPIO.input(ENC5_SW)
@@ -2632,7 +2821,9 @@ def encoder_reader():
                     time.sleep(0.05)  # Longer debounce for reliable toggle
                     if GPIO.input(ENC2_SW) == 0:
                         # Toggle Freq/Q mode for HOME controls
+                        global _home_enc2_range_pct
                         _home_enc2_alt = not _home_enc2_alt
+                        _home_enc2_range_pct = None  # Re-sync Q index from band.q on next Range turn
                         if _home_enc2_alt:
                             ui_flash("Mode: Range", 0.5)
                         else:
@@ -2641,90 +2832,94 @@ def encoder_reader():
                         _enc_awaiting_release[1] = True
                 _enc_last_sw[1] = enc2_sw
                 
-                # ===== Encoder 3 - Param B (Thresh/Beats) =====
-                direction = _read_encoder_quadrature(2, ENC3_CLK, ENC3_DT)
-                if direction != 0:
-                    _apply_encoder_delta(2, direction)  # Immediate update at 200Hz
-                
-                enc3_sw = GPIO.input(ENC3_SW)
-                # Non-blocking: check if waiting for button release
-                if _enc_awaiting_release[2]:
-                    if enc3_sw == 1:  # Button released
-                        _enc_awaiting_release[2] = False
-                        time.sleep(0.02)  # Post-release debounce
-                elif enc3_sw == 0 and _enc_last_sw[2] == 1:
-                    time.sleep(0.05)  # Longer debounce for reliable toggle
-                    if GPIO.input(ENC3_SW) == 0:
-                        global _setup_enc3_detect
-                        # Check if on Settings submenu tab
-                        if SUBMENU_TABS[submenu_tab] == "Settings":
-                            # Toggle Trigger (FFT thresh) vs Detect mode for Settings tab
-                            _setup_enc3_detect = not _setup_enc3_detect
-                            if _setup_enc3_detect:
-                                ui_flash("Mode: Detect", 0.5)
+                # When DISABLE_I2S_ENCODERS=1 (I2S audio HAT in use), E3/E4/E5 rotation
+                # doesn't work (needs both CLK+DT, but one pin per encoder is I2S).
+                # However, buttons still work on E3 (SW=GPIO23) and E5 (SW=GPIO8).
+                # E4's button is on GPIO21 (I2S DOUT) so it won't work.
+                if not DISABLE_I2S_ENCODERS:
+                    # Full E3/E4/E5 support when not using I2S HAT
+                    # ===== Encoder 3 - Param B (Thresh/Beats) =====
+                    direction = _read_encoder_quadrature(2, ENC3_CLK, ENC3_DT)
+                    if direction != 0:
+                        _apply_encoder_delta(2, direction)
+                    
+                    enc3_sw = GPIO.input(ENC3_SW)
+                    if _enc_awaiting_release[2]:
+                        if enc3_sw == 1:
+                            _enc_awaiting_release[2] = False
+                            time.sleep(0.02)
+                    elif enc3_sw == 0 and _enc_last_sw[2] == 1:
+                        time.sleep(0.05)
+                        if GPIO.input(ENC3_SW) == 0:
+                            global _setup_enc3_detect
+                            if SUBMENU_TABS[submenu_tab] == "Settings":
+                                _setup_enc3_detect = not _setup_enc3_detect
+                                ui_flash("Mode: Detect" if _setup_enc3_detect else "Mode: Trigger", 0.5)
                             else:
-                                ui_flash("Mode: Trigger", 0.5)
-                        else:
-                            # Toggle Thresh/ThreshMode for HOME controls
-                            _home_enc3_alt = not _home_enc3_alt
-                            if _home_enc3_alt:
-                                ui_flash("Mode: Th-Mode", 0.5)
+                                _home_enc3_alt = not _home_enc3_alt
+                                ui_flash("Mode: Th-Mode" if _home_enc3_alt else "Mode: Trigger", 0.5)
+                            _enc_awaiting_release[2] = True
+                    _enc_last_sw[2] = enc3_sw
+                    
+                    # ===== Encoder 4 - Param C (Release/Mode) =====
+                    direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
+                    if direction != 0:
+                        _apply_encoder_delta(3, direction)
+                    
+                    enc4_sw = GPIO.input(ENC4_SW)
+                    if _enc_awaiting_release[3]:
+                        if enc4_sw == 1:
+                            _enc_awaiting_release[3] = False
+                            time.sleep(0.02)
+                    elif enc4_sw == 0 and _enc_last_sw[3] == 1:
+                        time.sleep(0.05)
+                        if GPIO.input(ENC4_SW) == 0:
+                            global _setup_enc4_channels
+                            if SUBMENU_TABS[submenu_tab] == "Settings":
+                                _setup_enc4_channels = not _setup_enc4_channels
+                                ui_flash("Mode: Chans" if _setup_enc4_channels else "Mode: Setup", 0.5)
                             else:
-                                ui_flash("Mode: Trigger", 0.5)
-                        # Non-blocking: mark awaiting release to prevent double-toggle
-                        _enc_awaiting_release[2] = True
-                _enc_last_sw[2] = enc3_sw
-                
-                # ===== Encoder 4 - Param C (Release/Mode) =====
-                direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
-                if direction != 0:
-                    _apply_encoder_delta(3, direction)  # Immediate update at 200Hz
-                
-                enc4_sw = GPIO.input(ENC4_SW)
-                # Non-blocking: check if waiting for button release
-                if _enc_awaiting_release[3]:
-                    if enc4_sw == 1:  # Button released
-                        _enc_awaiting_release[3] = False
-                        time.sleep(0.02)  # Post-release debounce
-                elif enc4_sw == 0 and _enc_last_sw[3] == 1:
-                    time.sleep(0.05)  # Longer debounce for reliable toggle
-                    if GPIO.input(ENC4_SW) == 0:
-                        global _setup_enc4_channels
-                        # Check if on Settings submenu tab
-                        if SUBMENU_TABS[submenu_tab] == "Settings":
-                            # Toggle Setup/Chans for Settings tab
-                            _setup_enc4_channels = not _setup_enc4_channels
-                            if _setup_enc4_channels:
-                                ui_flash("Mode: Chans", 0.5)
+                                _home_enc4_alt = not _home_enc4_alt
+                                ui_flash("Mode: R-Mode" if _home_enc4_alt else "Mode: Release", 0.5)
+                            _enc_awaiting_release[3] = True
+                    _enc_last_sw[3] = enc4_sw
+                    
+                    # ===== Encoder 5 - Brightness =====
+                    direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
+                    if direction != 0:
+                        _apply_encoder_delta(4, direction)
+                else:
+                    # I2S HAT mode: E3/E4/E5 rotation disabled, but buttons work on E3 and E5
+                    # E3 button (GPIO23) - toggle thresh mode
+                    enc3_sw = GPIO.input(ENC3_SW)
+                    if _enc_awaiting_release[2]:
+                        if enc3_sw == 1:
+                            _enc_awaiting_release[2] = False
+                            time.sleep(0.02)
+                    elif enc3_sw == 0 and _enc_last_sw[2] == 1:
+                        time.sleep(0.05)
+                        if GPIO.input(ENC3_SW) == 0:
+                            if SUBMENU_TABS[submenu_tab] == "Settings":
+                                _setup_enc3_detect = not _setup_enc3_detect
+                                ui_flash("Mode: Detect" if _setup_enc3_detect else "Mode: Trigger", 0.5)
                             else:
-                                ui_flash("Mode: Setup", 0.5)
-                        else:
-                            # Toggle Release/ReleaseMode for HOME controls
-                            _home_enc4_alt = not _home_enc4_alt
-                            if _home_enc4_alt:
-                                ui_flash("Mode: R-Mode", 0.5)
-                            else:
-                                ui_flash("Mode: Release", 0.5)
-                        # Non-blocking: mark awaiting release to prevent double-toggle
-                        _enc_awaiting_release[3] = True
-                _enc_last_sw[3] = enc4_sw
+                                _home_enc3_alt = not _home_enc3_alt
+                                ui_flash("Mode: Th-Mode" if _home_enc3_alt else "Mode: Trigger", 0.5)
+                            _enc_awaiting_release[2] = True
+                    _enc_last_sw[2] = enc3_sw
+                    
+                    # E4 button (GPIO21) - SKIPPED, conflicts with I2S DOUT
                 
-                # ===== Encoder 5 - Brightness =====
-                direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
-                if direction != 0:
-                    _apply_encoder_delta(4, direction)  # Immediate update at 200Hz
-                
-                # Encoder 5 switch - toggle brightness on/off with fade
-                global _brightness_click_flash, _brightness_gpio8_state
+                # E5 button works in both modes (GPIO8 is safe)
                 if not ENC5_SW_DISABLED:
                     try:
                         enc5_sw = GPIO.input(ENC5_SW)
-                    except Exception as e:
+                    except Exception:
                         enc5_sw = 1
-                    _brightness_gpio8_state = enc5_sw  # Update for UI display
+                    _brightness_gpio8_state = enc5_sw
                     if enc5_sw == 0 and _enc_last_sw[4] == 1:
-                        _brightness_click_flash = 1.0  # Flash indicator in UI
-                        time.sleep(0.02)  # Debounce
+                        _brightness_click_flash = 1.0
+                        time.sleep(0.02)
                         try:
                             enc5_sw_after = GPIO.input(ENC5_SW)
                         except Exception:
@@ -2756,7 +2951,7 @@ def encoder_reader():
                             band.center = center_hz
                             band.thresh = thresh
                             band.decay_ms = decay_ms
-                            _fft_reset_msg_until = time.time() + 1.0  # Show "reset!" on FFT for 1s
+                            _fft_reset_msg_until = time.time() + 1.0  # Show "reset!" modal for 1s
                             ui_flash("Reset to defaults", 1.0)
                             _reset_press_time = 0  # Prevent repeated triggers
                 elif reset_btn == 1 and _reset_last_state == 0:
@@ -2882,6 +3077,26 @@ def audio_loop():
         if FFT_HPF_HZ > 0:
             x, _fft_hp_y, _fft_hp_x_prev = apply_fft_highpass(x, SR, FFT_HPF_HZ, _fft_hp_y, _fft_hp_x_prev)
         input_rms = float(np.sqrt(np.mean(x*x)) + 1e-12)
+        # Diagnostic: log raw audio levels every ~1 sec when AUDIO_DEBUG=1.
+        # Helps verify that audio is actually reaching the FFT pipeline.
+        if AUDIO_DEBUG:
+            global _audio_dbg_count
+            _audio_dbg_count += 1
+            if _audio_dbg_count % 40 == 0:
+                raw_peak = float(np.max(np.abs(indata.astype(np.float32))))
+                raw_l_peak = float(np.max(np.abs(indata[:, 0].astype(np.float32)))) if indata.shape[1] >= 1 else 0.0
+                raw_r_peak = float(np.max(np.abs(indata[:, 1].astype(np.float32)))) if indata.shape[1] >= 2 else 0.0
+                x_peak_val = float(np.max(np.abs(x)))
+                # Convert to dBFS for easier reading
+                raw_l_db = 20 * np.log10(raw_l_peak + 1e-10)
+                x_peak_db = 20 * np.log10(x_peak_val + 1e-10)
+                print(
+                    f"[AUDIO_DBG] frames={frames} ch={AUDIO_INPUT_CHANNEL_MODE} "
+                    f"raw_L={raw_l_db:.1f}dB x_peak={x_peak_db:.1f}dB "
+                    f"gain={INPUT_GAIN_DB}dB indata.shape={indata.shape} "
+                    f"status={status}",
+                    flush=True,
+                )
 
         # FFT analysis for display - zero-padded for better frequency resolution
         global _HANNING_WINDOW
@@ -2945,35 +3160,40 @@ def audio_loop():
         if FFT_SPECTRAL_FLOOR > 0:
             normalized = np.maximum(0.0, normalized - FFT_SPECTRAL_FLOOR)
         
-        # Bar motion: snappier attack so short kicks still reach threshold; smooth decay (EQ-like tail)
-        attack_mask = normalized > fft_bands
-        fft_bands[attack_mask] = 0.68 * normalized[attack_mask] + 0.32 * fft_bands[attack_mask]
-        # Slightly faster decay on lowest bands — they share few FFT bins and otherwise lag the rest of the spectrum
-        n_low_dec = min(FFT_LOW_DECAY_BANDS, len(fft_bands))
-        if n_low_dec > 0:
-            idx = np.arange(len(fft_bands), dtype=np.int32)
-            low_m = idx < n_low_dec
-            fall_m = (~attack_mask) & low_m
-            rest_fall = (~attack_mask) & (~low_m)
-            fft_bands[fall_m] = FFT_LOW_DECAY_MULT * fft_bands[fall_m]
-            fft_bands[rest_fall] = 0.92 * fft_bands[rest_fall]
-        else:
-            fft_bands[~attack_mask] = 0.92 * fft_bands[~attack_mask]
-        
-        # Soften lowest columns only (sub/kick share few bins; auto-scale + leakage = visible flicker)
-        nls = min(FFT_LOW_BAND_COUNT, len(fft_bands))
-        if nls > 0:
-            if _fft_low_smooth.shape[0] != fft_bands.shape[0]:
-                _fft_low_smooth = np.zeros_like(fft_bands)
-            c = FFT_LOW_SMOOTH_COEF
-            _fft_low_smooth[:nls] = c * _fft_low_smooth[:nls] + (1.0 - c) * fft_bands[:nls]
-            fft_bands[:nls] = _fft_low_smooth[:nls]
-        
-        # Display smoothing: EMA so drawn bars are less choppy (triggers still use raw fft_bands)
-        if FFT_DISPLAY_SMOOTH < 1.0:
-            fft_display_bands[:] = FFT_DISPLAY_SMOOTH * fft_display_bands + (1.0 - FFT_DISPLAY_SMOOTH) * fft_bands
-        else:
+        if FFT_ANALYZER_RAW:
+            # Direct per-hop levels after auto-scale (no EQ-style inertia on the bars).
+            fft_bands[:] = normalized
             fft_display_bands[:] = fft_bands
+        else:
+            # Bar motion: snappier attack so short kicks still reach threshold; smooth decay (EQ-like tail)
+            attack_mask = normalized > fft_bands
+            fft_bands[attack_mask] = 0.68 * normalized[attack_mask] + 0.32 * fft_bands[attack_mask]
+            # Slightly faster decay on lowest bands — they share few FFT bins and otherwise lag the rest of the spectrum
+            n_low_dec = min(FFT_LOW_DECAY_BANDS, len(fft_bands))
+            if n_low_dec > 0:
+                idx = np.arange(len(fft_bands), dtype=np.int32)
+                low_m = idx < n_low_dec
+                fall_m = (~attack_mask) & low_m
+                rest_fall = (~attack_mask) & (~low_m)
+                fft_bands[fall_m] = FFT_LOW_DECAY_MULT * fft_bands[fall_m]
+                fft_bands[rest_fall] = 0.92 * fft_bands[rest_fall]
+            else:
+                fft_bands[~attack_mask] = 0.92 * fft_bands[~attack_mask]
+            
+            # Soften lowest columns only (sub/kick share few bins; auto-scale + leakage = visible flicker)
+            nls = min(FFT_LOW_BAND_COUNT, len(fft_bands))
+            if nls > 0:
+                if _fft_low_smooth.shape[0] != fft_bands.shape[0]:
+                    _fft_low_smooth = np.zeros_like(fft_bands)
+                c = FFT_LOW_SMOOTH_COEF
+                _fft_low_smooth[:nls] = c * _fft_low_smooth[:nls] + (1.0 - c) * fft_bands[:nls]
+                fft_bands[:nls] = _fft_low_smooth[:nls]
+            
+            # Display smoothing: EMA so drawn bars are less choppy (triggers still use raw fft_bands)
+            if FFT_DISPLAY_SMOOTH < 1.0:
+                fft_display_bands[:] = FFT_DISPLAY_SMOOTH * fft_display_bands + (1.0 - FFT_DISPLAY_SMOOTH) * fft_bands
+            else:
+                fft_display_bands[:] = fft_bands
         
         # Vectorized peak tracking
         new_peak_mask = fft_bands > fft_peaks
@@ -3326,6 +3546,16 @@ class OledUI:
                 gpio_RST=OLED_RST_PIN,
             )
             self.device = ssd1322(serial, width=width, height=height, rotate=0)
+            # luma's default is contrast(0x7F); SSD1322 often looks washed out. Max by default, override with OLED_CONTRAST=0-255
+            _oc = os.environ.get("OLED_CONTRAST", "255").strip() or "255"
+            try:
+                _ocv = int(_oc, 0)
+            except ValueError:
+                _ocv = 255
+            try:
+                self.device.contrast(max(0, min(255, _ocv)))
+            except Exception:
+                pass
             try:
                 self._font = ImageFont.truetype(
                     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 9
@@ -3538,18 +3768,6 @@ class OledUI:
                 x_right,
                 emphasis=any_q_above_thresh,
             )
-
-        # "reset!" overlay when reset button long-press completes
-        if time.time() < _fft_reset_msg_until:
-            msg = "reset!"
-            try:
-                bbox = draw.textbbox((0, 0), msg, font=self._font_small)
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            except (TypeError, AttributeError):
-                tw, th = 30, 8  # Fallback for older Pillow
-            tx = fft_x + (fft_width - tw) // 2
-            ty = y + (height - th) // 2
-            draw.text((tx, ty), msg, font=self._font_small, fill=OLED_WHITE)
 
     def _format_freq_range(self, f_lo, f_hi):
         """Format frequency range for display (e.g., '2.5k-4.5k')."""
@@ -4066,16 +4284,18 @@ class OledUI:
                     # FFT_STANDARD mode
                     if i == 0:  # Frequency or Q (based on toggle)
                         if _home_enc2_alt:
-                            # Q mode - display as 0-99 (inverted: higher = wider range)
-                            # Use logarithmic mapping for perceptual linearity
-                            # Q_MAX (8.0) -> 0, Q_MIN (frequency-dependent) -> 99
-                            q_min = get_q_min(_display_freq)
-                            q_ratio = math.log(Q_MAX / max(q_min, _display_q)) / math.log(Q_MAX / q_min)
-                            q_pct = round(q_ratio * 99)
-                            q_pct = max(0, min(99, q_pct))
-                            if abs(q_pct - _display_q_pct) > 1:
+                            # Q / Range: show encoder ladder every detent (no hysteresis).
+                            # _home_enc2_range_pct is authoritative after first turn in Range mode.
+                            if _home_enc2_range_pct is not None:
+                                _display_q_pct = _home_enc2_range_pct
+                                val_str = f"{_home_enc2_range_pct}"
+                            else:
+                                q_min = get_q_min(_display_freq)
+                                q_ratio = math.log(Q_MAX / max(q_min, _display_q)) / math.log(Q_MAX / q_min)
+                                q_pct = round(q_ratio * 99)
+                                q_pct = max(0, min(99, q_pct))
                                 _display_q_pct = q_pct
-                            val_str = f"{_display_q_pct}"
+                                val_str = f"{q_pct}"
                         else:
                             # Freq mode - show in Hz (with tenths for kHz)
                             freq_hz = _display_freq
@@ -4246,13 +4466,16 @@ class OledUI:
                 # Normal mode values
                 if i == 0:  # Frequency or Q
                     if _home_enc2_alt:
-                        q_min = get_q_min(_display_freq)
-                        q_ratio = math.log(Q_MAX / max(q_min, band.q)) / math.log(Q_MAX / q_min)
-                        q_pct = round(q_ratio * 99)
-                        q_pct = max(0, min(99, q_pct))
-                        if abs(q_pct - _display_q_pct) > 1:
+                        if _home_enc2_range_pct is not None:
+                            _display_q_pct = _home_enc2_range_pct
+                            val_str = f"{_home_enc2_range_pct}"
+                        else:
+                            q_min = get_q_min(_display_freq)
+                            q_ratio = math.log(Q_MAX / max(q_min, band.q)) / math.log(Q_MAX / q_min)
+                            q_pct = round(q_ratio * 99)
+                            q_pct = max(0, min(99, q_pct))
                             _display_q_pct = q_pct
-                        val_str = f"{_display_q_pct}"
+                            val_str = f"{q_pct}"
                     else:
                         freq_hz = _display_freq
                         if freq_hz >= 1000:
@@ -4437,6 +4660,35 @@ class OledUI:
                 val_color = OLED_WHITE if is_selected else OLED_GRAY
                 self._draw_text_kerned(draw, (px, val_y), val_str, self._font_small, fill=val_color, kerning=val_kern)
 
+    def _draw_reset_modal(self, draw):
+        """Centered bordered panel over the main UI when long-press reset completes."""
+        if time.time() >= _fft_reset_msg_until:
+            return
+        W, H = self.width, self.height
+        msg = "reset!"
+        try:
+            bbox = draw.textbbox((0, 0), msg, font=self._font_small)
+            l, t, r, b = bbox[0], bbox[1], bbox[2], bbox[3]
+            tw, th = r - l, b - t
+        except (TypeError, AttributeError):
+            l, t, r, b = 0, 0, 30, 8
+            tw, th = 30, 8
+        pad_x, pad_y = 10, 5
+        border = 2
+        box_w = tw + pad_x * 2 + border * 2
+        box_h = th + pad_y * 2 + border * 2
+        bx0 = (W - box_w) // 2
+        by0 = (H - box_h) // 2
+        bx1 = bx0 + box_w - 1
+        by1 = by0 + box_h - 1
+        draw.rectangle((bx0, by0, bx1, by1), fill=OLED_WHITE)
+        ix0, iy0 = bx0 + border, by0 + border
+        ix1, iy1 = bx1 - border, by1 - border
+        draw.rectangle((ix0, iy0, ix1, iy1), fill=OLED_BLACK)
+        text_x = ix0 + pad_x - l
+        text_y = iy0 + pad_y - t
+        draw.text((text_x, text_y), msg, font=self._font_small, fill=OLED_WHITE)
+
     def render_once(self):
         if not self.enabled or self.device is None:
             return
@@ -4493,6 +4745,7 @@ class OledUI:
             
             # Bottom: HOME controls (4 columns) - pushed down
             self._draw_home_controls(draw, cx, cy + top_height + 2, cw)
+            self._draw_reset_modal(draw)
 
         try:
             self.device.display(image)
@@ -4798,10 +5051,16 @@ def main():
         if not gpio_ok:
             print("[WARN] GPIO init failed - continuing without hardware controls")
         else:
-            # Initialize gpiozero encoders (interrupt-driven, more reliable)
-            setup_gpiozero_enc1()
-            setup_gpiozero_encoders()
-            print("[OK] gpiozero encoders initialized")
+            # Initialize gpiozero encoders (interrupt-driven, more reliable).
+            # SKIP gpiozero entirely when DISABLE_I2S_ENCODERS=1 — its pin factory
+            # init can touch GPIO state in ways that break I2S audio even for
+            # "safe" pins. Fall back to pure RPi.GPIO polling for E1/E2 instead.
+            if DISABLE_I2S_ENCODERS:
+                print("[GPIO] DISABLE_I2S_ENCODERS=1 - skipping gpiozero (using RPi.GPIO polling for E1/E2)")
+            else:
+                setup_gpiozero_enc1()
+                setup_gpiozero_encoders()
+                print("[OK] gpiozero encoders initialized")
 
     # DMX backend + sender thread
     dmx_backend = make_dmx_backend()
@@ -4815,12 +5074,14 @@ def main():
     else:
         print("[INFO] OLED UI not available (skipping).")
 
-    # Encoder reader thread (GPIO)
-    if not DEV_NO_HW:
+    # Encoder reader thread (GPIO) — only if GPIO setup succeeded (SPI/OLED may still work otherwise)
+    if not DEV_NO_HW and gpio_ok:
         threading.Thread(target=encoder_reader, daemon=True).start()
         print("[OK] Encoders: 5 rotary encoders (E5 SW disabled - SPI conflict)")
         print("     E1(5,6,13) E2(17,27,22) E3(19,26,23) E4(16,20,21) E5(4,18,-)")
         print("     Reset(25): short=reset, long(>1s)=brightness toggle")
+    elif not DEV_NO_HW and not gpio_ok:
+        print("[INFO] Encoders disabled (GPIO init failed); OLED/audio still run if available.")
 
     # Audio thread
     threading.Thread(target=audio_loop, daemon=True).start()
