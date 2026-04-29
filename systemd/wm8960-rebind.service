@@ -1,0 +1,14 @@
+[Unit]
+Description=Rebind WM8960 codec on boot if probe failed (SB Components Audio Codec HAT workaround)
+DefaultDependencies=no
+After=systemd-modules-load.service local-fs.target
+Before=alsa-restore.service sound.target pi-dmx.service
+ConditionPathExists=/sys/bus/i2c/drivers/wm8960
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/pi/pi-dmx-controller-v2/scripts/wm8960-rebind.sh
+
+[Install]
+WantedBy=sound.target multi-user.target

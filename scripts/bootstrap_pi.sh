@@ -17,7 +17,9 @@ echo "[3/7] Enable SPI/I2C (non-interactive)"
 sudo raspi-config nonint do_spi 0
 sudo raspi-config nonint do_i2c 0
 
-echo "[4/7] Skipping HiFiBerry/boot audio tweaks (USB audio — config.txt unchanged)"
+echo "[4/7] ALSA placeholder capture (Pi USB-input-only installs — avoids PortAudio device count zero)"
+sudo sh -c 'echo snd-dummy >/etc/modules-load.d/pi-dmx-alsa-placeholder.conf'
+sudo modprobe snd-dummy 2>/dev/null || true
 
 echo "[5/7] Python venv (with system packages so OLA Python is visible)"
 cd ~/pi-dmx-controller-v2

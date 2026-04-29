@@ -17,7 +17,7 @@
 #   Rotary Encoder 2 (Param A - Freq/Speed/Preset):
 #     CLK: GPIO 17, DT: GPIO 27, SW: GPIO 22
 #
-#   Rotary Encoder 3 (Param B - Thresh/Beats):
+#   Rotary Encoder 3 (Param B - trigger threshold):
 #     CLK: GPIO 19, DT: GPIO 26, SW: GPIO 23
 #
 #   Rotary Encoder 4 (Param C - Release/Mode):
@@ -39,7 +39,7 @@
 #   AUDIO_DEVICE=1
 #   AUDIO_DEVICE_NAME="USB Audio"
 
-import os, sys, time, math, threading, curses, re, random
+import os, sys, time, math, threading, curses, re, random, subprocess
 
 # Set gpiozero to use RPi.GPIO backend (avoids conflict with RPi.GPIO pin setup)
 os.environ.setdefault('GPIOZERO_PIN_FACTORY', 'rpigpio')
@@ -105,7 +105,7 @@ DEFAULT_BRIGHT    = 0.5
 # Defaults modes: LOW, MID, HIGH are built-in presets, USR 1-3 are user-saveable slots
 # Each mode has (center_hz, thresh, decay_ms, q, thresh_mode, release_mode)
 # Q display mapping: 0 = narrow (Q=8), 99 = wide (Q=0.5), so display 96 ≈ Q=0.74
-# thresh_mode: 0=fixed, 1=adapt | release_mode: 0=fixed, 1=react, 2=bright, 3=both, 4=rand
+# thresh_mode: legacy sixth field; always 0 (fixed threshold). release_mode: 0=fixed, 1=react, 2=bright, 3=both, 4=rand
 DEFAULTS_MODES = ["LOW", "MID", "HIGH", "USR 1", "USR 2", "USR 3"]
 DEFAULTS_PRESETS = {
     #           (center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode)
@@ -165,8 +165,8 @@ def load_defaults_mode():
                             if len(parts) >= 4:
                                 base = tuple(float(p) for p in parts[:4])
                                 if len(parts) >= 6:
-                                    # New format with thresh_mode and release_mode
-                                    DEFAULTS_PRESETS[key] = base + (int(parts[4]), int(parts[5]))
+                                    # New format with thresh_mode and release_mode (thresh always fixed: 0)
+                                    DEFAULTS_PRESETS[key] = base + (0, int(parts[5]))
                                 else:
                                     # Old format - default modes to 0 (fixed)
                                     DEFAULTS_PRESETS[key] = base + (0, 0)
@@ -440,9 +440,12 @@ HOP = int(os.environ.get("AUDIO_HOP", "1024").strip() or "1024")  # Larger defau
 _HANNING_WINDOW = None  # Pre-computed, initialized on first use
 
 # Detection / logic
-ENV_EMA       = 0.62   # Slower release for calmer envelope, fewer threshold bounces (was 0.55)
+ENV_EMA       = 0.55   # Match legacy pi-dmx-controller; snappier envelope for kick transients
 AGC_ON        = True
 AGC_TARGET    = 0.020
+# Classic detection: map envelope to 0–1 via env / (AGC_TARGET * scale). Higher scale = lower meter/trigger
+# sensitivity (need louder kicks). Tune with env CLASSIC_UI_SCALE if kicks miss or double-fire.
+CLASSIC_UI_SCALE = float(os.environ.get("CLASSIC_UI_SCALE", "5.0"))
 REFRACTORY_MS = 130.0  # Slightly longer minimum spacing to reduce double-fires (was 110)
 # Hysteresis for fixed threshold: re-arm when env falls below thresh - margin;
 # fire only when crossing above thresh (optionally thresh + small margin). Reduces threshold chatter.
@@ -490,9 +493,10 @@ def format_input_gain_display():
         return "0dB"
     return f"{r:+d}dB"
 
-# Threshold detection modes
-THRESH_MODES = ["fixed", "adapt"]
-THRESH_MODE_INDEX = 0  # Default to fixed threshold (current behavior)
+# Threshold detection: fixed only (adaptive mode and enc3 "Th-Mode" toggle removed).
+# THRESH_MODE_INDEX is kept 0 for preset file compatibility (6-tuple format).
+THRESH_MODES = ("fixed",)
+THRESH_MODE_INDEX = 0
 _recent_min = 1.0           # Tracks recent minimum for adaptive mode
 _effective_thresh = 0.3     # Effective threshold for display (varies by mode)
 
@@ -515,8 +519,29 @@ TRIGGER_SPEED_SLOW_MS = 1000.0  # Triggers slower than this = max multiplier (2.
 TRIGGER_SPEED_MIN_MULT = 0.3  # Minimum multiplier for fast triggers (dampens effect)
 TRIGGER_SPEED_MAX_MULT = 2.0  # Maximum multiplier for slow triggers
 
-# Detection modes for FFT analysis
-# - "level": Uses absolute energy level — matches FFT bars vs threshold (WYSIWYG); default
+# "react" release: time between triggers maps directly to release length (uses same ms
+# breakpoints as TRIGGER_SPEED_*). Tight spacing → shorter than knob; sparse → longer.
+REACT_SPACING_RELEASE_MIN_MULT = 0.22  # at/under TRIGGER_SPEED_FAST_MS interval
+REACT_SPACING_RELEASE_MAX_MULT = 5.2  # mult reached at TRIGGER_SPEED_SLOW_MS (then idle ramp)
+# Between fast/slow: t=(ts-fast)/(slow-fast) is curved so mid/long gaps grow release faster.
+REACT_SPACING_CURVE_POWER = 1.65
+# Beyond slow ms, release multiplier keeps climbing (dramatic sparse hits / long silence).
+REACT_SPACING_GAP_EXTRA_PER_MS = 0.00105  # +~1.0 mult per ~950 ms past slow breakpoint
+REACT_SPACING_GAP_EXTRA_MAX = 3.8  # cap on top of REACT_SPACING_RELEASE_MAX_MULT
+REACT_SPACING_AMP_SCALE_MAX = 1.4  # small extra from hit strength (on top of spacing)
+
+# Reactive "bright" / "both" brightness: extra drive when signal is far above threshold (0..1 excess)
+BRIGHT_THRESHOLD_EXCESS_MAX_DELTA = 0.46  # added to BRIGHTNESS when drive==1 (before cap at 1.0)
+# Lower threshold (smaller ref) → higher gain; deeper overshoot → stronger curve toward 1.0
+BRIGHT_EXCESS_REF_PIVOT = 0.44
+BRIGHT_EXCESS_SENS_POWER = 1.05
+BRIGHT_EXCESS_SENS_CAP = 4.25
+BRIGHT_EXCESS_REF_MIN = 0.03  # floor for sensitivity divisor only (stability at very low thresh)
+# shaped_rel = 1 - (1-rel)^curve  rewards being well above the line vs barely over
+BRIGHT_EXCESS_CURVE = 2.15
+
+# Detection modes for FFT analysis (when not using classic bandpass path — see audio cb).
+# - "level": FFT Q-band mean for triggers unless BEAT_DETECT_METHOD is FFT + level (then classic DSP).
 # - "flux": Spectral flux (onset-heavy)
 # - "hybrid": Level + onset/flux boost
 # - "transient": Onset ratio + flux
@@ -598,6 +623,32 @@ PREFERRED_INPUTS = [
     r"pulse",
 ]
 
+
+def _looks_like_placeholder_capture(name: str) -> bool:
+    """True for snd_dummy / silent test devices — never preferred over USB."""
+    nl = (name or "").lower()
+    if not nl.strip():
+        return True
+    for s in ("dummy", "discard", ": null"):
+        if s in nl:
+            return True
+    return False
+
+
+def _capture_devices_with_preferences(devs, *, prefer_real: bool):
+    """Enumerate PortAudio indices with usable input channels, optionally skipping placeholders."""
+    out = []
+    for i, d in enumerate(devs):
+        inch = int(d.get("max_input_channels", 0) or 0)
+        if inch < 1:
+            continue
+        nm = d.get("name") or ""
+        if prefer_real and _looks_like_placeholder_capture(nm):
+            continue
+        out.append((i, d))
+    return out
+
+
 # Rotary Encoder 1 (Page selection)
 ENC1_CLK = 5
 ENC1_DT  = 6
@@ -646,19 +697,15 @@ OLED_GRAY = (128, 128, 128)
 # Submenu tabs (cycled by reset button)
 SUBMENU_TABS = ["Presets", "Settings", "Setup"]
 submenu_tab = 0        # 0=PRE, 1=SET, 2=SETUP
-submenu_column = 0     # Column index; max depends on tab (Settings: 0–1 only)
+submenu_column = 0     # Column index; max depends on tab (Presets: 0–2; Settings/Setup: 0–1)
 submenu_editing = False  # True when encoder 1 is editing selected column value
 
 # Submenu column labels for each tab
 SUBMENU_LABELS = {
     "Presets": ["Preset", "Mode", "Beats"],
     "Settings": ["Gain", "Defaults", ""],    # Defaults = preset selector, col 3 blank
-    "Setup": ["Output", "Chans", "Band"],   # Output=Dimmer/DMX, Chans=4-24, Band=LOW/MID/HIGH
+    "Setup": ["Output", "Chans", ""],   # Output=Dimmer/DMX, Chans=4-24; col 3 blank (layout)
 }
-
-# Setup tab Band selection state
-SETUP_BAND_INDEX = 0  # 0=LOW, 1=MID, 2=HIGH
-SETUP_BAND_OPTIONS = ["LOW", "MID", "HIGH"]
 
 # HOME controls (always visible on bottom half)
 # Encoder toggle states for HOME controls
@@ -666,7 +713,6 @@ _home_enc2_alt = False  # False = Freq, True = Q
 # Integer 0–99 for Range (Q) mode only; None = sync from band.q on next turn. Avoids float round-trip
 # where two encoder steps re-map to the same rounded display value.
 _home_enc2_range_pct = None
-_home_enc3_alt = False  # False = Thresh, True = ThreshMode
 _home_enc4_alt = False  # False = Release, True = ReleaseMode
 
 # Encoder toggle states for Settings submenu tab
@@ -720,6 +766,8 @@ FFT_HPF_HZ = float(os.environ.get("FFT_HPF_HZ", "0"))  # 0 = off; set e.g. 40 to
 FFT_SPECTRAL_FLOOR = float(os.environ.get("FFT_SPECTRAL_FLOOR", "0"))  # After auto-scale; 0 = no squashing
 FFT_FLUX_DEADZONE = float(os.environ.get("FFT_FLUX_DEADZONE", "0"))  # 0 = raw spectral flux
 FFT_HYBRID_MIN_LEVEL = float(os.environ.get("FFT_HYBRID_MIN_LEVEL", "0.07"))  # Hybrid detect mode only
+# Dashed horizontal threshold ruler inside the FFT Q band (visual only). Default off — env meter shows level vs thresh.
+FFT_SPECTRUM_THRESH_LINE = os.environ.get("FFT_SPECTRUM_THRESH_LINE", "0").strip() == "1"
 
 def apply_fft_highpass(x, sr, hz, y_prev, x_prev):
     """Stateful first-order high-pass (RC) across callbacks. hz<=0 returns x unchanged."""
@@ -831,8 +879,6 @@ def get_all_band_energies_vectorized(fft_mag):
 
 # Visual gain for FFT display (makes bars appear taller within fixed view)
 FFT_VISUAL_GAIN = 1.0
-# Solid gray fill for Q-band energy above threshold (SSD1322 grayscale; distinct from white body)
-FFT_ABOVE_THRESH_FILL = (168, 168, 168)
 
 # FFT state (numpy arrays for faster vectorized operations)
 fft_bands = np.zeros(len(FFT_BANDS), dtype=np.float32)
@@ -950,6 +996,79 @@ def format_release_display(ms_value):
     if ms_value >= 1000:
         return f"{ms_value / 1000.0:.1f}s"
     return f"{int(ms_value)}ms"
+
+
+def react_release_scale_from_interval_ms(time_since_last_ms, boost_amount):
+    """Scale factor for 'react' / 'both' release from trigger spacing and hit level.
+
+    Rapid retriggers (<= TRIGGER_SPEED_FAST_MS) use REACT_SPACING_RELEASE_MIN_MULT.
+    Between fast and slow breakpoints, spacing maps with a convex curve (longer gaps
+    push release up faster). At/above slow, base is REACT_SPACING_RELEASE_MAX_MULT and
+    keeps rising with extra silence up to REACT_SPACING_GAP_EXTRA_MAX.
+    ``boost_amount`` (0..1) adds a modest extra so loud hits are slightly longer."""
+    ts = time_since_last_ms
+    slow = TRIGGER_SPEED_SLOW_MS
+    fast = TRIGGER_SPEED_FAST_MS
+    lo = REACT_SPACING_RELEASE_MIN_MULT
+    hi = REACT_SPACING_RELEASE_MAX_MULT
+    if ts <= fast:
+        spacing_mult = lo
+    elif ts >= slow:
+        spacing_mult = hi + min(
+            REACT_SPACING_GAP_EXTRA_MAX,
+            max(0.0, ts - slow) * REACT_SPACING_GAP_EXTRA_PER_MS,
+        )
+    else:
+        speed_range = slow - fast
+        t = (ts - fast) / speed_range
+        t_ease = max(0.0, min(1.0, t)) ** REACT_SPACING_CURVE_POWER
+        spacing_mult = lo + t_ease * (hi - lo)
+    amp_scale = 1.0 + min(
+        REACT_SPACING_AMP_SCALE_MAX - 1.0,
+        max(0.0, boost_amount) * (REACT_SPACING_AMP_SCALE_MAX - 1.0),
+    )
+    return spacing_mult * amp_scale
+
+
+def _bright_reactive_drive(ref, sig):
+    """Map (threshold ref, signal) → 0..1 drive for reactive brightness.
+
+    Uses overshoot ``sig - ref`` relative to headroom ``1 - ref``, then:
+    - convex curve so moderate/large overshoots push harder than tiny ones;
+    - sensitivity ``~(pivot/ref)^power`` (capped) so a *lower* threshold yields a *bigger*
+      brightness jump for the same peak level."""
+    ref_fire = min(0.999, max(0.0, float(ref)))
+    sig_f = float(sig)
+    excess = max(0.0, sig_f - ref_fire)
+    headroom = max(1e-6, 1.0 - ref_fire)
+    rel = min(1.0, excess / headroom)
+    r = min(1.0, max(0.0, rel))
+    shaped = 1.0 - (1.0 - r) ** BRIGHT_EXCESS_CURVE
+    ref_sens = max(BRIGHT_EXCESS_REF_MIN, min(0.99, ref_fire))
+    sens = min(
+        BRIGHT_EXCESS_SENS_CAP,
+        (BRIGHT_EXCESS_REF_PIVOT / ref_sens) ** BRIGHT_EXCESS_SENS_POWER,
+    )
+    return min(1.0, max(0.0, shaped * sens))
+
+
+def bright_excess_normalized(live_band_env, thresh_mode, band, effective_thresh_display):
+    """0..1 drive for reactive brightness from how far signal sits above the active threshold.
+
+    Lower threshold (smaller ref) increases gain; stronger peaks past the line push harder."""
+    global three_band_detector
+    if BEAT_DETECT_METHOD == 1 and three_band_detector is not None:
+        bi = THREEBAND_SELECTED
+        bc = three_band_detector.bands[bi]
+        ref = float(bc.trigger_thresh)
+        sig = float(three_band_detector.normalized_slope[bi])
+        return _bright_reactive_drive(ref, sig)
+    if thresh_mode == "fixed":
+        ref = float(band.thresh + HYST_FIRE_MARGIN)
+        return _bright_reactive_drive(ref, live_band_env)
+    ref = float(effective_thresh_display)
+    return _bright_reactive_drive(ref, live_band_env)
+
 
 # ===================== Encoder / Pot State =====================
 
@@ -1313,7 +1432,7 @@ class BandParams:
         # Handle both old 4-value and new 6-value preset formats
         if len(preset) >= 6:
             center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
-            THRESH_MODE_INDEX = thresh_mode
+            THRESH_MODE_INDEX = 0  # fixed threshold only; ignore stored thresh_mode
             RELEASE_MODE_INDEX = release_mode
         else:
             center_hz, thresh, decay_ms, q_factor = preset[:4]
@@ -1399,8 +1518,9 @@ def update_lights(dt_ms):
     base_brightness_display = int(BRIGHTNESS * 99)
     
     if release_mode in ("bright", "both"):
-        # Bright/both mode: use the reactive brightness scale (set on each trigger, stays until next)
+        # Bright/both: DMX follows reactive scale; keep OLED readout in sync every frame (like release ms).
         effective_brightness = _reactive_brightness_scale
+        _effective_brightness_display = max(0, min(99, int(effective_brightness * 99)))
     else:
         effective_brightness = BRIGHTNESS
         # Reset reactive brightness to base when not in bright/both mode
@@ -1934,6 +2054,89 @@ three_band_detector = None
 
 # ===================== Input device pick =====================
 
+def _portaudio_troubleshooting_hints():
+    """Extra hints when PortAudio has no devices (often kernel/ALSAR/USB did not expose a card)."""
+    parts = []
+    try:
+        out = subprocess.run(
+            ["arecord", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        blob = (out.stdout or "") + (out.stderr or "")
+        if not re.search(r"card\s+\d+:", blob, re.I):
+            parts.append(
+                "ALSA reports no capture devices (same as `arecord -l`): the kernel did not register "
+                "any mic/in interface, so PortAudio has nothing to open."
+            )
+    except Exception:
+        pass
+
+    kernel_usb = ""
+    try:
+        p = subprocess.run(
+            ["journalctl", "-k", "-n", "250", "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        ks = (p.stdout or "")
+        low = ks.lower()
+        if "not enough bandwidth" in low:
+            kernel_usb += (
+                'Recent kernel logs mention USB "Not enough bandwidth" / failed config '
+                "(common with full‑speed adapters behind a crowded hub).\nTry: plug "
+                "the audio interface straight into one of the Pi’s USB ports (not "
+                "through an unpowered hub), disconnect other bandwidth‑heavy USB devices, reboot, "
+                "then unplug/replug.\nConfirm with `arecord -l` listing a capture `card`, then rerun."
+            )
+        elif re.search(r"can't set config.*error\s*-28", ks, re.I):
+            kernel_usb += (
+                "Kernel failed to activate the USB audio device (often USB bandwidth/power). "
+                "Same remediation as above."
+            )
+    except Exception:
+        pass
+
+    if kernel_usb:
+        parts.append(kernel_usb)
+
+    try:
+        ar = subprocess.run(
+            ["arecord", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        ap = subprocess.run(
+            ["aplay", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        a_rec = (ar.stdout or "") + (ar.stderr or "")
+        a_play = (ap.stdout or "") + (ap.stderr or "")
+        if re.search(r"card\s+\d+:", a_play, re.I) and not re.search(
+            r"card\s+\d+:", a_rec, re.I
+        ):
+            parts.append(
+                "ALSA can see playback (often HDMI-only) but no capture devices at all — PortAudio "
+                "may enumerate zero interfaces (ALSA pcm asym / asym_default has no capture half). "
+                "For USB-input-only builds, ship /etc/modules-load.d with `snd-dummy` so there is "
+                "always a harmless capture PCM, then fix USB enumeration until `arecord -l` also "
+                "lists your dongle."
+            )
+    except Exception:
+        pass
+
+    return ("\n" + "\n".join(parts)) if parts else ""
+
+
 def _portaudio_devices_debug():
     """Human-readable list of all PortAudio devices (for error messages)."""
     try:
@@ -1942,28 +2145,35 @@ def _portaudio_devices_debug():
             inch = d.get("max_input_channels", 0)
             outch = d.get("max_output_channels", 0)
             lines.append(f"  [{i}] in={inch} out={outch} {d.get('name', '')!r}")
-        return "\n".join(lines) if lines else "  (empty device list)"
+        empty = "\n".join(lines) if lines else "  (empty device list)"
+        if not lines:
+            empty += _portaudio_troubleshooting_hints()
+        return empty
     except Exception as e:
         return f"  (could not list devices: {e})"
 
 
 def pick_input_device():
     devs = sd.query_devices()
+    use = _capture_devices_with_preferences(devs, prefer_real=True)
+    if not use:
+        use = _capture_devices_with_preferences(devs, prefer_real=False)
+    if not use:
+        raise RuntimeError(
+            "No suitable input device (>=1ch) found.\n"
+            "PortAudio sees:\n"
+            + _portaudio_devices_debug()
+            + "\nPlug in USB audio or enable your HAT, then retry. "
+            "Or pick a line above with in>0 and run: export AUDIO_DEVICE=<index>"
+        )
+
     for pat in PREFERRED_INPUTS:
         rx = re.compile(pat, re.I)
-        for i, d in enumerate(devs):
-            if d.get("max_input_channels",0) >= 1 and rx.search(d.get("name","")):
+        for i, d in use:
+            if rx.search(d.get("name", "")):
                 return i, d["name"], min(d.get("max_input_channels", 1), 2)
-    for i, d in enumerate(devs):
-        if d.get("max_input_channels",0) >= 1:
-            return i, d["name"], min(d.get("max_input_channels", 1), 2)
-    raise RuntimeError(
-        "No suitable input device (>=1ch) found.\n"
-        "PortAudio sees:\n"
-        + _portaudio_devices_debug()
-        + "\nPlug in USB audio or enable your HAT, then retry. "
-        "Or pick a line above with in>0 and run: export AUDIO_DEVICE=<index>"
-    )
+    i, d = use[0]
+    return i, d["name"], min(d.get("max_input_channels", 1), 2)
 
 def choose_input_device():
     devs = sd.query_devices()
@@ -1995,15 +2205,37 @@ def choose_input_device():
 
     if AUDIO_DEVICE_NAME:
         needle = AUDIO_DEVICE_NAME.lower()
+        primary = []
         for i, d in enumerate(devs):
-            if d.get("max_input_channels", 0) > 0 and needle in d.get("name", "").lower():
-                return i, d["name"], min(d.get("max_input_channels", 1), 2)
-        raise RuntimeError(
-            f'No input device name contains "{AUDIO_DEVICE_NAME}".\n'
-            "PortAudio sees:\n"
-            + _portaudio_devices_debug()
-            + "\nUnset AUDIO_DEVICE_NAME to auto-pick, or set AUDIO_DEVICE=<index>."
-        )
+            inch = int(d.get("max_input_channels", 0) or 0)
+            if inch <= 0:
+                continue
+            nm = (d.get("name") or "")
+            if not _looks_like_placeholder_capture(nm):
+                primary.append((i, d))
+
+        if primary:
+            for i, d in primary:
+                if needle in (d.get("name", "").lower()):
+                    return i, d["name"], min(d.get("max_input_channels", 1), 2)
+            footer = (
+                "\nUnset AUDIO_DEVICE_NAME to auto-pick (when PortAudio already lists inputs), "
+                "or set AUDIO_DEVICE=<index>."
+            )
+            if len(devs) == 0:
+                footer = (
+                    "\nClearing AUDIO_DEVICE_NAME will not help while no devices appear above — "
+                    "fix ALSA/USB until `arecord -l` shows a capture card, then rerun."
+                )
+            raise RuntimeError(
+                f'No input device name contains "{AUDIO_DEVICE_NAME}".\n'
+                "PortAudio sees:\n"
+                + _portaudio_devices_debug()
+                + footer
+            )
+
+        # Only ALSA placeholders (snd_dummy etc.) exposed — substring match is pointless.
+        return pick_input_device()
 
     return pick_input_device()
 
@@ -2022,10 +2254,10 @@ def _apply_encoder_delta(enc_idx, direction):
     (no velocity scaling on those parameters).
     
     Args:
-        enc_idx: 1=Freq/Q, 2=Thresh/ThreshMode, 3=Release/ReleaseMode, 4=Brightness
+        enc_idx: 1=Freq/Q, 2=Thresh, 3=Release/ReleaseMode, 4=Brightness
         direction: 1 for CW, -1 for CCW
     """
-    global BRIGHTNESS, THRESH_MODE_INDEX, RELEASE_MODE_INDEX
+    global BRIGHTNESS, RELEASE_MODE_INDEX
     global _brightness_target, _discrete_last_change
     global _reactive_brightness_scale, _effective_brightness_display, _brightness_knob_last_turn
     global _effective_release_display, _release_knob_last_turn
@@ -2080,7 +2312,7 @@ def _apply_encoder_delta(enc_idx, direction):
                 band.center = new_center
             return
         
-        # ===== Encoder 3 (enc_idx=2): Trigger Threshold/ThreshMode (disabled in AMBIENT) =====
+        # ===== Encoder 3 (enc_idx=2): Trigger threshold (disabled in AMBIENT) =====
         # On Settings tab: Detection Mode when _setup_enc3_detect; else same Trigger knob as HOME (band.thresh).
         # Input gain is encoder 1 edit on Settings "Gain" column only.
         if enc_idx == 2:
@@ -2107,16 +2339,6 @@ def _apply_encoder_delta(enc_idx, direction):
                         0.0,
                         min(1.0, band.thresh + base_delta * ENC_STEP_TRIG_BRIGHT),
                     )
-            elif _home_enc3_alt:
-                now = time.time()
-                elapsed_ms = (now - _discrete_last_change[2]) * 1000
-                if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                    delta = 1 if direction > 0 else -1
-                    new_idx = max(0, min(len(THRESH_MODES) - 1, THRESH_MODE_INDEX + delta))
-                    if new_idx != THRESH_MODE_INDEX:
-                        THRESH_MODE_INDEX = new_idx
-                        _discrete_last_change[2] = now
-                        save_current_as_default()
             else:
                 band.thresh = max(
                     0.0,
@@ -2215,15 +2437,15 @@ def toggle_brightness():
 
 def save_current_as_default():
     """Save current band params and modes as the selected default preset.
-    Called when 'saved!' appears after 1..2..3 countdown - captures trigger mode
-    (THRESH_MODE_INDEX) and release mode (RELEASE_MODE_INDEX) at that moment."""
+    Called when 'saved!' appears after 1..2..3 countdown - captures release mode
+    (RELEASE_MODE_INDEX) at that moment. Threshold mode is always fixed (0)."""
     mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-    # Update in-memory preset with all 6 values (incl. trigger + release mode)
+    # Update in-memory preset with all 6 values (thresh_mode slot always 0 = fixed)
     DEFAULTS_PRESETS[mode_name] = (band.center, band.thresh, band.decay_ms, band.q,
-                                    THRESH_MODE_INDEX, RELEASE_MODE_INDEX)
+                                    0, RELEASE_MODE_INDEX)
     # Persist to config file
     save_preset_values(mode_name, band.center, band.thresh, band.decay_ms, band.q,
-                       THRESH_MODE_INDEX, RELEASE_MODE_INDEX)
+                       0, RELEASE_MODE_INDEX)
 
 def setup_gpio_inputs():
     """Initialize GPIO pins for encoders and reset button.
@@ -2629,7 +2851,7 @@ def _handle_submenu_value_change(direction):
             if len(preset) >= 6:
                 center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode = preset
                 global THRESH_MODE_INDEX, RELEASE_MODE_INDEX
-                THRESH_MODE_INDEX = thresh_mode
+                THRESH_MODE_INDEX = 0
                 RELEASE_MODE_INDEX = release_mode
             else:
                 center_hz, thresh, decay_ms, q_factor = preset[:4]
@@ -2637,6 +2859,8 @@ def _handle_submenu_value_change(direction):
             band.thresh = thresh
             band.decay_ms = decay_ms
             band.q = q_factor
+            global _home_enc2_range_pct
+            _home_enc2_range_pct = None  # Resync Range ladder from restored band.q
             save_defaults_mode(DEFAULTS_MODE_INDEX)
             ui_flash(f"Reset: {mode_name}", 0.5)
         elif col == 2:
@@ -2653,10 +2877,8 @@ def _handle_submenu_value_change(direction):
             save_dmx_channel_count(DMX_CHANNEL_COUNT)
             ui_flash(f"Chans: {DMX_CHANNEL_COUNT}", 0.5)
         elif col == 2:
-            # Band selection (LOW/MID/HIGH) - clamped, no cycling
-            global SETUP_BAND_INDEX
-            SETUP_BAND_INDEX = max(0, min(len(SETUP_BAND_OPTIONS) - 1, SETUP_BAND_INDEX + direction))
-            ui_flash(f"Band: {SETUP_BAND_OPTIONS[SETUP_BAND_INDEX]}", 0.5)
+            # Column 3 is blank - no action
+            pass
 
 
 def encoder_reader():
@@ -2669,7 +2891,7 @@ def encoder_reader():
     global current_page
     global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state, _reset_press_time
     global _enc_state, _enc_count, _enc_last_click_time, _enc_velocity_mult
-    global _home_enc2_alt, _home_enc3_alt, _home_enc4_alt
+    global _home_enc2_alt, _home_enc4_alt
     global _enc2_press_time, _enc2_saving, _enc2_save_complete
     global submenu_tab, submenu_column, submenu_editing
     global _enc_awaiting_release
@@ -2743,7 +2965,7 @@ def encoder_reader():
                     else:
                         # Selection mode: move between columns (Settings has only Gain + Defaults)
                         _max_submenu_col = (
-                            1 if SUBMENU_TABS[submenu_tab] == "Settings" else 2
+                            2 if SUBMENU_TABS[submenu_tab] == "Presets" else 1
                         )
                         submenu_column = max(
                             0, min(_max_submenu_col, submenu_column + direction)
@@ -2855,9 +3077,6 @@ def encoder_reader():
                             if SUBMENU_TABS[submenu_tab] == "Settings":
                                 _setup_enc3_detect = not _setup_enc3_detect
                                 ui_flash("Mode: Detect" if _setup_enc3_detect else "Mode: Trigger", 0.5)
-                            else:
-                                _home_enc3_alt = not _home_enc3_alt
-                                ui_flash("Mode: Th-Mode" if _home_enc3_alt else "Mode: Trigger", 0.5)
                             _enc_awaiting_release[2] = True
                     _enc_last_sw[2] = enc3_sw
                     
@@ -2890,7 +3109,7 @@ def encoder_reader():
                         _apply_encoder_delta(4, direction)
                 else:
                     # I2S HAT mode: E3/E4/E5 rotation disabled, but buttons work on E3 and E5
-                    # E3 button (GPIO23) - toggle thresh mode
+                    # E3 button (GPIO23): Settings tab toggles Detect/Trigger; no action on HOME
                     enc3_sw = GPIO.input(ENC3_SW)
                     if _enc_awaiting_release[2]:
                         if enc3_sw == 1:
@@ -2902,9 +3121,6 @@ def encoder_reader():
                             if SUBMENU_TABS[submenu_tab] == "Settings":
                                 _setup_enc3_detect = not _setup_enc3_detect
                                 ui_flash("Mode: Detect" if _setup_enc3_detect else "Mode: Trigger", 0.5)
-                            else:
-                                _home_enc3_alt = not _home_enc3_alt
-                                ui_flash("Mode: Th-Mode" if _home_enc3_alt else "Mode: Trigger", 0.5)
                             _enc_awaiting_release[2] = True
                     _enc_last_sw[2] = enc3_sw
                     
@@ -2930,7 +3146,7 @@ def encoder_reader():
                 
                 # ===== Reset button (GPIO 25) =====
                 # Short press = cycle through submenu tabs (PRE -> SET -> PRE...)
-                # Long press (3s) = reset freq/thresh/release to defaults
+                # Long press (2s) = reset band to current Defaults slot (freq, thresh, Q/range, release, etc.)
                 reset_btn = GPIO.input(RESET_PIN)
                 if reset_btn == 0 and _reset_last_state == 1:
                     # Button just pressed - start timing
@@ -2940,17 +3156,21 @@ def encoder_reader():
                     if _reset_press_time > 0:
                         hold_duration = time.time() - _reset_press_time
                         if hold_duration >= 2.0:
-                            # Long press detected - reset to defaults
+                            # Long press detected - reset to defaults (full preset incl. Q/range + release mode)
                             global _fft_reset_msg_until
                             mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
                             preset = DEFAULTS_PRESETS[mode_name]
                             if len(preset) >= 6:
-                                center_hz, thresh, decay_ms, q_factor, _, _ = preset
+                                center_hz, thresh, decay_ms, q_factor, _, release_mode = preset
+                                global RELEASE_MODE_INDEX
+                                RELEASE_MODE_INDEX = release_mode
                             else:
                                 center_hz, thresh, decay_ms, q_factor = preset[:4]
                             band.center = center_hz
                             band.thresh = thresh
                             band.decay_ms = decay_ms
+                            band.q = q_factor
+                            _home_enc2_range_pct = None  # Resync Range ladder from restored band.q
                             _fft_reset_msg_until = time.time() + 1.0  # Show "reset!" modal for 1s
                             ui_flash("Reset to defaults", 1.0)
                             _reset_press_time = 0  # Prevent repeated triggers
@@ -3001,6 +3221,9 @@ bp   = None
 envd = None
 agc  = Agc(target=AGC_TARGET, tau=0.95)
 
+# Classic detection (bandpass + envelope + AGC): absolute smoothed envelope before UI scaling
+classic_abs_ema = 0.0
+
 def get_band_energy(fft_magnitudes, freqs, low_hz, high_hz):
     """Get energy in a frequency band from FFT data.
     Uses interpolation for bands that fall between FFT bins."""
@@ -3031,9 +3254,12 @@ def audio_loop():
     global fft_bands, fft_peaks, fft_peak_times, fft_recent_max
     global three_band_detector, _last_3band_update
 
+    global classic_abs_ema
+
     bp   = BiquadBandpass(SR, band.center, band.q)
     envd = EnvDetector(SR, attack_ms=8.0, release_ms=80.0)
-    
+    classic_abs_ema = 0.0
+
     # Initialize 3-band onset detector
     three_band_detector = ThreeBandOnsetDetector(SR, n_fft=FFT_SIZE)
 
@@ -3058,6 +3284,7 @@ def audio_loop():
         global _q_band_running_avg, _flux_recent_max
         global _fft_hp_y, _fft_hp_x_prev
         global _fft_low_smooth
+        global classic_abs_ema
 
         if not RUNNING:
             return
@@ -3127,17 +3354,6 @@ def audio_loop():
             fft_flux = np.maximum(0.0, fft_flux - FFT_FLUX_DEADZONE)
         prev_band_energies = raw_levels.copy()
         
-        # ===== 3-Band Onset Detector =====
-        # Use the SAME normalized fft_bands that the display uses
-        # This ensures the VU meter matches what you see on the FFT
-        global _last_3band_update
-        if three_band_detector is not None:
-            # Run detector at THREEBAND_UPDATE_HZ (100 Hz)
-            dt = now - _last_3band_update
-            if dt >= 1.0 / THREEBAND_UPDATE_HZ:
-                three_band_detector.update_from_fft_bands(fft_bands, FFT_BANDS, dt)
-                _last_3band_update = now
-        
         # Apply per-band normalization (spectral whitening) - SKIPPED for performance
         # The raw_levels are already compensated and work well enough
         whitened_levels = raw_levels  # Use raw levels directly
@@ -3195,6 +3411,14 @@ def audio_loop():
             else:
                 fft_display_bands[:] = fft_bands
         
+        # ===== 3-Band Onset Detector ===== (after fft_bands updated this hop)
+        global _last_3band_update
+        if three_band_detector is not None:
+            dt = now - _last_3band_update
+            if dt >= 1.0 / THREEBAND_UPDATE_HZ:
+                three_band_detector.update_from_fft_bands(fft_bands, FFT_BANDS, dt)
+                _last_3band_update = now
+        
         # Vectorized peak tracking
         new_peak_mask = fft_bands > fft_peaks
         fft_peaks[new_peak_mask] = fft_bands[new_peak_mask]
@@ -3227,43 +3451,55 @@ def audio_loop():
         else:
             display_mean_in_q = 0.0
             q_flux_mean = 0.0
-        
-        # Same scale as OLED (_draw_fft_spectrum uses level * FFT_VISUAL_GAIN vs thresh).
-        # Previously hybrid/flux/transient inflated q_band_max above the bars, and extra envelope lag
-        # caused triggers when bars looked below the line (or missed when they looked above).
-        q_band_max = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
-        
-        # Optional alternate detection (Settings): still compute for diagnostics / future use
+
         detect_mode = DETECT_MODES[DETECT_MODE_INDEX]
-        if detect_mode != "level":
-            if detect_mode == "flux":
-                _flux_recent_max = max(_flux_recent_max * 0.99, q_flux_mean)
-                q_band_max = q_flux_mean / max(0.001, _flux_recent_max)
-            elif detect_mode == "hybrid":
-                base = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
-                _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base
-                if base >= FFT_HYBRID_MIN_LEVEL:
-                    onset_ratio = base / max(0.01, _q_band_running_avg)
-                    onset_boost = min(0.3, max(0.0, (onset_ratio - 1.2) * 0.25))
-                    flux_boost = min(0.15, q_flux_mean * 2.0)
-                    q_band_max = min(1.0, base + onset_boost + flux_boost)
-                else:
-                    q_band_max = base
-            elif detect_mode == "transient":
-                base_vis = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
-                onset_ratio = base_vis / max(0.01, _q_band_running_avg)
-                _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base_vis
-                onset_score = min(1.0, max(0.0, (onset_ratio - 1.0) / 2.0))
-                flux_score = min(1.0, q_flux_mean * 4.0)
-                q_band_max = max(onset_score, flux_score)
-        
-        # Light temporal smoothing on q_band_max to dampen single-hop FFT spikes
-        _q_band_smooth = Q_BAND_SMOOTH_COEF * _q_band_smooth + (1.0 - Q_BAND_SMOOTH_COEF) * q_band_max
-        # Envelope: instant attack (track displayed bars), smooth release only (reduces threshold chatter)
-        if _q_band_smooth >= live_band_env:
-            live_band_env = _q_band_smooth
+        # Classic pi-dmx-controller path: biquad → envelope → AGC → EMA.
+        # Map to 0–1 like legacy absolute env vs thresh (no FFT-style peak follower — preserves kick punch).
+        if BEAT_DETECT_METHOD == 0 and detect_mode == "level":
+            bp.set_params(band.center, band.q)
+            y_bp = bp.process(x)
+            e_env = envd.process(y_bp)
+            g_agc = agc.update(float(np.mean(e_env))) if AGC_ON else 1.0
+            wgt = math.sqrt(max(1.0, band.center / 100.0)) if WEIGHTING_ON else 1.0
+            e_scaled = e_env * (g_agc * wgt)
+            va = classic_abs_ema
+            a_em = ENV_EMA
+            for s in e_scaled:
+                va = a_em * va + (1.0 - a_em) * float(s)
+            classic_abs_ema = va
+            cm = float(va)
+            denom = max(AGC_TARGET * CLASSIC_UI_SCALE, 1e-10)
+            live_band_env = min(1.0, cm / denom)
         else:
-            live_band_env = ENV_EMA * live_band_env + (1.0 - ENV_EMA) * _q_band_smooth
+            # FFT-derived envelope (level / flux / hybrid / transient) — same scale as spectrum bars vs thresh line.
+            q_band_max = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
+            if detect_mode != "level":
+                if detect_mode == "flux":
+                    _flux_recent_max = max(_flux_recent_max * 0.99, q_flux_mean)
+                    q_band_max = q_flux_mean / max(0.001, _flux_recent_max)
+                elif detect_mode == "hybrid":
+                    base = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
+                    _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base
+                    if base >= FFT_HYBRID_MIN_LEVEL:
+                        onset_ratio = base / max(0.01, _q_band_running_avg)
+                        onset_boost = min(0.3, max(0.0, (onset_ratio - 1.2) * 0.25))
+                        flux_boost = min(0.15, q_flux_mean * 2.0)
+                        q_band_max = min(1.0, base + onset_boost + flux_boost)
+                    else:
+                        q_band_max = base
+                elif detect_mode == "transient":
+                    base_vis = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
+                    onset_ratio = base_vis / max(0.01, _q_band_running_avg)
+                    _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base_vis
+                    onset_score = min(1.0, max(0.0, (onset_ratio - 1.0) / 2.0))
+                    flux_score = min(1.0, q_flux_mean * 4.0)
+                    q_band_max = max(onset_score, flux_score)
+            _q_band_smooth = Q_BAND_SMOOTH_COEF * _q_band_smooth + (1.0 - Q_BAND_SMOOTH_COEF) * q_band_max
+            if _q_band_smooth >= live_band_env:
+                live_band_env = _q_band_smooth
+            else:
+                live_band_env = ENV_EMA * live_band_env + (1.0 - ENV_EMA) * _q_band_smooth
+
         live_threshold = band.thresh
 
         # Update tracking variable for adaptive threshold mode
@@ -3299,8 +3535,8 @@ def audio_loop():
         global trigger_flash, _brightness_click_flash
         _brightness_click_flash = _brightness_click_flash * 0.9  # Decay click indicator
 
-        # Determine trigger based on detection method and threshold mode
-        thresh_mode = THRESH_MODES[THRESH_MODE_INDEX]
+        # Determine trigger based on detection method (FFT path: fixed threshold with hysteresis only)
+        thresh_mode = "fixed"
         should_trigger = False
         
         # Check if using 3BAND detection mode
@@ -3309,7 +3545,7 @@ def audio_loop():
             should_trigger = three_band_detector.trigger[THREEBAND_SELECTED]
             # Use the selected band's adaptive threshold for display
             _effective_thresh = three_band_detector.get_adaptive_threshold(THREEBAND_SELECTED)
-        elif thresh_mode == "fixed":
+        else:
             # FFT_STANDARD: Fixed edge-triggered with hysteresis — re-arm when env falls below
             # thresh - margin; fire only when crossing above thresh + margin. Reduces misfires.
             fire_thresh = band.thresh + HYST_FIRE_MARGIN
@@ -3322,26 +3558,14 @@ def audio_loop():
             if should_trigger:
                 _hysteresis_armed = False
             above = above_hyst  # For was_above: track hysteresis crossing, not simple thresh
-        elif thresh_mode == "adapt":
-            # FFT_STANDARD: Adaptive - trigger on rise above recent minimum, with hysteresis
-            adapt_thresh = 0.02 + band.thresh * 0.58
-            fire_thresh = adapt_thresh + ADAPT_FIRE_MARGIN
-            if live_band_env < _recent_min - ADAPT_REARM_MARGIN:
-                _adapt_armed = True
-            relative_rise = live_band_env - _recent_min
-            _effective_thresh = min(1.0, _recent_min + adapt_thresh)  # Show where trigger point is
-            should_trigger = relative_rise >= fire_thresh and can_fire and _adapt_armed
-            if should_trigger:
-                _recent_min = live_band_env  # Reset after trigger
-                _adapt_armed = False
 
         if should_trigger and active_prog in (1, 2, 3, 4, 5):
             # Calculate time since last trigger for speed multiplier
             time_since_last_ms = (now - last_trigger_ts) * 1000.0
             
-            # Update speed multiplier based on trigger interval
-            # Slow triggers (> 1000ms apart) = max multiplier (2.0x) - boosts effect
-            # Fast triggers (< 200ms apart) = min multiplier (0.3x) - dampens effect
+            # Speed multiplier vs trigger spacing (TRIG_DEBUG; "both"/"bright" brightness uses threshold excess)
+            # Slow triggers (> 1000ms apart) = max multiplier (2.0x)
+            # Fast triggers (< 200ms apart) = min multiplier (0.3x)
             if time_since_last_ms >= TRIGGER_SPEED_SLOW_MS:
                 _trigger_speed_multiplier = TRIGGER_SPEED_MAX_MULT
             elif time_since_last_ms <= TRIGGER_SPEED_FAST_MS:
@@ -3361,51 +3585,35 @@ def audio_loop():
             release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
             effective_decay = band.decay_ms
             
-            # Calculate boost amount from signal energy directly
-            # live_band_env is 0-1, representing the smoothed amplitude of the frequency band
-            # Louder/more energetic = higher value = more boost
-            # This works the same regardless of threshold mode
+            # Signal level for react release accent; bright/both use threshold excess separately
             boost_amount = live_band_env
-            
-            # Multiply amplitude by speed multiplier
-            # Fast triggers (< 200ms) = 1.0x (just amplitude)
-            # Slow triggers (> 1000ms) = 2.0x (amplitude doubled)
-            combined_boost = boost_amount * _trigger_speed_multiplier
-            
+            bright_excess = bright_excess_normalized(
+                live_band_env, thresh_mode, band, _effective_thresh
+            )
+
             if release_mode == "react":
-                # Reactive: release scales up from set value based on signal strength + speed
-                # Check if we're still in the buffer period after knob turn
+                # Reactive: release length follows trigger spacing (sparse = long, dense = short),
+                # with a small extra from hit strength. Same ms breakpoints as bright-mode speed.
                 if (now - _release_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
-                    # Max 300% boost based on combined signal strength and trigger speed
-                    scale = 1.0 + min(3.0, combined_boost * 3.0)  # 1x to 4x
-                    effective_decay = band.decay_ms * scale
-                    # Update display value (in ms)
+                    scale = react_release_scale_from_interval_ms(time_since_last_ms, boost_amount)
+                    effective_decay = max(40.0, min(5000.0, band.decay_ms * scale))
                     _effective_release_display = int(effective_decay)
             elif release_mode == "bright":
-                # Reactive brightness: brightness scales up from set value based on signal strength + speed
-                # Check if we're still in the buffer period after knob turn
+                # Reactive brightness: further above threshold → more lift from base brightness
                 if (now - _brightness_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
-                    # Max 50% boost based on combined signal strength and trigger speed
-                    boost = min(0.5, combined_boost * 0.5) * BRIGHTNESS  # Up to 50% of set brightness
+                    boost = bright_excess * BRIGHT_THRESHOLD_EXCESS_MAX_DELTA
                     _reactive_brightness_scale = min(1.0, BRIGHTNESS + boost)
-                    # Update display value (0-99 scale)
                     _effective_brightness_display = int(_reactive_brightness_scale * 99)
                     _effective_brightness_display = max(0, min(99, _effective_brightness_display))
             elif release_mode == "both":
-                # Both: combines react (release scaling) and bright (brightness scaling)
-                # Check release buffer
+                # Spacing-based release (same as "react") + threshold-based brightness (same as "bright")
                 if (now - _release_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
-                    # Max 300% boost based on combined signal strength and trigger speed
-                    scale = 1.0 + min(3.0, combined_boost * 3.0)  # 1x to 4x
-                    effective_decay = band.decay_ms * scale
-                    # Update display value (in ms)
+                    scale = react_release_scale_from_interval_ms(time_since_last_ms, boost_amount)
+                    effective_decay = max(40.0, min(5000.0, band.decay_ms * scale))
                     _effective_release_display = int(effective_decay)
-                # Check brightness buffer
                 if (now - _brightness_knob_last_turn) >= REACTIVE_BUFFER_SECONDS:
-                    # Max 50% boost based on combined signal strength and trigger speed
-                    boost = min(0.5, combined_boost * 0.5) * BRIGHTNESS  # Up to 50% of set brightness
+                    boost = bright_excess * BRIGHT_THRESHOLD_EXCESS_MAX_DELTA
                     _reactive_brightness_scale = min(1.0, BRIGHTNESS + boost)
-                    # Update display value (0-99 scale)
                     _effective_brightness_display = int(_reactive_brightness_scale * 99)
                     _effective_brightness_display = max(0, min(99, _effective_brightness_display))
             elif release_mode == "rand":
@@ -3660,14 +3868,41 @@ class OledUI:
                     (px, y - 1), fill=OLED_BLACK if main_white else OLED_WHITE
                 )
 
+    def _draw_env_meter_h(self, draw, x, y, width, height, env_val, thr_eff):
+        """Horizontal bar under spectrum: white fill from left = envelope; dashed | = threshold."""
+        if width < 8 or height < 3:
+            return
+        draw.rectangle((x, y, x + width - 1, y + height - 1), outline=OLED_WHITE)
+        inner_x0 = x + 1
+        inner_x1 = x + width - 2
+        inner_y0 = y + 1
+        inner_y1 = y + height - 2
+        iw = inner_x1 - inner_x0 + 1
+        ih = inner_y1 - inner_y0 + 1
+        if iw < 1 or ih < 1:
+            return
+        ev = max(0.0, min(1.0, float(env_val)))
+        tw = int(ev * iw)
+        if tw > 0:
+            draw.rectangle(
+                (inner_x0, inner_y0, inner_x0 + tw - 1, inner_y1), fill=OLED_WHITE
+            )
+        te = max(0.0, min(1.0, float(thr_eff)))
+        tx = inner_x0 + int(te * iw)
+        tx = max(inner_x0, min(inner_x1, tx))
+        env_edge = inner_x0 + tw - 1 if tw > 0 else inner_x0 - 1
+        for py in range(inner_y0, inner_y1 + 1):
+            if (py + tx) % 2 != 0:
+                continue
+            on_white = tw > 0 and inner_x0 <= tx <= env_edge
+            draw.point((tx, py), fill=OLED_BLACK if on_white else OLED_WHITE)
+
     def _draw_fft_spectrum(self, draw, x, y, width, height):
-        """Draw FFT spectrum with Q band highlighting and beat indicator.
-        - Left: Beat indicator bar showing live_band_env with trigger flash
-        - Q styling (gray above threshold / white body) only in x between frequency markers
-          (same span as vertical lines; bars are equal-width so we clip per band to that x range)
-        - Outside that x span: solid white bars
+        """Draw FFT spectrum with Q band highlighting.
+        - Env meter is drawn below this region (see render_once / _draw_env_meter_h).
+        - Q styling: white bars inside the selected Freq/Q range; gray outside (vertical markers show edges).
         - Q range boundaries: thin dashed vertical markers
-        - Threshold: dashed ruler; becomes a 2-row inverted band when Q audio crosses above it"""
+        - Optional dashed threshold ruler (env FFT_SPECTRUM_THRESH_LINE=1); default off — use env meter below."""
         
         # FFT spectrum uses full width
         fft_x = x
@@ -3691,63 +3926,49 @@ class OledUI:
         
         # Use display-smoothed bands (temporal EMA + optional spatial); triggers still use raw fft_bands
         draw_bands = _smooth_fft_display_bands(fft_display_bands)
-        # Calculate bar positions to fill the entire width (no gaps)
         bar_step = fft_width / num_bands
         any_q_above_thresh = False
-        
+
         for i, level in enumerate(draw_bands):
             bx_start = fft_x + int(i * bar_step)
             bx_end = fft_x + int((i + 1) * bar_step) - 1
-            
+
             if bx_end >= fft_x + fft_width:
                 bx_end = fft_x + fft_width - 1
             if bx_start >= fft_x + fft_width:
                 continue
-            
+
             bar_h = int(level * height * FFT_VISUAL_GAIN)
             if bar_h <= 0:
                 continue
-            
-            # Clip to view height (bars can exceed view with visual gain)
+
             bar_h = min(bar_h, height)
-            
+
             bar_top = y + height - bar_h
             bar_bottom = y + height - 1
-            
-            # Q highlight must match vertical markers in *pixel* space. Bars are uniform width
-            # but markers use _freq_to_x; frequency-only tests misalign gray caps with lines.
+
             sx = max(bx_start, q_x0)
             ex = min(bx_end, q_x1)
             q_overlap = sx <= ex
-            
-            # Outside-Q portions of this bar (same solid white as non-Q bars)
+
+            # Outside selected frequency range: gray. Inside range: white.
             if bx_start < q_x0:
                 left_end = min(bx_end, q_x0 - 1)
                 if bx_start <= left_end:
                     draw.rectangle(
-                        (bx_start, bar_top, left_end, bar_bottom), fill=OLED_WHITE
+                        (bx_start, bar_top, left_end, bar_bottom), fill=OLED_GRAY
                     )
             if bx_end > q_x1:
                 right_start = max(bx_start, q_x1 + 1)
                 if right_start <= bx_end:
                     draw.rectangle(
-                        (right_start, bar_top, bx_end, bar_bottom), fill=OLED_WHITE
+                        (right_start, bar_top, bx_end, bar_bottom), fill=OLED_GRAY
                     )
-            
+
             if q_overlap:
                 if bar_top < thresh_y:
                     any_q_above_thresh = True
-                    above_top = bar_top
-                    above_bottom = min(thresh_y - 1, bar_bottom)
-                    if above_top <= above_bottom:
-                        draw.rectangle(
-                            (sx, above_top, ex, above_bottom),
-                            fill=FFT_ABOVE_THRESH_FILL,
-                        )
-                    if thresh_y <= bar_bottom:
-                        draw.rectangle((sx, thresh_y, ex, bar_bottom), fill=OLED_WHITE)
-                else:
-                    draw.rectangle((sx, bar_top, ex, bar_bottom), fill=OLED_WHITE)
+                draw.rectangle((sx, bar_top, ex, bar_bottom), fill=OLED_WHITE)
         
         x_right = fft_x + fft_width - 1
         y_bottom = y + height - 1
@@ -3755,8 +3976,8 @@ class OledUI:
         self._draw_fft_contrast_vline(draw, low_x, y, y_bottom, fft_x, x_right)
         self._draw_fft_contrast_vline(draw, high_x, y, y_bottom, fft_x, x_right)
         
-        # Threshold (horizontal within Q range, same x span as gray/white Q fill)
-        if y <= thresh_y <= y_bottom:
+        # Threshold ruler (visual only; gray/white Q fill still uses thresh_y above)
+        if FFT_SPECTRUM_THRESH_LINE and y <= thresh_y <= y_bottom:
             self._draw_fft_contrast_hline(
                 draw,
                 q_x0,
@@ -4072,28 +4293,26 @@ class OledUI:
         else:
             draw.text((x, y), f"P{BASE_PROGRAM}", font=self._font_small, fill=OLED_WHITE)
         
-        # Sun icon + brightness percentage (use smoothed display value)
+        # Sun icon + brightness percentage (reactive bright/both: live value like release column)
         self._draw_sun_icon(draw, x, y + 10, size=7)
         release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
         base_brt = int(_display_bright * 100)
-        if release_mode in ("bright", "both") and _effective_brightness_display > base_brt:
-            # Show effective brightness when boosted in bright/both mode
+        if release_mode in ("bright", "both"):
             brt_pct = _effective_brightness_display
-            draw.text((x + 9, y + 11), f"{brt_pct:2d}", font=self._font_small, fill=OLED_WHITE)
         else:
-            draw.text((x + 9, y + 11), f"{base_brt:2d}", font=self._font_small, fill=OLED_WHITE)
+            brt_pct = base_brt
+        draw.text((x + 9, y + 11), f"{brt_pct:2d}", font=self._font_small, fill=OLED_WHITE)
     
     def _draw_brightness_inline(self, draw, x, y):
         """Draw sun icon + brightness percentage inline."""
         self._draw_sun_icon(draw, x, y, size=7)
         release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
         base_brt = int(_display_bright * 100)
-        if release_mode in ("bright", "both") and _effective_brightness_display > base_brt:
-            # Show effective brightness when boosted in bright/both mode
+        if release_mode in ("bright", "both"):
             brt_pct = _effective_brightness_display
-            draw.text((x + 9, y + 1), f"{brt_pct:2d}", font=self._font_small, fill=OLED_WHITE)
         else:
-            draw.text((x + 9, y + 1), f"{base_brt:2d}", font=self._font_small, fill=OLED_WHITE)
+            brt_pct = base_brt
+        draw.text((x + 9, y + 1), f"{brt_pct:2d}", font=self._font_small, fill=OLED_WHITE)
     
     def _draw_trigger_indicator(self, draw, x, y):
         """Draw trigger indicator dot at specified position."""
@@ -4188,7 +4407,7 @@ class OledUI:
         elif page_name == "HOME":
             labels = [
                 "Range" if _home_enc2_alt else "Freq",
-                "Th-Mode" if _home_enc3_alt else "Thresh",
+                "Thresh",
                 "R-Mode" if _home_enc4_alt else "Release"
             ]
         # Override labels for SET page based on encoder toggle states
@@ -4220,7 +4439,7 @@ class OledUI:
         # Kerning value for letter spacing (1 = 1 extra pixel between chars)
         # Use tighter kerning (0) for longer labels/values to fit on screen
         # Use extra tight kerning (-1) for very long values
-        tight_labels = {"Th-Mode", "R-Mode"}  # Labels that need tighter kerning
+        tight_labels = {"R-Mode"}  # Labels that need tighter kerning
         tight_values = {"rnd/amb", "rnd"}  # Values that need tighter kerning (kern=0)
         extra_tight_values = set()  # Values that need extra tight kerning (kern=-1)
         
@@ -4308,13 +4527,8 @@ class OledUI:
                                     val_str = f"{freq_khz:.1f}kHz"
                             else:
                                 val_str = f"{int(freq_hz)}Hz"
-                    elif i == 1:  # Threshold or ThreshMode (based on toggle)
-                        if _home_enc3_alt:
-                            # ThreshMode - show current mode name
-                            val_str = THRESH_MODES[THRESH_MODE_INDEX]
-                        else:
-                            # Threshold - 0-99
-                            val_str = f"{int(_display_thresh * 99)}"
+                    elif i == 1:  # Threshold (fixed mode only)
+                        val_str = f"{int(_display_thresh * 99)}"
                     else:  # Release or ReleaseMode (based on toggle)
                         if _home_enc4_alt:
                             # ReleaseMode - show current mode name
@@ -4433,7 +4647,7 @@ class OledUI:
         else:
             labels = [
                 "Range" if _home_enc2_alt else "Freq",
-                "Th-Mode" if _home_enc3_alt else "Trigger",
+                "Trigger",
                 "R-Mode" if _home_enc4_alt else "Release",
                 "Brightness"
             ]
@@ -4445,7 +4659,7 @@ class OledUI:
         
         for i in range(4):
             px = x + i * (col_width + spacing)
-            label_kern = 0 if labels[i] in {"Th-Mode", "R-Mode"} else 1
+            label_kern = 0 if labels[i] in {"R-Mode"} else 1
             self._draw_text_kerned(draw, (px, y), labels[i], self._font_small, fill=OLED_WHITE, kerning=label_kern)
             
             # Format value based on column
@@ -4483,11 +4697,8 @@ class OledUI:
                             val_str = f"{freq_khz:.1f}kHz"
                         else:
                             val_str = f"{int(freq_hz)}Hz"
-                elif i == 1:  # Trigger threshold or mode
-                    if _home_enc3_alt:
-                        val_str = THRESH_MODES[THRESH_MODE_INDEX]
-                    else:
-                        val_str = f"{int(_display_thresh * 99)}"
+                elif i == 1:  # Trigger threshold
+                    val_str = f"{int(_display_thresh * 99)}"
                 elif i == 2:  # Release or mode
                     if _home_enc4_alt:
                         val_str = RELEASE_MODES[RELEASE_MODE_INDEX]
@@ -4502,7 +4713,11 @@ class OledUI:
                     if _brightness_off and not _brightness_fading:
                         val_str = "OFF"
                     else:
-                        val_str = f"{int(BRIGHTNESS * 100)}"
+                        rm = RELEASE_MODES[RELEASE_MODE_INDEX]
+                        if rm in ("bright", "both"):
+                            val_str = f"{_effective_brightness_display}"
+                        else:
+                            val_str = f"{int(BRIGHTNESS * 100)}"
             
             self._draw_text_kerned(draw, (px, y + 9), val_str, self._font_small, fill=OLED_WHITE, kerning=1)
 
@@ -4641,8 +4856,8 @@ class OledUI:
                     val_str = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
                 elif i == 1:  # Channels
                     val_str = str(DMX_CHANNEL_COUNT)
-                else:  # Band
-                    val_str = SETUP_BAND_OPTIONS[SETUP_BAND_INDEX]
+                else:  # Column 3 is blank
+                    val_str = ""
             else:
                 val_str = "--"
             
@@ -4728,9 +4943,26 @@ class OledUI:
             half_width = cw // 2  # ~125px
             top_height = 38  # Taller top section for submenu content
             
-            # Top-left: FFT spectrum
+            # Top-left: FFT (squashed) + horizontal env vs threshold — same outer box as before
             draw.rectangle((cx, cy, cx + half_width - 1, cy + top_height - 1), outline=OLED_WHITE)
-            self._draw_fft_spectrum(draw, cx + 1, cy + 1, half_width - 2, top_height - 2)
+            inner_x = cx + 1
+            inner_y = cy + 1
+            inner_w = half_width - 2
+            inner_h = top_height - 2
+            meter_h = 6
+            gap_y = 1
+            fft_h = inner_h - meter_h - gap_y
+            fft_h = max(8, fft_h)
+            self._draw_fft_spectrum(draw, inner_x, inner_y, inner_w, fft_h)
+            self._draw_env_meter_h(
+                draw,
+                inner_x,
+                inner_y + fft_h + gap_y,
+                inner_w,
+                meter_h,
+                live_band_env,
+                _effective_thresh,
+            )
             
             # Top-right: Submenu area (taller to fit 3 lines)
             submenu_x = cx + half_width + 2
@@ -4999,15 +5231,15 @@ def tui(stdscr):
 
         row = 4
         safe_addstr(stdscr, row, 0, "Band Env vs Threshold (| is threshold):")
-        draw_threshold_meter(stdscr, row+1, 0, bar_width, live_band_env, band.thresh)
-        safe_addstr(stdscr, row+2, 0, f"env={live_band_env:.4f}")
+        draw_threshold_meter(stdscr, row + 1, 0, bar_width, live_band_env, band.thresh)
+        safe_addstr(stdscr, row + 2, 0, f"env={live_band_env:.4f}")
 
-        safe_addstr(stdscr, row+4, 0, "Targeted Frequency Band:")
-        draw_band_bar(stdscr, row+5, 0, bar_width, band.center, band.q)
+        safe_addstr(stdscr, row + 4, 0, "Targeted Frequency Band:")
+        draw_band_bar(stdscr, row + 5, 0, bar_width, band.center, band.q)
 
-        safe_addstr(stdscr, row+7, 0, "Channels:")
+        safe_addstr(stdscr, row + 7, 0, "Channels:")
         for i, s in enumerate(states, start=1):
-            safe_addstr(stdscr, row+7+i, 1, f"ch{i}: env={s.env:.3f} post={s.post:.3f} {'ON' if s.active else 'off'}")
+            safe_addstr(stdscr, row + 7 + i, 1, f"ch{i}: env={s.env:.3f} post={s.post:.3f} {'ON' if s.active else 'off'}")
 
         # Display persistent error in elegant box at bottom of screen
         error_msg, error_time, error_type = get_error()
