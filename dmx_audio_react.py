@@ -94,10 +94,10 @@ DMX_OUTPUT_MODES = ["Dimmer", "(DMX)"]  # DMX in parentheses = disabled/not yet 
 # DMX Channel Count (4-24, affects all preset patterns)
 DMX_CHANNEL_COUNT = 4
 
-# Startup defaults (used by "LOW" mode)
-DEFAULT_CENTER_HZ = 120.0   # 120 Hz
-DEFAULT_Q         = 4.24    # 60 on 0-99 scale ((10-4.24)/9.5*99 = 60)
-DEFAULT_THRESH    = 0.61    # 60 on 0-99 scale (0.61 * 99 = 60.39 → 60)
+# Startup defaults (used by "LOW" mode) — tuned for kick body around 80 Hz, classic mode
+DEFAULT_CENTER_HZ = 80.0    # 80 Hz: kick body
+DEFAULT_Q         = 1.5     # focused but not too narrow
+DEFAULT_THRESH    = 0.50    # 50 on 0-99 scale (sits above classic's ~33% steady state, trips on peaks)
 DEFAULT_ATTACK_MS = 10.0
 DEFAULT_DECAY_MS  = 542.0   # 10 on 0-99 scale ((542-40)/4960*99 = 10.02 → 10)
 DEFAULT_BRIGHT    = 0.5
@@ -109,7 +109,7 @@ DEFAULT_BRIGHT    = 0.5
 DEFAULTS_MODES = ["LOW", "MID", "HIGH", "USR 1", "USR 2", "USR 3"]
 DEFAULTS_PRESETS = {
     #           (center_hz, thresh, decay_ms, q_factor, thresh_mode, release_mode)
-    "LOW":   (120.0,  0.40, 542.0, 2.0, 0, 0),    # Low frequencies ~120Hz, thresh=40
+    "LOW":   (80.0,   0.50, 542.0, 1.5, 0, 0),    # Kick body ~80Hz, thresh=50 (classic mode default)
     "MID":   (1000.0, 0.41, 542.0, 1.5, 0, 0),    # Mid frequencies ~1kHz, thresh=40
     "HIGH":  (5000.0, 0.25, 542.0, 0.82, 0, 0),   # High frequencies ~5kHz, thresh=25, Q display=90
     "USR 1": (1200.0, 0.40, 542.0, 0.65, 0, 0),   # User preset 1: 1.2kHz, Q display=99
@@ -120,10 +120,14 @@ DEFAULTS_PRESETS = {
 # Config file for persisting settings
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dmx_config")
 
-# Input gain applied to audio (absolute dB). UI shows relative dB with 0 = INPUT_GAIN_REF_DB (calmer default).
-INPUT_GAIN_REF_DB = -12
-INPUT_GAIN_MIN_DB = INPUT_GAIN_REF_DB - 24  # -36
-INPUT_GAIN_MAX_DB = INPUT_GAIN_REF_DB + 24  # +12
+# Input gain applied to audio (absolute dB). UI shows relative dB with 0 = INPUT_GAIN_REF_DB.
+# Reference calibrated for Behringer UFO202 and similar consumer USB interfaces.
+# IMPORTANT: INPUT_GAIN_REF_DB anchors the visual "0 dB" in Settings. Bumping the
+# underlying default for a calmer chain (e.g. to make FFT visible) does NOT shift
+# the user's 0 point — the UI keeps showing 0 dB at whatever default we choose.
+INPUT_GAIN_REF_DB = 12  # 0dB display = +12 dB absolute boost (good level for UFO202 + bandpass)
+INPUT_GAIN_MIN_DB = INPUT_GAIN_REF_DB - 24  # absolute floor (display: -24 dB)
+INPUT_GAIN_MAX_DB = INPUT_GAIN_REF_DB + 24  # absolute ceiling (display: +24 dB)
 INPUT_GAIN_DB = INPUT_GAIN_REF_DB
 
 def load_defaults_mode():
@@ -440,18 +444,28 @@ HOP = int(os.environ.get("AUDIO_HOP", "1024").strip() or "1024")  # Larger defau
 _HANNING_WINDOW = None  # Pre-computed, initialized on first use
 
 # Detection / logic
-ENV_EMA       = 0.55   # Match legacy pi-dmx-controller; snappier envelope for kick transients
+ENV_EMA       = 0.55   # Restored old-project value; smooth envelope without chatter
 AGC_ON        = True
 AGC_TARGET    = 0.020
-# Classic detection: map envelope to 0–1 via env / (AGC_TARGET * scale). Higher scale = lower meter/trigger
-# sensitivity (need louder kicks). Tune with env CLASSIC_UI_SCALE if kicks miss or double-fire.
-CLASSIC_UI_SCALE = float(os.environ.get("CLASSIC_UI_SCALE", "5.0"))
-REFRACTORY_MS = 130.0  # Slightly longer minimum spacing to reduce double-fires (was 110)
-# Hysteresis for fixed threshold: re-arm when env falls below thresh - margin;
-# fire only when crossing above thresh (optionally thresh + small margin). Reduces threshold chatter.
-HYST_REARM_MARGIN = 0.035   # Must fall this far below thresh before next trigger can fire
-HYST_FIRE_MARGIN = 0.02     # Must cross this far above thresh to fire (rejects noise on the line)
-Q_BAND_SMOOTH_COEF = 0.65   # One-pole EMA on q_band_max before envelope; dampens single-hop FFT spikes
+# CLASSIC_UI_SCALE divides the AGC-stabilized envelope so the meter has dynamic
+# range. AGC pulls the post-EMA value toward AGC_TARGET (=0.02) at steady state;
+# with scale=3.0, denom=0.06 → average music sits at ~0.33 on the 0..1 meter and
+# transients (kick hits) pop into the 0.6–1.0 range. Lower it (e.g. 1.0) to make
+# the meter more "always-on", raise it (e.g. 5.0) for an even more peaky meter.
+CLASSIC_UI_SCALE = float(os.environ.get("CLASSIC_UI_SCALE", "3.0"))
+# Noise gate (classic mode): if the raw band envelope mean falls below this absolute
+# floor, freeze AGC (don't let it pump noise up toward target) and decay the displayed
+# envelope toward zero. ~0.0008 ≈ -62 dBFS; tune for your input chain.
+NOISE_GATE_RMS = float(os.environ.get("NOISE_GATE_RMS", "0.0008"))
+# Cap the AGC's maximum gain (was 20×). 8× ≈ +18 dB still amplifies quiet music,
+# but won't pump silence to full scale.
+AGC_MAX_GAIN = float(os.environ.get("AGC_MAX_GAIN", "8.0"))
+REFRACTORY_MS = 110.0  # Match old project; refractory + edge detect handles double-fires
+# Hysteresis margins are no longer used by the new trigger modes (classic/compander/kick).
+# The compander/onset path naturally suppresses chatter; refractory + edge detect is enough.
+HYST_REARM_MARGIN = 0.0     # Disabled; new modes don't use it
+HYST_FIRE_MARGIN = 0.0      # Disabled; new modes don't use it
+Q_BAND_SMOOTH_COEF = 0.65   # Restored; FFT path only (display, not trigger)
 # Adaptive threshold: hysteresis and smoother floor
 ADAPT_REARM_MARGIN = 0.03   # Must fall this far below floor before next trigger can fire
 ADAPT_FLOOR_EMA = 0.93      # EMA for floor when env below floor; averaged baseline, not instant
@@ -504,6 +518,15 @@ _effective_thresh = 0.3     # Effective threshold for display (varies by mode)
 _q_band_running_avg = 0.1   # Running average for onset ratio calculation
 _flux_recent_max = 0.001    # Tracks recent max flux for auto-normalization
 
+# Per-Q-band normalization: auto-scales the targeted frequency range independently
+# so that frequency-specific triggers are consistent regardless of overall mix level.
+_q_band_recent_max = 0.15   # Running max for the Q-band (decays slowly)
+_q_band_recent_min = 0.01   # Running floor for the Q-band
+Q_BAND_NORM_DECAY = 0.994   # How fast the Q-band normalizer forgets peaks (faster decay = more dynamic)
+Q_BAND_NORM_ATTACK = 0.5    # How fast to jump to new peaks (faster = more responsive)
+Q_BAND_NORM_FLOOR_DECAY = 0.998  # Floor decay (faster = tighter floor tracking)
+Q_BAND_NORM_ENABLED = os.environ.get("Q_BAND_NORM", "0").strip() != "0"  # Disabled by default; FFT path no longer drives trigger
+
 # Release modes
 RELEASE_MODES = ["fixed", "react", "bright", "both", "rand"]
 RELEASE_MODE_INDEX = 0  # Default to fixed (current behavior)
@@ -540,12 +563,11 @@ BRIGHT_EXCESS_REF_MIN = 0.03  # floor for sensitivity divisor only (stability at
 # shaped_rel = 1 - (1-rel)^curve  rewards being well above the line vs barely over
 BRIGHT_EXCESS_CURVE = 2.15
 
-# Detection modes for FFT analysis (when not using classic bandpass path — see audio cb).
-# - "level": FFT Q-band mean for triggers unless BEAT_DETECT_METHOD is FFT + level (then classic DSP).
-# - "flux": Spectral flux (onset-heavy)
-# - "hybrid": Level + onset/flux boost
-# - "transient": Onset ratio + flux
-DETECT_MODES = ["level", "flux", "hybrid", "transient"]
+# Trigger detection modes (each is a separate algorithm; FFT spectrum display is unaffected).
+# - "classic":   biquad bandpass + envelope + AGC + outer EMA (faithful old-project chain)
+# - "compander": biquad + envelope + adaptive compander (RMS floor / peak ceiling) + onset boost
+# - "kick":      cascaded biquads + faster envelope + decay-only floor + slope-weighted + peak-hold meter
+DETECT_MODES = ["classic", "compander", "kick", "old"]
 
 
 def load_detect_mode_index():
@@ -589,9 +611,12 @@ def save_detect_mode_index():
 
 
 DETECT_MODE_INDEX = load_detect_mode_index()
-# Optional: FORCE_DETECT_LEVEL=1 always use level (WYSIWYG with threshold line)
-if os.environ.get("FORCE_DETECT_LEVEL", "").strip() in ("1", "true", "yes"):
-    DETECT_MODE_INDEX = 0
+# Optional override: DETECT_MODE=classic|compander|kick (or legacy FORCE_DETECT_LEVEL=1 -> classic)
+_dmenv = os.environ.get("DETECT_MODE", "").strip().lower()
+if _dmenv in DETECT_MODES:
+    DETECT_MODE_INDEX = DETECT_MODES.index(_dmenv)
+elif os.environ.get("FORCE_DETECT_LEVEL", "").strip() in ("1", "true", "yes"):
+    DETECT_MODE_INDEX = 0  # "classic" is index 0 in the new list
 
 # Beat detection method: 0 = FFT_STANDARD (Q-band analysis)
 # 3-band mode has been removed - now using FFT-only mode
@@ -697,14 +722,14 @@ OLED_GRAY = (128, 128, 128)
 # Submenu tabs (cycled by reset button)
 SUBMENU_TABS = ["Presets", "Settings", "Setup"]
 submenu_tab = 0        # 0=PRE, 1=SET, 2=SETUP
-submenu_column = 0     # Column index; max depends on tab (Presets: 0–2; Settings/Setup: 0–1)
+submenu_column = 0     # Column index; max depends on tab (Presets: 0–2; Settings: 0–2; Setup: 0–1)
 submenu_editing = False  # True when encoder 1 is editing selected column value
 
 # Submenu column labels for each tab
 SUBMENU_LABELS = {
     "Presets": ["Preset", "Mode", "Beats"],
-    "Settings": ["Gain", "Defaults", ""],    # Defaults = preset selector, col 3 blank
-    "Setup": ["Output", "Chans", ""],   # Output=Dimmer/DMX, Chans=4-24; col 3 blank (layout)
+    "Settings": ["Gain", "Defaults", "Detect"],   # Detect = trigger algorithm (classic/compander/kick)
+    "Setup": ["Output", "Chans", ""],              # Output=Dimmer/DMX, Chans=4-24; col 3 blank (layout)
 }
 
 # HOME controls (always visible on bottom half)
@@ -878,7 +903,7 @@ def get_all_band_energies_vectorized(fft_mag):
     return (band_sums / _FFT_BIN_COUNTS).astype(np.float32)
 
 # Visual gain for FFT display (makes bars appear taller within fixed view)
-FFT_VISUAL_GAIN = 1.0
+FFT_VISUAL_GAIN = 1.0  # Default 1.0; trigger modes do their own normalization
 
 # FFT state (numpy arrays for faster vectorized operations)
 fft_bands = np.zeros(len(FFT_BANDS), dtype=np.float32)
@@ -1665,16 +1690,266 @@ class EnvDetector:
         return out
 
 class Agc:
-    def __init__(self, target=0.02, tau=0.95):
+    def __init__(self, target=0.02, tau=0.95, max_gain=8.0):
         self.target=target
         self.gain  = 1.0
         self.tau   = tau
+        self.max_gain = max_gain
     def update(self, env_mean):
         eps=1e-6
         desired=self.target/max(eps, env_mean)
-        desired=max(0.1, min(20.0, desired))
+        desired=max(0.1, min(self.max_gain, desired))
         self.gain=self.tau*self.gain+(1.0-self.tau)*desired
         return self.gain
+
+# ===================== Trigger Mode State =====================
+# Per-mode running state for the three trigger algorithms.
+# Each helper updates only its own state; switching modes leaves the others untouched.
+
+# classic mode: outer EMA (legacy) — uses module-level live_band_env and Agc instance
+# Kept here for clarity; actual EMA accumulator is `classic_abs_ema` (already declared).
+
+# compander mode state
+_comp_running_rms  = 0.001  # ~5s running mean of band envelope (long-term floor)
+_comp_running_peak = 0.05   # ~250ms decaying peak of band envelope (short-term ceiling)
+_comp_running_smax = 0.01   # decaying max of slope (for onset normalization)
+_comp_prev_e       = 0.0    # last per-block envelope scalar
+_comp_meter_ema    = 0.0    # smoothed live_band_env for display
+
+# kick mode state (separate from compander so they can coexist)
+_kick_bp2 = None            # second cascaded biquad (initialized in audio_loop)
+_kick_envd = None           # dedicated faster envelope detector
+_kick_running_rms  = 0.001
+_kick_running_peak = 0.05
+_kick_running_smax = 0.01
+_kick_prev_e       = 0.0
+_kick_peak_hold    = 0.0    # peak-hold meter value
+_kick_peak_t       = 0.0    # timestamp of last peak-set
+KICK_PEAK_HOLD_S   = 0.15   # how long meter holds peaks before decaying
+
+# "old" mode: frozen replica of the pre-agent-changes "level" detection path.
+# Same chain as classic, but with the legacy CLASSIC_UI_SCALE=5.0 divisor and
+# the original AGC max-gain of 20×, and crucially NO noise gate. Kept here for
+# A/B testing against the new modes; uses its own EMA/AGC state so it doesn't
+# share running state with classic.
+OLD_CLASSIC_UI_SCALE = 5.0   # legacy divisor; denom = AGC_TARGET * 5.0 = 0.10
+OLD_AGC_MAX_GAIN     = 20.0  # legacy AGC ceiling (was hard-coded before)
+_old_classic_abs_ema = 0.0
+_old_agc             = None  # lazily constructed on first use to honor module-level Agc
+
+
+def _trigger_classic(x_block, bp_obj, envd_obj, agc_obj):
+    """Faithful restore of the old project's signal chain, with noise gate.
+
+    Pipeline: bandpass -> envelope -> noise gate -> AGC -> outer EMA -> live_band_env
+    Returns: (live_band_env, trigger_score) -- both equal in this mode.
+    """
+    global classic_abs_ema
+    bp_obj.set_params(band.center, band.q)
+    y_bp  = bp_obj.process(x_block)
+    e_env = envd_obj.process(y_bp)
+    e_mean_raw = float(np.mean(e_env))
+
+    denom = max(AGC_TARGET * CLASSIC_UI_SCALE, 1e-10)
+
+    # Noise gate: if the raw band envelope is below the absolute floor, freeze the
+    # AGC (don't ramp up to chase noise) and decay the displayed envelope toward 0.
+    # Without this, AGC pumps room noise up to ~AGC_TARGET and live_band_env sits
+    # near 1.0 even with no signal.
+    if e_mean_raw < NOISE_GATE_RMS:
+        a_em = ENV_EMA
+        # Decay toward zero (no signal contribution) at the same EMA rate.
+        # Approximate per-block decay: a_em^N where N=len(x_block); cheap and stable.
+        try:
+            n = len(x_block)
+        except TypeError:
+            n = 1
+        decay = a_em ** n
+        classic_abs_ema = float(classic_abs_ema) * decay
+        lbe = min(1.0, float(classic_abs_ema) / denom)
+        return lbe, lbe
+
+    g_agc = agc_obj.update(e_mean_raw) if AGC_ON else 1.0
+    wgt   = math.sqrt(max(1.0, band.center / 100.0)) if WEIGHTING_ON else 1.0
+    e_scaled = e_env * (g_agc * wgt)
+
+    # Per-sample EMA on the scaled envelope, like the old project
+    va  = classic_abs_ema
+    a_em = ENV_EMA
+    for s in e_scaled:
+        va = a_em * va + (1.0 - a_em) * float(s)
+    classic_abs_ema = va
+
+    # Map AGC-scaled envelope to 0..1 (CLASSIC_UI_SCALE=1.0 lets it reach 1.0)
+    lbe = min(1.0, float(va) / denom)
+    return lbe, lbe
+
+
+def _trigger_compander(x_block, bp_obj, envd_obj):
+    """Adaptive compander + onset boost.
+
+    Pipeline:
+      bandpass -> envelope -> per-block scalar
+      -> running RMS (floor) + running peak (ceiling) -> normalize 0..1
+      -> half-wave-rectified slope -> normalize against running max -> onset 0..1
+      -> score = max(norm, 0.5*onset)
+    Returns: (live_band_env_smoothed_for_display, raw_score_for_trigger)
+    """
+    global _comp_running_rms, _comp_running_peak, _comp_running_smax
+    global _comp_prev_e, _comp_meter_ema
+
+    bp_obj.set_params(band.center, band.q)
+    y_bp  = bp_obj.process(x_block)
+    e_env = envd_obj.process(y_bp)
+    e_scalar = float(np.mean(e_env))
+
+    # Running RMS (~5s window at 48kSR/1024hop ~= 47Hz block rate; coef tuned for ~5s)
+    _comp_running_rms = 0.998 * _comp_running_rms + 0.002 * e_scalar
+    # Running peak with ~250ms decay
+    _comp_running_peak = max(_comp_running_peak * 0.995, e_scalar)
+
+    floor   = max(0.001, _comp_running_rms)
+    ceiling = max(_comp_running_peak, floor * 4.0)
+    norm    = (e_scalar - floor) / max(ceiling - floor, 1e-6)
+    norm    = max(0.0, min(1.0, norm))
+
+    # Slope (rising-edge only)
+    slope = max(0.0, e_scalar - _comp_prev_e)
+    _comp_prev_e = e_scalar
+    _comp_running_smax = max(_comp_running_smax * 0.995, slope)
+    onset = slope / max(_comp_running_smax, 1e-6)
+    onset = max(0.0, min(1.0, onset))
+
+    score = max(norm, 0.5 * onset)
+    # Meter: smoothed for visual stability, but trigger uses raw score
+    _comp_meter_ema = ENV_EMA * _comp_meter_ema + (1.0 - ENV_EMA) * score
+    return _comp_meter_ema, score
+
+
+def _trigger_kick(x_block, bp_obj):
+    """Dedicated kick detector.
+
+    Pipeline:
+      cascaded biquad (bp_obj -> _kick_bp2) -> faster envelope (5ms/60ms)
+      -> compander (running_rms only updated on decays) -> norm 0..1
+      -> slope-weighted score = 0.4*norm + 0.6*onset
+      -> peak-hold meter (~150ms)
+    Returns: (peak_hold_meter, raw_score_for_trigger)
+    """
+    global _kick_bp2, _kick_envd
+    global _kick_running_rms, _kick_running_peak, _kick_running_smax
+    global _kick_prev_e, _kick_peak_hold, _kick_peak_t
+
+    bp_obj.set_params(band.center, band.q)
+    if _kick_bp2 is None:
+        _kick_bp2 = BiquadBandpass(SR, band.center, band.q)
+    if _kick_envd is None:
+        _kick_envd = EnvDetector(SR, attack_ms=5.0, release_ms=60.0)
+    _kick_bp2.set_params(band.center, band.q)
+
+    # Cascaded bandpass for sharper sub-bass roll-off
+    y1 = bp_obj.process(x_block)
+    y2 = _kick_bp2.process(y1)
+    e_env = _kick_envd.process(y2)
+    e_scalar = float(np.mean(e_env))
+
+    # Slope first so we can decide whether to update the floor
+    slope = e_scalar - _kick_prev_e
+    _kick_prev_e = e_scalar
+
+    # Running RMS only updated on decays (slope <= 0): "learn the noise floor when nothing is hitting"
+    if slope <= 0.0:
+        _kick_running_rms = 0.995 * _kick_running_rms + 0.005 * e_scalar
+    # Peak with ~200ms decay
+    _kick_running_peak = max(_kick_running_peak * 0.993, e_scalar)
+
+    floor   = max(0.001, _kick_running_rms)
+    ceiling = max(_kick_running_peak, floor * 5.0)
+    norm    = (e_scalar - floor) / max(ceiling - floor, 1e-6)
+    norm    = max(0.0, min(1.0, norm))
+
+    # Onset = positive slope normalized against its own decaying max
+    pos_slope = max(0.0, slope)
+    _kick_running_smax = max(_kick_running_smax * 0.993, pos_slope)
+    onset = pos_slope / max(_kick_running_smax, 1e-6)
+    onset = max(0.0, min(1.0, onset))
+
+    # Slope-weighted score: kicks are dominated by onsets, but level still matters
+    score = 0.4 * norm + 0.6 * onset
+    score = max(0.0, min(1.0, score))
+
+    # Peak-hold meter for max visual contrast
+    now = time.time()
+    if score >= _kick_peak_hold:
+        _kick_peak_hold = score
+        _kick_peak_t = now
+    else:
+        if (now - _kick_peak_t) > KICK_PEAK_HOLD_S:
+            # decay toward current score after hold expires
+            _kick_peak_hold = max(score, _kick_peak_hold * 0.92)
+
+    return _kick_peak_hold, score
+
+
+def _trigger_kick_effective_thresh():
+    """Adaptive trigger margin for kick mode: never let the trigger fire below the noise floor."""
+    return max(band.thresh, _kick_running_rms * 2.5 + 0.05)
+
+
+def _trigger_old(x_block, bp_obj, envd_obj):
+    """Frozen replica of the pre-agent-changes 'level' detection path.
+
+    Pipeline: bandpass -> envelope -> AGC (max 20×) -> per-sample EMA -> normalize by 0.02 * 5.0
+    No noise gate; AGC is free to pump up quiet signal toward target. Uses its own
+    AGC instance and EMA accumulator so flipping between modes doesn't cross-contaminate state.
+    """
+    global _old_classic_abs_ema, _old_agc
+    if _old_agc is None:
+        _old_agc = Agc(target=AGC_TARGET, tau=0.95, max_gain=OLD_AGC_MAX_GAIN)
+    bp_obj.set_params(band.center, band.q)
+    y_bp  = bp_obj.process(x_block)
+    e_env = envd_obj.process(y_bp)
+    g_agc = _old_agc.update(float(np.mean(e_env))) if AGC_ON else 1.0
+    wgt   = math.sqrt(max(1.0, band.center / 100.0)) if WEIGHTING_ON else 1.0
+    e_scaled = e_env * (g_agc * wgt)
+
+    va  = _old_classic_abs_ema
+    a_em = ENV_EMA
+    for s in e_scaled:
+        va = a_em * va + (1.0 - a_em) * float(s)
+    _old_classic_abs_ema = va
+
+    denom = max(AGC_TARGET * OLD_CLASSIC_UI_SCALE, 1e-10)
+    lbe = min(1.0, float(va) / denom)
+    return lbe, lbe
+
+
+def _reset_trigger_state():
+    """Clear per-mode running state (used on mode switch or reset)."""
+    global _comp_running_rms, _comp_running_peak, _comp_running_smax
+    global _comp_prev_e, _comp_meter_ema
+    global _kick_running_rms, _kick_running_peak, _kick_running_smax
+    global _kick_prev_e, _kick_peak_hold, _kick_peak_t
+    global classic_abs_ema
+    global _old_classic_abs_ema, _old_agc
+    _comp_running_rms = 0.001
+    _comp_running_peak = 0.05
+    _comp_running_smax = 0.01
+    _comp_prev_e = 0.0
+    _comp_meter_ema = 0.0
+    _kick_running_rms = 0.001
+    _kick_running_peak = 0.05
+    _kick_running_smax = 0.01
+    _kick_prev_e = 0.0
+    _kick_peak_hold = 0.0
+    _kick_peak_t = 0.0
+    _old_classic_abs_ema = 0.0
+    _old_agc = None  # rebuilt on next call with correct max_gain
+    try:
+        classic_abs_ema = 0.0
+    except NameError:
+        pass
+
 
 # ===================== 3-Band Onset Detector =====================
 
@@ -2332,6 +2607,7 @@ def _apply_encoder_delta(enc_idx, direction):
                             DETECT_MODE_INDEX = new_idx
                             _discrete_last_change[2] = now
                             save_detect_mode_index()
+                            _reset_trigger_state()  # clear running state of all modes on switch
                             ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.5)
                 else:
                     # Trigger threshold (matches bottom-row "Trigger" label while on Settings)
@@ -2864,8 +3140,14 @@ def _handle_submenu_value_change(direction):
             save_defaults_mode(DEFAULTS_MODE_INDEX)
             ui_flash(f"Reset: {mode_name}", 0.5)
         elif col == 2:
-            # Column 3 is blank - no action
-            pass
+            # Detect: cycle through DETECT_MODES (classic / compander / kick)
+            global DETECT_MODE_INDEX
+            new_idx = max(0, min(len(DETECT_MODES) - 1, DETECT_MODE_INDEX + direction))
+            if new_idx != DETECT_MODE_INDEX:
+                DETECT_MODE_INDEX = new_idx
+                save_detect_mode_index()
+                _reset_trigger_state()  # clear running state of all modes on switch
+                ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.5)
     elif tab == "Setup":
         if col == 0:
             # Output mode (Dimmer/DMX)
@@ -2963,10 +3245,13 @@ def encoder_reader():
                         # Editing mode: adjust the selected column's value
                         _handle_submenu_value_change(direction)
                     else:
-                        # Selection mode: move between columns (Settings has only Gain + Defaults)
-                        _max_submenu_col = (
-                            2 if SUBMENU_TABS[submenu_tab] == "Presets" else 1
-                        )
+                        # Selection mode: move between columns
+                        # Presets: 3 cols (Preset/Mode/Beats); Settings: 3 cols (Gain/Defaults/Detect); Setup: 2 cols (Output/Chans)
+                        _tab_name = SUBMENU_TABS[submenu_tab]
+                        if _tab_name == "Setup":
+                            _max_submenu_col = 1
+                        else:
+                            _max_submenu_col = 2
                         submenu_column = max(
                             0, min(_max_submenu_col, submenu_column + direction)
                         )
@@ -3219,7 +3504,7 @@ TRIGGER_FLASH_DURATION = 0.08  # How long the flash stays visible (seconds)
 
 bp   = None
 envd = None
-agc  = Agc(target=AGC_TARGET, tau=0.95)
+agc  = Agc(target=AGC_TARGET, tau=0.95, max_gain=AGC_MAX_GAIN)
 
 # Classic detection (bandpass + envelope + AGC): absolute smoothed envelope before UI scaling
 classic_abs_ema = 0.0
@@ -3282,6 +3567,7 @@ def audio_loop():
         global _trigger_speed_multiplier
         global prev_band_energies, fft_flux, band_running_mean, band_running_max
         global _q_band_running_avg, _flux_recent_max
+        global _q_band_recent_max, _q_band_recent_min
         global _fft_hp_y, _fft_hp_x_prev
         global _fft_low_smooth
         global classic_abs_ema
@@ -3318,7 +3604,7 @@ def audio_loop():
                 raw_l_db = 20 * np.log10(raw_l_peak + 1e-10)
                 x_peak_db = 20 * np.log10(x_peak_val + 1e-10)
                 print(
-                    f"[AUDIO_DBG] frames={frames} ch={AUDIO_INPUT_CHANNEL_MODE} "
+                    f"[AUDIO_DBG] ch={AUDIO_INPUT_CHANNEL_MODE} "
                     f"raw_L={raw_l_db:.1f}dB x_peak={x_peak_db:.1f}dB "
                     f"gain={INPUT_GAIN_DB}dB indata.shape={indata.shape} "
                     f"status={status}",
@@ -3452,63 +3738,57 @@ def audio_loop():
             display_mean_in_q = 0.0
             q_flux_mean = 0.0
 
-        detect_mode = DETECT_MODES[DETECT_MODE_INDEX]
-        # Classic pi-dmx-controller path: biquad → envelope → AGC → EMA.
-        # Map to 0–1 like legacy absolute env vs thresh (no FFT-style peak follower — preserves kick punch).
-        if BEAT_DETECT_METHOD == 0 and detect_mode == "level":
-            bp.set_params(band.center, band.q)
-            y_bp = bp.process(x)
-            e_env = envd.process(y_bp)
-            g_agc = agc.update(float(np.mean(e_env))) if AGC_ON else 1.0
-            wgt = math.sqrt(max(1.0, band.center / 100.0)) if WEIGHTING_ON else 1.0
-            e_scaled = e_env * (g_agc * wgt)
-            va = classic_abs_ema
-            a_em = ENV_EMA
-            for s in e_scaled:
-                va = a_em * va + (1.0 - a_em) * float(s)
-            classic_abs_ema = va
-            cm = float(va)
-            denom = max(AGC_TARGET * CLASSIC_UI_SCALE, 1e-10)
-            live_band_env = min(1.0, cm / denom)
-        else:
-            # FFT-derived envelope (level / flux / hybrid / transient) — same scale as spectrum bars vs thresh line.
-            q_band_max = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
-            if detect_mode != "level":
-                if detect_mode == "flux":
-                    _flux_recent_max = max(_flux_recent_max * 0.99, q_flux_mean)
-                    q_band_max = q_flux_mean / max(0.001, _flux_recent_max)
-                elif detect_mode == "hybrid":
-                    base = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
-                    _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base
-                    if base >= FFT_HYBRID_MIN_LEVEL:
-                        onset_ratio = base / max(0.01, _q_band_running_avg)
-                        onset_boost = min(0.3, max(0.0, (onset_ratio - 1.2) * 0.25))
-                        flux_boost = min(0.15, q_flux_mean * 2.0)
-                        q_band_max = min(1.0, base + onset_boost + flux_boost)
-                    else:
-                        q_band_max = base
-                elif detect_mode == "transient":
-                    base_vis = min(1.0, float(display_mean_in_q) * FFT_VISUAL_GAIN)
-                    onset_ratio = base_vis / max(0.01, _q_band_running_avg)
-                    _q_band_running_avg = 0.95 * _q_band_running_avg + 0.05 * base_vis
-                    onset_score = min(1.0, max(0.0, (onset_ratio - 1.0) / 2.0))
-                    flux_score = min(1.0, q_flux_mean * 4.0)
-                    q_band_max = max(onset_score, flux_score)
-            _q_band_smooth = Q_BAND_SMOOTH_COEF * _q_band_smooth + (1.0 - Q_BAND_SMOOTH_COEF) * q_band_max
-            if _q_band_smooth >= live_band_env:
-                live_band_env = _q_band_smooth
+        # Per-Q-band normalization: auto-scale the targeted frequency range independently
+        # so triggers are consistent regardless of overall mix level changes.
+        global _q_band_recent_max, _q_band_recent_min
+        raw_q_level = display_mean_in_q
+        if Q_BAND_NORM_ENABLED and raw_q_level > 0:
+            # Update running max (fast attack, slow decay)
+            if raw_q_level > _q_band_recent_max:
+                _q_band_recent_max = Q_BAND_NORM_ATTACK * raw_q_level + (1 - Q_BAND_NORM_ATTACK) * _q_band_recent_max
             else:
-                live_band_env = ENV_EMA * live_band_env + (1.0 - ENV_EMA) * _q_band_smooth
+                _q_band_recent_max = Q_BAND_NORM_DECAY * _q_band_recent_max
+            _q_band_recent_max = max(0.05, _q_band_recent_max)  # Floor to prevent division issues
+            
+            # Update running floor (very slow adaptation)
+            if raw_q_level < _q_band_recent_min:
+                _q_band_recent_min = Q_BAND_NORM_FLOOR_DECAY * _q_band_recent_min + (1 - Q_BAND_NORM_FLOOR_DECAY) * raw_q_level
+            else:
+                _q_band_recent_min = min(_q_band_recent_min * 1.001, raw_q_level * 0.3)
+            _q_band_recent_min = max(0.001, min(_q_band_recent_min, _q_band_recent_max * 0.5))
+            
+            # Normalize: map [floor, max] to [0, 1] with some headroom
+            q_range = max(0.02, _q_band_recent_max - _q_band_recent_min)
+            normalized_q = (raw_q_level - _q_band_recent_min) / q_range
+            display_mean_in_q = min(1.0, max(0.0, normalized_q))
+
+        detect_mode = DETECT_MODES[DETECT_MODE_INDEX]
+        # Per-mode trigger pipeline (each mode keeps its own running state in module globals).
+        # FFT spectrum display above is unaffected; only the trigger compare changes.
+        if detect_mode == "compander":
+            live_band_env, trigger_score = _trigger_compander(x, bp, envd)
+            effective_thresh = band.thresh
+        elif detect_mode == "kick":
+            live_band_env, trigger_score = _trigger_kick(x, bp)
+            # Kick mode: noise-floor-aware effective threshold (never fires below floor)
+            effective_thresh = _trigger_kick_effective_thresh()
+        elif detect_mode == "old":
+            # Frozen replica of the pre-agent-changes "level" detection (legacy scale + AGC, no gate).
+            live_band_env, trigger_score = _trigger_old(x, bp, envd)
+            effective_thresh = band.thresh
+        else:  # "classic" (default / index 0)
+            live_band_env, trigger_score = _trigger_classic(x, bp, envd, agc)
+            effective_thresh = band.thresh
 
         live_threshold = band.thresh
 
-        # Update tracking variable for adaptive threshold mode
+        # Update tracking variable for adaptive threshold display only (no longer drives triggers)
         if live_band_env < _recent_min:
             _recent_min = ADAPT_FLOOR_EMA * _recent_min + (1.0 - ADAPT_FLOOR_EMA) * live_band_env
         else:
             _recent_min = min(_recent_min * 1.005, live_band_env)  # Slowly drift up when env above floor
 
-        above = (live_band_env >= band.thresh)
+        above = (trigger_score >= effective_thresh)
         can_fire = ((now - last_trigger_ts)*1000.0 >= REFRACTORY_MS)
 
         current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
@@ -3535,29 +3815,18 @@ def audio_loop():
         global trigger_flash, _brightness_click_flash
         _brightness_click_flash = _brightness_click_flash * 0.9  # Decay click indicator
 
-        # Determine trigger based on detection method (FFT path: fixed threshold with hysteresis only)
+        # Determine trigger: edge detect on raw trigger_score vs effective_thresh + refractory.
+        # The compander/onset/peak-hold pipelines already condition the score so the simple compare is enough.
         thresh_mode = "fixed"
         should_trigger = False
-        
-        # Check if using 3BAND detection mode
+
         if BEAT_DETECT_METHOD == 1 and three_band_detector is not None:
-            # 3BAND_DETECT mode: use trigger from selected band
+            # 3BAND_DETECT mode (legacy alternate): trigger from selected band
             should_trigger = three_band_detector.trigger[THREEBAND_SELECTED]
-            # Use the selected band's adaptive threshold for display
             _effective_thresh = three_band_detector.get_adaptive_threshold(THREEBAND_SELECTED)
         else:
-            # FFT_STANDARD: Fixed edge-triggered with hysteresis — re-arm when env falls below
-            # thresh - margin; fire only when crossing above thresh + margin. Reduces misfires.
-            fire_thresh = band.thresh + HYST_FIRE_MARGIN
-            rearm_thresh = band.thresh - HYST_REARM_MARGIN
-            if live_band_env < rearm_thresh:
-                _hysteresis_armed = True
-            above_hyst = live_band_env >= fire_thresh
-            _effective_thresh = band.thresh
-            should_trigger = above_hyst and not was_above and can_fire and _hysteresis_armed
-            if should_trigger:
-                _hysteresis_armed = False
-            above = above_hyst  # For was_above: track hysteresis crossing, not simple thresh
+            _effective_thresh = effective_thresh
+            should_trigger = above and not was_above and can_fire
 
         if should_trigger and active_prog in (1, 2, 3, 4, 5):
             # Calculate time since last trigger for speed multiplier
@@ -4849,8 +5118,8 @@ class OledUI:
                         if _enc1_save_progress >= 2.0 and (time.time() - _enc1_save_complete) >= 0.8:
                             _enc1_save_progress = 0.0
                         val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                else:  # Column 3 is blank
-                    val_str = ""
+                else:  # Column 3: Detect mode
+                    val_str = DETECT_MODES[DETECT_MODE_INDEX]
             elif tab == "Setup":
                 if i == 0:  # Output
                     val_str = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
