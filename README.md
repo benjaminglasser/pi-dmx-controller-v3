@@ -124,28 +124,41 @@ Disable DMX autostart for development:
 
 ```
 pi-dmx-controller-v2/
-├── dmx_audio_react.py      # Main app
-├── oled_boot.py            # Boot splash (CSW logo, CRT reveal)
+├── dmx_audio_react.py             # Main app (audio → FFT → DMX, OLED UI, encoders)
+├── oled_boot.py                   # Boot splash (CSW logo, CRT reveal)
+├── dmx_uart_test.py               # Quick UART DMX chase test (stop pi-dmx first)
+├── run_dmx.sh                     # Manual run with same env as pi-dmx.service
 ├── requirements.txt
 ├── config/
-│   ├── boot/config.txt     # Pi firmware (SPI / UART / audio overlays)
-│   ├── alsa/asound.conf    # HiFiBerry default device (optional)
-│   ├── udev/               # e.g. ttyAMA0 → dialout when UART is for DMX
-│   └── initramfs/          # Early OLED display
+│   ├── boot/config.txt            # Pi firmware (SPI / UART / audio overlays)
+│   ├── alsa/asound.conf           # HiFiBerry default device (optional)
+│   ├── udev/                      # ttyAMA0 → dialout for DMX after disabling serial console
+│   └── initramfs/                 # Early-boot OLED hook + script
 ├── scripts/
-│   ├── bootstrap_pi.sh     # Full system setup
-│   ├── dmx_probe.py        # Sweep frame length + break style (Chauvet / picky dimmers)
-│   ├── install_oled_splash.sh
-│   ├── install_oled_initramfs.sh
-│   └── dmx-dev             # systemctl disable/enable pi-dmx (autostart)
-├── dmx_uart_test.py        # Quick UART DMX chase test (stop pi-dmx first)
+│   ├── bootstrap_pi.sh                     # Full system setup (apt, venv, OLA, systemd)
+│   ├── apply_repo_boot_firmware_config.sh  # Re-copy config.txt with timestamped backup
+│   ├── audio-source.sh                     # Switch pi-dmx.service between USB and HiFiBerry
+│   ├── audio_test.py                       # Standalone PortAudio meter (sanity check capture)
+│   ├── build_oled_initramfs.sh             # Build static utils/oled_early
+│   ├── install_oled_initramfs.sh           # Install initramfs hooks (calls build_…)
+│   ├── install_oled_splash.sh              # Install/refresh oled_splash.service
+│   ├── dev_ui.py                           # Re-launch app with clean env (USB + TUI)
+│   ├── dmx-dev                             # Toggle pi-dmx autostart (disable/enable/status)
+│   ├── dmx_probe.py                        # Sweep frame length + break style (picky dimmers)
+│   ├── stop.sh                             # Stop pi-dmx & blank the OLED
+│   ├── verify_universe.sh                  # Print + repatch ola-universe.conf
+│   └── wm8960-rebind.sh                    # SB Components WM8960 codec workaround
 ├── systemd/
-│   ├── pi-dmx.service
-│   └── oled_splash.service
+│   ├── pi-dmx.service             # Main app unit (USB defaults; HiFiBerry block commented)
+│   ├── oled_splash.service        # Splash before pi-dmx
+│   └── wm8960-rebind.service      # Optional: WM8960 codec HAT rebind workaround
 ├── deploy/
-│   └── pi-dmx.service      # Alternate template
-└── utils/
-    └── oled_initramfs.c    # C source for early display
+│   └── pi-dmx.service             # Alternate template (older paths — superseded by systemd/)
+├── utils/
+│   └── oled_initramfs.c           # C source for early display
+└── docs/
+    ├── QUICKSTART.md              # ★ Canonical onboarding (fresh SD card → working system)
+    └── WIRING.md
 ```
 
 ---

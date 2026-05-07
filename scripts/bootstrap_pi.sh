@@ -7,11 +7,13 @@ sudo apt-get update
 sudo apt-get -y -o Dpkg::Options::="--force-confold" full-upgrade
 
 echo "[2/7] Core packages"
+# build-essential is required by scripts/install_oled_initramfs.sh (gcc -static)
 sudo apt-get install -y -o Dpkg::Options::="--force-confold" \
   git python3 python3-venv python3-pip \
   alsa-utils libportaudio2 portaudio19-dev libsndfile1 \
   ola ola-python \
-  python3-pil i2c-tools
+  python3-pil i2c-tools \
+  build-essential
 
 echo "[3/7] Enable SPI/I2C (non-interactive)"
 sudo raspi-config nonint do_spi 0
