@@ -125,7 +125,10 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dmx_con
 # IMPORTANT: INPUT_GAIN_REF_DB anchors the visual "0 dB" in Settings. Bumping the
 # underlying default for a calmer chain (e.g. to make FFT visible) does NOT shift
 # the user's 0 point — the UI keeps showing 0 dB at whatever default we choose.
-INPUT_GAIN_REF_DB = 12  # 0dB display = +12 dB absolute boost (good level for UFO202 + bandpass)
+# Calibrated for the "old" detector: previous +12 dB reference saturated the
+# trigger at 1 on most music, so the reference was lowered by 24 dB. The user's
+# preferred "-24 dB display" operating point now corresponds to 0 dB display.
+INPUT_GAIN_REF_DB = -12  # 0dB display = -12 dB absolute (calmer, more dynamic for "old" detector)
 INPUT_GAIN_MIN_DB = INPUT_GAIN_REF_DB - 24  # absolute floor (display: -24 dB)
 INPUT_GAIN_MAX_DB = INPUT_GAIN_REF_DB + 24  # absolute ceiling (display: +24 dB)
 INPUT_GAIN_DB = INPUT_GAIN_REF_DB
@@ -569,54 +572,11 @@ BRIGHT_EXCESS_CURVE = 2.15
 # - "kick":      cascaded biquads + faster envelope + decay-only floor + slope-weighted + peak-hold meter
 DETECT_MODES = ["classic", "compander", "kick", "old"]
 
-
-def load_detect_mode_index():
-    """Load detect_mode_index from .dmx_config; default 0 = level."""
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("detect_mode_index="):
-                        idx = int(line.split("=", 1)[1].strip())
-                        if 0 <= idx < len(DETECT_MODES):
-                            return idx
-    except Exception:
-        pass
-    return 0
-
-
-def save_detect_mode_index():
-    """Persist detect mode to config (merge line into existing file)."""
-    try:
-        new_line = f"detect_mode_index={DETECT_MODE_INDEX}\n"
-        lines = []
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                lines = f.readlines()
-        out = []
-        found = False
-        for line in lines:
-            if line.strip().startswith("detect_mode_index="):
-                out.append(new_line)
-                found = True
-            else:
-                out.append(line)
-        if not found:
-            out.append(new_line)
-        with open(CONFIG_FILE, "w") as f:
-            f.writelines(out)
-    except Exception:
-        pass
-
-
-DETECT_MODE_INDEX = load_detect_mode_index()
-# Optional override: DETECT_MODE=classic|compander|kick (or legacy FORCE_DETECT_LEVEL=1 -> classic)
-_dmenv = os.environ.get("DETECT_MODE", "").strip().lower()
-if _dmenv in DETECT_MODES:
-    DETECT_MODE_INDEX = DETECT_MODES.index(_dmenv)
-elif os.environ.get("FORCE_DETECT_LEVEL", "").strip() in ("1", "true", "yes"):
-    DETECT_MODE_INDEX = 0  # "classic" is index 0 in the new list
+# Detection mode is locked to "old". The other entries above are kept so
+# the trigger functions and any references to DETECT_MODES still resolve, but
+# the index is fixed and is not loaded from or saved to .dmx_config. The
+# Settings UI no longer exposes a way to switch modes.
+DETECT_MODE_INDEX = DETECT_MODES.index("old")
 
 # Beat detection method: 0 = FFT_STANDARD (Q-band analysis)
 # 3-band mode has been removed - now using FFT-only mode
@@ -728,7 +688,7 @@ submenu_editing = False  # True when encoder 1 is editing selected column value
 # Submenu column labels for each tab
 SUBMENU_LABELS = {
     "Presets": ["Preset", "Mode", "Beats"],
-    "Settings": ["Gain", "Defaults", "Detect"],   # Detect = trigger algorithm (classic/compander/kick)
+    "Settings": ["Gain", "Defaults", ""],          # 3rd column blank (Detect mode locked to "old")
     "Setup": ["Output", "Chans", ""],              # Output=Dimmer/DMX, Chans=4-24; col 3 blank (layout)
 }
 
@@ -741,7 +701,7 @@ _home_enc2_range_pct = None
 _home_enc4_alt = False  # False = Release, True = ReleaseMode
 
 # Encoder toggle states for Settings submenu tab
-_setup_enc3_detect = False    # Settings: enc3 button toggles Trigger vs Detect; rotation matches selected mode
+_setup_enc3_detect = False    # Deprecated: Detect-mode toggle removed; mode is locked to "old". Kept for any stale references.
 _setup_enc4_channels = False  # False = DMX Output Mode, True = Channel Count
 
 # Legacy compatibility - keep current_page and get_pages() for remaining references
@@ -1727,13 +1687,19 @@ _kick_peak_hold    = 0.0    # peak-hold meter value
 _kick_peak_t       = 0.0    # timestamp of last peak-set
 KICK_PEAK_HOLD_S   = 0.15   # how long meter holds peaks before decaying
 
-# "old" mode: frozen replica of the pre-agent-changes "level" detection path.
-# Same chain as classic, but with the legacy CLASSIC_UI_SCALE=5.0 divisor and
-# the original AGC max-gain of 20×, and crucially NO noise gate. Kept here for
-# A/B testing against the new modes; uses its own EMA/AGC state so it doesn't
-# share running state with classic.
-OLD_CLASSIC_UI_SCALE = 5.0   # legacy divisor; denom = AGC_TARGET * 5.0 = 0.10
-OLD_AGC_MAX_GAIN     = 20.0  # legacy AGC ceiling (was hard-coded before)
+# "old" mode: FFT-window level detector.
+# Source signal is `display_mean_in_q` — the mean of normalized FFT bands whose
+# centers fall inside band.center ± bandwidth/2. Same bars the user sees
+# highlighted on the spectrum, so the meter and trigger now correspond exactly
+# to visible energy in the configured frequency range. No biquad bandpass,
+# no AGC pumping of room noise. A small noise gate zeroes out sub-floor
+# residuals and a light EMA smooths the meter for visual stability.
+OLD_FFT_NOISE_GATE = float(os.environ.get("OLD_FFT_NOISE_GATE", "0.06"))  # below this, meter snaps to 0
+OLD_FFT_SMOOTH_EMA = float(os.environ.get("OLD_FFT_SMOOTH_EMA", "0.55"))  # display smoothing (matches ENV_EMA feel)
+_old_fft_ema = 0.0
+# Legacy state names kept for compatibility with _reset_trigger_state references; unused now.
+OLD_CLASSIC_UI_SCALE = 5.0
+OLD_AGC_MAX_GAIN     = 20.0
 _old_classic_abs_ema = 0.0
 _old_agc             = None  # lazily constructed on first use to honor module-level Agc
 
@@ -1896,32 +1862,24 @@ def _trigger_kick_effective_thresh():
     return max(band.thresh, _kick_running_rms * 2.5 + 0.05)
 
 
-def _trigger_old(x_block, bp_obj, envd_obj):
-    """Frozen replica of the pre-agent-changes 'level' detection path.
+def _trigger_old(display_mean_in_q):
+    """FFT-window level detector for "old" mode.
 
-    Pipeline: bandpass -> envelope -> AGC (max 20×) -> per-sample EMA -> normalize by 0.02 * 5.0
-    No noise gate; AGC is free to pump up quiet signal toward target. Uses its own
-    AGC instance and EMA accumulator so flipping between modes doesn't cross-contaminate state.
+    Source: `display_mean_in_q` — mean of normalized FFT bands inside
+    band.center ± bandwidth/2 (the same bars highlighted on the spectrum).
+    Replaces the legacy biquad → envelope → AGC chain so the meter and trigger
+    reflect ONLY the energy in the user-visible frequency window. Out-of-band
+    content cannot drive the trigger, and silence keeps the meter at 0.
+
+    Pipeline: noise-gate → EMA smooth → clip
+    Returns: (live_band_env, trigger_score) — both equal in this mode.
     """
-    global _old_classic_abs_ema, _old_agc
-    if _old_agc is None:
-        _old_agc = Agc(target=AGC_TARGET, tau=0.95, max_gain=OLD_AGC_MAX_GAIN)
-    bp_obj.set_params(band.center, band.q)
-    y_bp  = bp_obj.process(x_block)
-    e_env = envd_obj.process(y_bp)
-    g_agc = _old_agc.update(float(np.mean(e_env))) if AGC_ON else 1.0
-    wgt   = math.sqrt(max(1.0, band.center / 100.0)) if WEIGHTING_ON else 1.0
-    e_scaled = e_env * (g_agc * wgt)
-
-    va  = _old_classic_abs_ema
-    a_em = ENV_EMA
-    for s in e_scaled:
-        va = a_em * va + (1.0 - a_em) * float(s)
-    _old_classic_abs_ema = va
-
-    denom = max(AGC_TARGET * OLD_CLASSIC_UI_SCALE, 1e-10)
-    lbe = min(1.0, float(va) / denom)
-    return lbe, lbe
+    global _old_fft_ema
+    src = float(display_mean_in_q)
+    gated = src if src >= OLD_FFT_NOISE_GATE else 0.0
+    _old_fft_ema = OLD_FFT_SMOOTH_EMA * _old_fft_ema + (1.0 - OLD_FFT_SMOOTH_EMA) * gated
+    val = min(1.0, max(0.0, _old_fft_ema))
+    return val, val
 
 
 def _reset_trigger_state():
@@ -1931,7 +1889,7 @@ def _reset_trigger_state():
     global _kick_running_rms, _kick_running_peak, _kick_running_smax
     global _kick_prev_e, _kick_peak_hold, _kick_peak_t
     global classic_abs_ema
-    global _old_classic_abs_ema, _old_agc
+    global _old_classic_abs_ema, _old_agc, _old_fft_ema
     _comp_running_rms = 0.001
     _comp_running_peak = 0.05
     _comp_running_smax = 0.01
@@ -1944,7 +1902,8 @@ def _reset_trigger_state():
     _kick_peak_hold = 0.0
     _kick_peak_t = 0.0
     _old_classic_abs_ema = 0.0
-    _old_agc = None  # rebuilt on next call with correct max_gain
+    _old_agc = None  # legacy: rebuilt on next call if any old caller still uses it
+    _old_fft_ema = 0.0
     try:
         classic_abs_ema = 0.0
     except NameError:
@@ -2588,38 +2547,16 @@ def _apply_encoder_delta(enc_idx, direction):
             return
         
         # ===== Encoder 3 (enc_idx=2): Trigger threshold (disabled in AMBIENT) =====
-        # On Settings tab: Detection Mode when _setup_enc3_detect; else same Trigger knob as HOME (band.thresh).
-        # Input gain is encoder 1 edit on Settings "Gain" column only.
+        # Same Trigger knob (band.thresh) on HOME and Settings tabs. Input gain is
+        # adjusted via encoder 1 on the Settings "Gain" column. Detection mode is
+        # locked to "old" and is no longer adjustable from any encoder.
         if enc_idx == 2:
-            global DETECT_MODE_INDEX
             if BASE_PROGRAM == 6:
                 return
-            # Check if on Settings submenu tab
-            if SUBMENU_TABS[submenu_tab] == "Settings":
-                if _setup_enc3_detect:
-                    # Detection mode (level/flux/hybrid/transient)
-                    now = time.time()
-                    elapsed_ms = (now - _discrete_last_change[2]) * 1000
-                    if elapsed_ms >= DISCRETE_DEBOUNCE_MS:
-                        delta = 1 if direction > 0 else -1
-                        new_idx = max(0, min(len(DETECT_MODES) - 1, DETECT_MODE_INDEX + delta))
-                        if new_idx != DETECT_MODE_INDEX:
-                            DETECT_MODE_INDEX = new_idx
-                            _discrete_last_change[2] = now
-                            save_detect_mode_index()
-                            _reset_trigger_state()  # clear running state of all modes on switch
-                            ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.5)
-                else:
-                    # Trigger threshold (matches bottom-row "Trigger" label while on Settings)
-                    band.thresh = max(
-                        0.0,
-                        min(1.0, band.thresh + base_delta * ENC_STEP_TRIG_BRIGHT),
-                    )
-            else:
-                band.thresh = max(
-                    0.0,
-                    min(1.0, band.thresh + base_delta * ENC_STEP_TRIG_BRIGHT),
-                )
+            band.thresh = max(
+                0.0,
+                min(1.0, band.thresh + base_delta * ENC_STEP_TRIG_BRIGHT),
+            )
             return
         
         # ===== Encoder 4 (enc_idx=3): Release/ReleaseMode or Fade in AMBIENT mode =====
@@ -3140,14 +3077,9 @@ def _handle_submenu_value_change(direction):
             save_defaults_mode(DEFAULTS_MODE_INDEX)
             ui_flash(f"Reset: {mode_name}", 0.5)
         elif col == 2:
-            # Detect: cycle through DETECT_MODES (classic / compander / kick)
-            global DETECT_MODE_INDEX
-            new_idx = max(0, min(len(DETECT_MODES) - 1, DETECT_MODE_INDEX + direction))
-            if new_idx != DETECT_MODE_INDEX:
-                DETECT_MODE_INDEX = new_idx
-                save_detect_mode_index()
-                _reset_trigger_state()  # clear running state of all modes on switch
-                ui_flash(f"Detect: {DETECT_MODES[DETECT_MODE_INDEX]}", 0.5)
+            # Detect column removed (mode locked to "old"). Navigation is also
+            # capped at col=1 for Settings, so this branch is defensive only.
+            pass
     elif tab == "Setup":
         if col == 0:
             # Output mode (Dimmer/DMX)
@@ -3246,9 +3178,9 @@ def encoder_reader():
                         _handle_submenu_value_change(direction)
                     else:
                         # Selection mode: move between columns
-                        # Presets: 3 cols (Preset/Mode/Beats); Settings: 3 cols (Gain/Defaults/Detect); Setup: 2 cols (Output/Chans)
+                        # Presets: 3 cols (Preset/Mode/Beats); Settings: 2 cols (Gain/Defaults); Setup: 2 cols (Output/Chans)
                         _tab_name = SUBMENU_TABS[submenu_tab]
-                        if _tab_name == "Setup":
+                        if _tab_name in ("Setup", "Settings"):
                             _max_submenu_col = 1
                         else:
                             _max_submenu_col = 2
@@ -3358,10 +3290,7 @@ def encoder_reader():
                     elif enc3_sw == 0 and _enc_last_sw[2] == 1:
                         time.sleep(0.05)
                         if GPIO.input(ENC3_SW) == 0:
-                            global _setup_enc3_detect
-                            if SUBMENU_TABS[submenu_tab] == "Settings":
-                                _setup_enc3_detect = not _setup_enc3_detect
-                                ui_flash("Mode: Detect" if _setup_enc3_detect else "Mode: Trigger", 0.5)
+                            # E3 button has no function (Trigger/Detect toggle removed; detect mode locked to "old").
                             _enc_awaiting_release[2] = True
                     _enc_last_sw[2] = enc3_sw
                     
@@ -3393,8 +3322,8 @@ def encoder_reader():
                     if direction != 0:
                         _apply_encoder_delta(4, direction)
                 else:
-                    # I2S HAT mode: E3/E4/E5 rotation disabled, but buttons work on E3 and E5
-                    # E3 button (GPIO23): Settings tab toggles Detect/Trigger; no action on HOME
+                    # I2S HAT mode: E3/E4/E5 rotation disabled, but buttons work on E3 and E5.
+                    # E3 button (GPIO23) currently has no function (Trigger/Detect toggle removed).
                     enc3_sw = GPIO.input(ENC3_SW)
                     if _enc_awaiting_release[2]:
                         if enc3_sw == 1:
@@ -3403,9 +3332,6 @@ def encoder_reader():
                     elif enc3_sw == 0 and _enc_last_sw[2] == 1:
                         time.sleep(0.05)
                         if GPIO.input(ENC3_SW) == 0:
-                            if SUBMENU_TABS[submenu_tab] == "Settings":
-                                _setup_enc3_detect = not _setup_enc3_detect
-                                ui_flash("Mode: Detect" if _setup_enc3_detect else "Mode: Trigger", 0.5)
                             _enc_awaiting_release[2] = True
                     _enc_last_sw[2] = enc3_sw
                     
@@ -3773,8 +3699,10 @@ def audio_loop():
             # Kick mode: noise-floor-aware effective threshold (never fires below floor)
             effective_thresh = _trigger_kick_effective_thresh()
         elif detect_mode == "old":
-            # Frozen replica of the pre-agent-changes "level" detection (legacy scale + AGC, no gate).
-            live_band_env, trigger_score = _trigger_old(x, bp, envd)
+            # FFT-window level detector: source is the mean of normalized FFT bands
+            # inside band.center ± bandwidth/2 — identical to the highlighted bars
+            # on the visible spectrum. Out-of-band content cannot drive the trigger.
+            live_band_env, trigger_score = _trigger_old(display_mean_in_q)
             effective_thresh = band.thresh
         else:  # "classic" (default / index 0)
             live_band_env, trigger_score = _trigger_classic(x, bp, envd, agc)
@@ -4683,7 +4611,7 @@ class OledUI:
         elif page_name == "SET":
             labels = [
                 labels[0],  # Default
-                "Detect" if _setup_enc3_detect else "Thresh",
+                "Thresh",
                 "Chans" if _setup_enc4_channels else "Setup"
             ]
         # Override labels for COLOR page based on encoder 3 toggle state
@@ -4858,11 +4786,8 @@ class OledUI:
                         val_str = "Saved!"
                     else:
                         val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                elif i == 1:  # FFT threshold or Detection Mode (based on toggle)
-                    if _setup_enc3_detect:
-                        val_str = DETECT_MODES[DETECT_MODE_INDEX]
-                    else:
-                        val_str = f"{int(band.thresh * 99)}"
+                elif i == 1:  # FFT threshold
+                    val_str = f"{int(band.thresh * 99)}"
                 else:  # DMX Output Mode or Channel Count (based on toggle)
                     if _setup_enc4_channels:
                         val_str = str(DMX_CHANNEL_COUNT)
@@ -5118,8 +5043,8 @@ class OledUI:
                         if _enc1_save_progress >= 2.0 and (time.time() - _enc1_save_complete) >= 0.8:
                             _enc1_save_progress = 0.0
                         val_str = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                else:  # Column 3: Detect mode
-                    val_str = DETECT_MODES[DETECT_MODE_INDEX]
+                else:  # Column 3 is blank (Detect mode locked to "old")
+                    val_str = ""
             elif tab == "Setup":
                 if i == 0:  # Output
                     val_str = DMX_OUTPUT_MODES[DMX_OUTPUT_MODE]
