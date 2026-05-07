@@ -14,15 +14,16 @@ Audio-reactive DMX lighting controller for Raspberry Pi with OLED UI, rotary enc
 
 ## Quick Start (Fresh SD Card)
 
-See **[docs/QUICKSTART.md](docs/QUICKSTART.md)** for the full path from a blank SD card to a running system (order of steps, USB vs HiFiBerry, OLA patching, headless `apt`).
+**Full onboarding:** **[docs/QUICKSTART.md](docs/QUICKSTART.md)** — single canonical guide (hardware, UART/`cmdline`/`udev`, bootstrap, OLED splash, OLA patching, HiFiBerry vs USB, Pi 5 UART notes).
 
 Short version:
 
-1. Clone to **`~/pi-dmx-controller-v2`** (required by `bootstrap_pi.sh`).
-2. Edit **`systemd/pi-dmx.service`** and **`systemd/oled_splash.service`** if your user is not **`pi`** or your path is not **`/home/pi/pi-dmx-controller-v2`**.
-3. **`sudo cp config/boot/config.txt /boot/firmware/config.txt`** — add HiFiBerry `dtoverlay=...` in that file first if you use the HAT.
-4. **`sudo cp config/alsa/asound.conf /etc/asound.conf`** — **HiFiBerry only**; skip for USB-only capture.
-5. **`./scripts/bootstrap_pi.sh`** then **`sudo scripts/install_oled_splash.sh`**, then **`sudo reboot`**.
+1. Clone **exactly** to **`~/pi-dmx-controller-v2`** (`bootstrap_pi.sh` assumes this path).
+2. Edit **`systemd/pi-dmx.service`** and **`systemd/oled_splash.service`** if user ≠ **`pi`** or path ≠ **`/home/pi/pi-dmx-controller-v2`** — also **`scripts/audio-source.sh`** / **`config/initramfs/hook-oled-boot`** paths if relevant.
+3. **`sudo cp config/boot/config.txt /boot/firmware/config.txt`** — add HiFiBerry `dtoverlay=...` in that repo file first when using the HAT.
+4. (HiFiBerry only) **`sudo cp config/alsa/asound.conf /etc/asound.conf`**.
+5. **Free `/dev/serial0` for DMX** before expecting fixtures: **`cmdline.txt`** (strip **`console=serial0,...`**), **`sudo systemctl disable --now serial-getty@ttyAMA0`**, install **`config/udev/99-dmx-ttyAMA0-dialout.rules`** (**[QUICKSTART § Step 5](docs/QUICKSTART.md#step-5-free-gpio-dmx-uart-before-reboot)**). **Pi 5:** verify symlink target with **`readlink`** (QUICKSTART).
+6. **`./scripts/bootstrap_pi.sh`**, **`sudo scripts/install_oled_splash.sh`**, optional **`sudo scripts/install_oled_initramfs.sh`**, **`sudo reboot`**.
 
 ---
 

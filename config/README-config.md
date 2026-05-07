@@ -55,4 +55,4 @@ sudo cp config/alsa/asound.conf /etc/asound.conf
 sudo reboot
 ```
 
-See [docs/QUICKSTART.md](../docs/QUICKSTART.md) for full setup from a fresh SD card.
+See [docs/QUICKSTART.md](../docs/QUICKSTART.md) — canonical **fresh SD card / full restore** guide (includes UART, udev, ALSA, bootstrap, and non-`pi` users).
