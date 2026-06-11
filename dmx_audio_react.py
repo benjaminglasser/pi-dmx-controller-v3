@@ -66,10 +66,22 @@ _OLED_AVAILABLE = False
 try:
     from PIL import Image, ImageDraw, ImageFont
     from luma.core.interface.serial import spi as luma_spi
+    from luma.core.framebuffer import full_frame as luma_full_frame
     from luma.oled.device import ssd1322  # EastRising 3.2" uses SSD1322
     _OLED_AVAILABLE = True
 except Exception:
     _OLED_AVAILABLE = False
+
+# --- MCP23017 I/O expander (optional, I2C) ---
+_MCP_AVAILABLE = False
+try:
+    import board
+    import busio
+    from digitalio import Direction, Pull
+    from adafruit_mcp230xx.mcp23017 import MCP23017
+    _MCP_AVAILABLE = True
+except Exception:
+    _MCP_AVAILABLE = False
 
 
 # ===================== Config =====================
@@ -487,13 +499,7 @@ elif _ai_ch in ("mix", "mono", "both", "avg", "stereo"):
 else:
     AUDIO_INPUT_CHANNEL_MODE = "right"
 
-# When using an I2S audio HAT (HiFiBerry, etc.), GPIO 18/19/20/21 are claimed by
-# the I2S controller. Encoders 3, 4, and 5 in this project happen to share those
-# pins (E3 CLK=19, E4 DT=20, E4 SW=21, E5 DT=18), so calling GPIO.setup() on them
-# rewrites the pin function from I2S to plain GPIO and silently kills audio.
-# Set DISABLE_I2S_ENCODERS=1 to skip all GPIO.setup / polling for E3, E4, E5.
-# E1, E2, and the Reset button keep working.
-DISABLE_I2S_ENCODERS = os.environ.get("DISABLE_I2S_ENCODERS", "0").strip() == "1"
+# V3: all encoders are on MCP23017 — no I2S pin conflicts.
 
 def db_to_linear(db):
     """Convert dB to linear gain multiplier."""
@@ -634,40 +640,45 @@ def _capture_devices_with_preferences(devs, *, prefer_real: bool):
     return out
 
 
-# Rotary Encoder 1 (Page selection)
-ENC1_CLK = 5
-ENC1_DT  = 6
-ENC1_SW  = 13
+# MCP23017 I2C address (A0/A1/A2 all tied to GND)
+MCP23017_ADDRESS = 0x20
 
-# Rotary Encoder 2 - Param A (Freq/Speed/Preset depending on page)
-ENC2_CLK = 17
-ENC2_DT  = 27
-ENC2_SW  = 22
+# MCP23017 pin indices: GPA0-GPA7 = 0-7, GPB0-GPB7 = 8-15
+# GPA7 (7) and GPB7 (15) are intentionally unused per hardware spec.
 
-# Rotary Encoder 3 - Param B (Thresh/Beats depending on page)
-ENC3_CLK = 19
-ENC3_DT  = 26
-ENC3_SW  = 23
+# Rotary Encoder 1 (Page selection) — MCP23017
+ENC1_CLK = 8   # GPB0
+ENC1_DT  = 9   # GPB1
+ENC1_SW  = 10  # GPB2
 
-# Rotary Encoder 4 - Param C (Release/Mode depending on page)
-ENC4_CLK = 16
-ENC4_DT  = 20
-ENC4_SW  = 21
+# Rotary Encoder 2 - Param A (Freq/Speed/Preset) — MCP23017
+ENC2_CLK = 11  # GPB3
+ENC2_DT  = 12  # GPB4
+ENC2_SW  = 13  # GPB5
 
-# Rotary Encoder 5 - Brightness (global)
-# NOTE: GPIO8 is SPI CE0, conflicts with OLED. SW for Enc5 is disabled.
-ENC5_CLK = 4
-ENC5_DT  = 18
-ENC5_SW  = 8  # Brightness toggle (physical pin 24)
-ENC5_SW_DISABLED = False  # ENABLED - brightness toggle on GPIO8
+# Rotary Encoder 3 - Param B (Thresh/Beats) — MCP23017
+ENC3_CLK = 14  # GPB6
+ENC3_DT  = 0   # GPA0
+ENC3_SW  = 1   # GPA1
 
-# Reset button (separate from encoder buttons)
-RESET_PIN = 25
+# Rotary Encoder 4 - Param C (Release/Mode) — MCP23017
+ENC4_CLK = 2   # GPA2
+ENC4_DT  = 3   # GPA3
+ENC4_SW  = 4   # GPA4
 
-# SPI OLED pins (EastRising 3.2" SSD1322 on CE1)
-OLED_SPI_DEV = 1   # CE1 (GPIO 7)
-OLED_RST_PIN = 12
-OLED_DC_PIN  = 24
+# Rotary Encoder 5 - Brightness (global) — MCP23017 A/B, direct GPIO switch
+ENC5_CLK     = 5   # GPA5
+ENC5_DT      = 6   # GPA6
+ENC5_SW_GPIO = 17  # Direct Pi BCM GPIO17 (physical pin 11)
+
+# Direct Pi GPIO buttons
+RESET_BUTTON_GPIO = 25  # BCM GPIO25 (physical pin 22)
+EXTRA_BUTTON_GPIO = 7   # BCM GPIO7  (physical pin 26)
+
+# SPI OLED pins (EastRising 3.2" SSD1322 on CE0)
+OLED_SPI_DEV = 0   # CE0 (GPIO8, physical pin 24)
+OLED_RST_PIN = 24  # BCM GPIO24 (physical pin 18)
+OLED_DC_PIN  = 23  # BCM GPIO23 (physical pin 16)
 OLED_WIDTH   = 256
 OLED_HEIGHT  = 64
 
@@ -1126,7 +1137,7 @@ BRIGHTNESS_FADE_DURATION = 0.5  # Fade duration in seconds
 _brightness_fade_start_time = 0.0  # When fade started
 _brightness_fade_start_value = DEFAULT_BRIGHT  # Brightness when fade started
 _brightness_click_flash = 0.0  # Decays over time, >0 means click detected recently
-_brightness_gpio8_state = 1  # Current GPIO8 state for debug display
+_brightness_enc5sw_state = 1  # Current ENC5_SW_GPIO state for debug display
 
 # Display-specific smoothed values (separate from control values)
 _display_freq = DEFAULT_CENTER_HZ
@@ -2665,70 +2676,23 @@ def setup_gpio_inputs():
     
     Returns True on success, False on failure (with error set for TUI display).
     """
+    global _mcp, _mcp_pins
+
     if DEV_NO_HW:
         return True
     if GPIO is None:
         set_error("RPi.GPIO not available - run with DEV_NO_HW=1")
         return False
-    
+
     try:
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BCM)
-        
-        # Rotary Encoder 1 (Page selection)
-        GPIO.setup(ENC1_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC1_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC1_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        
-        # Rotary Encoder 2 (Param A - Freq/Speed/Preset)
-        GPIO.setup(ENC2_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC2_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(ENC2_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        
-        if DISABLE_I2S_ENCODERS:
-            # I2S uses GPIO 18 (BCLK), 19 (LRCLK), 20 (DIN), 21 (DOUT).
-            # We can still set up the NON-conflicting pins for partial encoder function:
-            #   E3: CLK=19 (CONFLICT), DT=26 (safe), SW=23 (safe)
-            #   E4: CLK=16 (safe), DT=20 (CONFLICT), SW=21 (CONFLICT)
-            #   E5: CLK=4 (safe), DT=18 (CONFLICT), SW=8 (safe)
-            # Rotation won't work (needs both CLK+DT), but buttons on E3/E5 will work.
-            print("[GPIO] DISABLE_I2S_ENCODERS=1 - setting up safe pins only for E3/E4/E5")
-            # E3: DT and SW are safe
-            GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            # E4: only CLK is safe (rotation and buttons won't work)
-            GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            # E5: CLK and SW are safe
-            GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            if not ENC5_SW_DISABLED:
-                try:
-                    GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-                except Exception as e:
-                    print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
-        else:
-            # Rotary Encoder 3 (Param B - Thresh/Beats)
-            GPIO.setup(ENC3_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.setup(ENC3_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.setup(ENC3_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            
-            # Rotary Encoder 4 (Param C - Release/Mode)
-            GPIO.setup(ENC4_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.setup(ENC4_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.setup(ENC4_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            
-            # Rotary Encoder 5 (Brightness)
-            GPIO.setup(ENC5_CLK, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.setup(ENC5_DT, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            if not ENC5_SW_DISABLED:
-                try:
-                    GPIO.setup(ENC5_SW, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-                except Exception as e:
-                    print(f"[GPIO] ENC5_SW (GPIO8) setup failed: {e} - disabling")
-        
-        # Reset button
-        GPIO.setup(RESET_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        return True
-        
+
+        # Direct Pi GPIO inputs: ENC5 switch, reset button, extra button
+        GPIO.setup(ENC5_SW_GPIO,      GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(RESET_BUTTON_GPIO, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(EXTRA_BUTTON_GPIO, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
     except Exception as e:
         error_str = str(e)
         if "busy" in error_str.lower():
@@ -2739,7 +2703,36 @@ def setup_gpio_inputs():
         else:
             set_error(f"GPIO error: {error_str[:50]}")
             print(f"\n[ERROR] GPIO setup failed: {e}\n")
-        # Do not set DEV_NO_HW: SPI/OLED is independent; only skip encoders when gpio_ok is False.
+        return False
+
+    if not _MCP_AVAILABLE:
+        set_error("adafruit-circuitpython-mcp230xx not installed")
+        print("[ERROR] MCP23017 library missing. Install: pip install adafruit-circuitpython-mcp230xx")
+        return False
+
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        _mcp = MCP23017(i2c, address=MCP23017_ADDRESS)
+
+        mcp_input_pins = [
+            ENC1_CLK, ENC1_DT, ENC1_SW,
+            ENC2_CLK, ENC2_DT, ENC2_SW,
+            ENC3_CLK, ENC3_DT, ENC3_SW,
+            ENC4_CLK, ENC4_DT, ENC4_SW,
+            ENC5_CLK, ENC5_DT,
+        ]
+        for idx in mcp_input_pins:
+            pin = _mcp.get_pin(idx)
+            pin.direction = Direction.INPUT
+            pin.pull = Pull.UP
+            _mcp_pins[idx] = pin
+
+        print(f"[OK] MCP23017 initialized at 0x{MCP23017_ADDRESS:02X}, {len(mcp_input_pins)} encoder pins configured")
+        return True
+
+    except Exception as e:
+        set_error(f"MCP23017 error: {str(e)[:50]}")
+        print(f"\n[ERROR] MCP23017 init failed: {e}\n")
         return False
 
 _enc_last_update_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time when delta was last consumed
@@ -2826,170 +2819,85 @@ def _calc_velocity_multiplier(enc_idx, max_mult=10, min_mult=1.0):
 # NOTE: We import gpiozero lazily inside setup functions to avoid any
 # pin-factory initialization side effects at module load time.
 
-# Encoder objects (initialized in setup_gpiozero_encoders)
-_gz_encoders = {}  # {enc_idx: GpioZeroEncoder}
-_gz_last_steps = {}  # {enc_idx: last_steps_value}
+# MCP23017 globals — set up in setup_gpio_inputs()
+_mcp = None
+_mcp_pins = {}  # {mcp_pin_index: digitalio pin object} — used for initial config only
+_mcp_snapshot = 0xFFFF  # Last bulk read of all 16 MCP pins (bits 0-15 = GPA0-GPB7)
 
-def setup_gpiozero_encoders():
-    """Initialize gpiozero RotaryEncoder objects for encoders 2-5.
-    
-    NOTE: gpiozero's RotaryEncoder internally calls GPIO.setup() on each pin,
-    which rewrites the bcm2712 function-select register. For encoders 3, 4, 5
-    that share GPIO 18/19/20 with the I2S audio bus, this kills audio capture.
-    DISABLE_I2S_ENCODERS=1 skips those three to keep the I2S pins owned by the
-    kernel audio driver.
-    """
-    global _gz_encoders, _gz_last_steps
-    
-    # Lazy import to avoid pin-factory side effects at module load
-    from gpiozero import RotaryEncoder as GpioZeroEncoder
-    
-    # Encoder pin mappings (CLK, DT) - BCM pins
-    # E2 (GPIO 17/27) is always safe; it does not overlap I2S.
-    enc_pins = {
-        1: (ENC2_CLK, ENC2_DT),  # Encoder 2 - GPIO 17/27 (safe)
-    }
-    if not DISABLE_I2S_ENCODERS:
-        # E3 CLK=GPIO19 (I2S LRCLK), E4 DT=GPIO20 (I2S DIN), E5 DT=GPIO18 (I2S BCLK).
-        enc_pins[2] = (ENC3_CLK, ENC3_DT)  # Encoder 3
-        enc_pins[3] = (ENC4_CLK, ENC4_DT)  # Encoder 4
-        enc_pins[4] = (ENC5_CLK, ENC5_DT)  # Encoder 5 (brightness)
-    
-    for enc_idx, (clk, dt) in enc_pins.items():
-        try:
-            enc = GpioZeroEncoder(clk, dt, wrap=False, max_steps=0)
-            _gz_encoders[enc_idx] = enc
-            _gz_last_steps[enc_idx] = 0
-            enc.steps = 0
-        except Exception as e:
-            import sys
-            print(f"Failed to init gpiozero encoder {enc_idx+1}: {e}", file=sys.stderr)
 
-def _read_encoder_quadrature(enc_idx, clk_pin, dt_pin):
-    """Read encoder using gpiozero (interrupt-driven) or RPi.GPIO fallback.
-    
-    Returns: 1 for CW, -1 for CCW, 0 for no change
-    """
-    global _gz_last_steps, _enc_state
-    
-    # If gpiozero encoder is available for this index, use it
-    if enc_idx in _gz_encoders:
-        enc = _gz_encoders[enc_idx]
-        current_steps = enc.steps
-        last_steps = _gz_last_steps[enc_idx]
-        
-        if current_steps != last_steps:
-            diff = current_steps - last_steps
-            _gz_last_steps[enc_idx] = current_steps
-            return 1 if diff > 0 else -1
-        return 0
-    
-    # Fallback: RPi.GPIO polling-based quadrature decoding
-    if GPIO is None:
-        return 0
-    
+def _mcp_snapshot_update():
+    """Read both GPIO ports in one I2C transaction and cache the result."""
+    global _mcp_snapshot
     try:
-        clk = GPIO.input(clk_pin)
-        dt = GPIO.input(dt_pin)
+        _mcp_snapshot = _mcp.gpio  # 16-bit: bits 0-7=GPIOA, bits 8-15=GPIOB
+    except Exception:
+        pass  # keep previous snapshot on error
+
+
+def _mcp_read(idx):
+    """Read MCP23017 pin from cached snapshot. Returns 1 (HIGH) or 0 (LOW)."""
+    return (_mcp_snapshot >> idx) & 1
+
+
+def _read_encoder_quadrature(enc_idx, clk_idx, dt_idx):
+    """Read encoder via MCP23017 polling. Returns 1 (CW), -1 (CCW), 0 (no change)."""
+    global _enc_state
+    if _mcp is None:
+        return 0
+    try:
+        clk = _mcp_read(clk_idx)
+        dt  = _mcp_read(dt_idx)
     except Exception:
         return 0
-    
+
     new_state = (clk << 1) | dt
     old_state = _enc_state[enc_idx]
-    
     if new_state == old_state:
         return 0
-    
     _enc_state[enc_idx] = new_state
-    
-    # Quadrature state machine: detect direction from state transitions
-    # CW: 3->1->0->2->3  CCW: 3->2->0->1->3
+
+    # Quadrature state machine: CW: 3->1->0->2->3  CCW: 3->2->0->1->3
     if old_state == 0:
         if new_state == 2:
-            return 1   # CW click complete
+            return 1
         elif new_state == 1:
-            return -1  # CCW click complete
-    
+            return -1
     return 0
 
 
-# Encoder 1 - also use gpiozero
-_gz_enc1 = None
-_gz_enc1_last_steps = 0
-
-def setup_gpiozero_enc1():
-    """Initialize gpiozero encoder for encoder 1."""
-    global _gz_enc1, _gz_enc1_last_steps
-    
-    # Lazy import to avoid pin-factory side effects at module load
-    from gpiozero import RotaryEncoder as GpioZeroEncoder
-    
-    try:
-        _gz_enc1 = GpioZeroEncoder(ENC1_CLK, ENC1_DT, wrap=False, max_steps=0)
-        _gz_enc1.steps = 0
-        _gz_enc1_last_steps = 0
-    except Exception as e:
-        import sys
-        print(f"Failed to init gpiozero encoder 1: {e}", file=sys.stderr)
-
-def _read_enc1_quadrature(clk_pin, dt_pin):
-    """Read Encoder 1 using gpiozero (interrupt-driven) or RPi.GPIO fallback.
-    
-    Returns: 1 for CW, -1 for CCW, 0 for no change
-    """
-    global _gz_enc1_last_steps, _enc1_state, _enc1_rotation_dir
-    
-    # If gpiozero encoder is available, use it (more reliable, interrupt-driven)
-    if _gz_enc1 is not None:
-        current_steps = _gz_enc1.steps
-        last_steps = _gz_enc1_last_steps
-        
-        if current_steps != last_steps:
-            diff = current_steps - last_steps
-            _gz_enc1_last_steps = current_steps
-            return 1 if diff > 0 else -1
+def _read_enc1_quadrature(clk_idx, dt_idx):
+    """Read Encoder 1 via MCP23017 polling. Returns 1 (CW), -1 (CCW), 0 (no change)."""
+    global _enc1_state
+    if _mcp is None:
         return 0
-    
-    # Fallback: RPi.GPIO polling-based quadrature decoding
-    if GPIO is None:
-        return 0
-    
     try:
-        clk = GPIO.input(clk_pin)
-        dt = GPIO.input(dt_pin)
+        clk = _mcp_read(clk_idx)
+        dt  = _mcp_read(dt_idx)
     except Exception:
         return 0
-    
+
     new_state = (clk << 1) | dt
     old_state = _enc1_state
-    
     if new_state == old_state:
         return 0
-    
     _enc1_state = new_state
-    
-    # Quadrature state machine: detect direction from state transitions
-    # CW: 3->1->0->2->3  CCW: 3->2->0->1->3
-    direction = 0
+
     if old_state == 3:
         if new_state == 1:
-            direction = 1   # CW start
+            return 0
         elif new_state == 2:
-            direction = -1  # CCW start
+            return 0
     elif old_state == 1:
         if new_state == 0:
-            direction = 1   # CW continue
+            return 0
     elif old_state == 2:
         if new_state == 0:
-            direction = -1  # CCW continue
+            return 0
     elif old_state == 0:
         if new_state == 2:
-            direction = 1   # CW end - register click
             return 1
         elif new_state == 1:
-            direction = -1  # CCW end - register click
             return -1
-    
     return 0
 
 
@@ -3110,7 +3018,7 @@ def encoder_reader():
     global submenu_tab, submenu_column, submenu_editing
     global _enc_awaiting_release
     global _setup_enc3_detect, _setup_enc4_channels
-    global _brightness_click_flash, _brightness_gpio8_state
+    global _brightness_click_flash, _brightness_enc5sw_state
     
     if DEV_NO_HW:
         return
@@ -3123,52 +3031,47 @@ def encoder_reader():
         (ENC4_CLK, ENC4_DT),
         (ENC5_CLK, ENC5_DT),
     ]
-    
-    for i, (clk_pin, dt_pin) in enumerate(enc_pins):
+
+    for i, (clk_idx, dt_idx) in enumerate(enc_pins):
         try:
-            clk = GPIO.input(clk_pin)
-            dt = GPIO.input(dt_pin)
+            clk = _mcp_read(clk_idx)
+            dt  = _mcp_read(dt_idx)
             _enc_state[i] = (clk << 1) | dt
         except Exception:
-            _enc_state[i] = 3  # Default to rest position (both high)
+            _enc_state[i] = 3
         _enc_rotation_dir[i] = 0
         _enc_count[i] = 0
-    
-    # Initialize Encoder 1 dedicated state (detent-based detection)
+
+    # Initialize Encoder 1 dedicated state
     global _enc1_state, _enc1_rotation_dir, _enc1_last_click
     try:
-        clk = GPIO.input(ENC1_CLK)
-        dt = GPIO.input(ENC1_DT)
+        clk = _mcp_read(ENC1_CLK)
+        dt  = _mcp_read(ENC1_DT)
         _enc1_state = (clk << 1) | dt
     except Exception:
-        _enc1_state = 3  # Default to rest position (both high)
+        _enc1_state = 3
     _enc1_rotation_dir = 0
     _enc1_last_click = 0.0
-    
+
     # Initialize switch states
-    _enc_last_sw[0] = GPIO.input(ENC1_SW)
-    _enc_last_sw[1] = GPIO.input(ENC2_SW)
-    if not DISABLE_I2S_ENCODERS:
-        _enc_last_sw[2] = GPIO.input(ENC3_SW)
-        _enc_last_sw[3] = GPIO.input(ENC4_SW)
-    else:
-        # E3/E4 not configured (I2S HAT owns their pins) - default to "not pressed"
-        _enc_last_sw[2] = 1
-        _enc_last_sw[3] = 1
-    if not ENC5_SW_DISABLED:
-        try:
-            _enc_last_sw[4] = GPIO.input(ENC5_SW)
-        except Exception:
-            _enc_last_sw[4] = 1
-    else:
+    _enc_last_sw[0] = _mcp_read(ENC1_SW)
+    _enc_last_sw[1] = _mcp_read(ENC2_SW)
+    _enc_last_sw[2] = _mcp_read(ENC3_SW)
+    _enc_last_sw[3] = _mcp_read(ENC4_SW)
+    try:
+        _enc_last_sw[4] = GPIO.input(ENC5_SW_GPIO)
+    except Exception:
         _enc_last_sw[4] = 1
-    
-    _reset_last_state = GPIO.input(RESET_PIN)
+
+    _reset_last_state = GPIO.input(RESET_BUTTON_GPIO)
     _reset_press_time = 0  # Track how long reset button is held
     
     try:
         while not STOP_THREADS:
             try:
+                # Bulk-read all MCP pins in one I2C transaction
+                _mcp_snapshot_update()
+
                 # ===== Encoder 1 - Submenu column selection/editing =====
                 direction = _read_enc1_quadrature(ENC1_CLK, ENC1_DT)
                 if direction != 0:
@@ -3188,27 +3091,21 @@ def encoder_reader():
                             0, min(_max_submenu_col, submenu_column + direction)
                         )
                 
-                enc1_sw = GPIO.input(ENC1_SW)
+                enc1_sw = _mcp_read(ENC1_SW)
                 global _enc1_press_time, _enc1_save_progress, _enc1_save_complete
-                
+
                 # Non-blocking: check if waiting for button release
                 if _enc_awaiting_release[0]:
                     if enc1_sw == 1:  # Button released
                         _enc_awaiting_release[0] = False
-                        time.sleep(0.02)  # Post-release debounce
                     _enc_last_sw[0] = enc1_sw
                 else:
-                    # Check if we're on Settings tab with Reset column in EDITING mode (showing preset names)
-                    # Only allow long-press save when editing (viewing LOW/MID/HIGH/USR 1-3)
-                    is_settings_reset_editing = (SUBMENU_TABS[submenu_tab] == "Settings" and 
+                    is_settings_reset_editing = (SUBMENU_TABS[submenu_tab] == "Settings" and
                                                  submenu_column == 1 and submenu_editing)
-                    
+
                     if enc1_sw == 0 and _enc_last_sw[0] == 1:
-                        # Button just pressed - start timing
-                        time.sleep(0.02)  # Debounce
-                        if GPIO.input(ENC1_SW) == 0:
-                            _enc1_press_time = time.time()
-                            _enc1_save_progress = 0.0
+                        _enc1_press_time = time.time()
+                        _enc1_save_progress = 0.0
                     elif enc1_sw == 0 and _enc_last_sw[0] == 0:
                         # Button still held - check for long press on Settings/Reset (editing mode only)
                         if _enc1_press_time > 0 and is_settings_reset_editing:
@@ -3248,126 +3145,78 @@ def encoder_reader():
                 # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
                 direction = _read_encoder_quadrature(1, ENC2_CLK, ENC2_DT)
                 if direction != 0:
-                    _apply_encoder_delta(1, direction)  # Immediate update at 200Hz
-                
-                enc2_sw = GPIO.input(ENC2_SW)
-                # Non-blocking: check if waiting for button release
+                    _apply_encoder_delta(1, direction)
+
+                enc2_sw = _mcp_read(ENC2_SW)
                 if _enc_awaiting_release[1]:
-                    if enc2_sw == 1:  # Button released
+                    if enc2_sw == 1:
                         _enc_awaiting_release[1] = False
-                        time.sleep(0.02)  # Post-release debounce
                 elif enc2_sw == 0 and _enc_last_sw[1] == 1:
-                    time.sleep(0.05)  # Longer debounce for reliable toggle
-                    if GPIO.input(ENC2_SW) == 0:
-                        # Toggle Freq/Q mode for HOME controls
-                        global _home_enc2_range_pct
-                        _home_enc2_alt = not _home_enc2_alt
-                        _home_enc2_range_pct = None  # Re-sync Q index from band.q on next Range turn
-                        if _home_enc2_alt:
-                            ui_flash("Mode: Range", 0.5)
-                        else:
-                            ui_flash("Mode: Freq", 0.5)
-                        # Non-blocking: mark awaiting release to prevent double-toggle
-                        _enc_awaiting_release[1] = True
+                    global _home_enc2_range_pct
+                    _home_enc2_alt = not _home_enc2_alt
+                    _home_enc2_range_pct = None
+                    ui_flash("Mode: Range" if _home_enc2_alt else "Mode: Freq", 0.5)
+                    _enc_awaiting_release[1] = True
                 _enc_last_sw[1] = enc2_sw
-                
-                # When DISABLE_I2S_ENCODERS=1 (I2S audio HAT in use), E3/E4/E5 rotation
-                # doesn't work (needs both CLK+DT, but one pin per encoder is I2S).
-                # However, buttons still work on E3 (SW=GPIO23) and E5 (SW=GPIO8).
-                # E4's button is on GPIO21 (I2S DOUT) so it won't work.
-                if not DISABLE_I2S_ENCODERS:
-                    # Full E3/E4/E5 support when not using I2S HAT
-                    # ===== Encoder 3 - Param B (Thresh/Beats) =====
-                    direction = _read_encoder_quadrature(2, ENC3_CLK, ENC3_DT)
-                    if direction != 0:
-                        _apply_encoder_delta(2, direction)
-                    
-                    enc3_sw = GPIO.input(ENC3_SW)
-                    if _enc_awaiting_release[2]:
-                        if enc3_sw == 1:
-                            _enc_awaiting_release[2] = False
-                            time.sleep(0.02)
-                    elif enc3_sw == 0 and _enc_last_sw[2] == 1:
-                        time.sleep(0.05)
-                        if GPIO.input(ENC3_SW) == 0:
-                            # E3 button has no function (Trigger/Detect toggle removed; detect mode locked to "old").
-                            _enc_awaiting_release[2] = True
-                    _enc_last_sw[2] = enc3_sw
-                    
-                    # ===== Encoder 4 - Param C (Release/Mode) =====
-                    direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
-                    if direction != 0:
-                        _apply_encoder_delta(3, direction)
-                    
-                    enc4_sw = GPIO.input(ENC4_SW)
-                    if _enc_awaiting_release[3]:
-                        if enc4_sw == 1:
-                            _enc_awaiting_release[3] = False
-                            time.sleep(0.02)
-                    elif enc4_sw == 0 and _enc_last_sw[3] == 1:
-                        time.sleep(0.05)
-                        if GPIO.input(ENC4_SW) == 0:
-                            global _setup_enc4_channels
-                            if SUBMENU_TABS[submenu_tab] == "Settings":
-                                _setup_enc4_channels = not _setup_enc4_channels
-                                ui_flash("Mode: Chans" if _setup_enc4_channels else "Mode: Setup", 0.5)
-                            else:
-                                _home_enc4_alt = not _home_enc4_alt
-                                ui_flash("Mode: R-Mode" if _home_enc4_alt else "Mode: Release", 0.5)
-                            _enc_awaiting_release[3] = True
-                    _enc_last_sw[3] = enc4_sw
-                    
-                    # ===== Encoder 5 - Brightness =====
-                    direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
-                    if direction != 0:
-                        _apply_encoder_delta(4, direction)
-                else:
-                    # I2S HAT mode: E3/E4/E5 rotation disabled, but buttons work on E3 and E5.
-                    # E3 button (GPIO23) currently has no function (Trigger/Detect toggle removed).
-                    enc3_sw = GPIO.input(ENC3_SW)
-                    if _enc_awaiting_release[2]:
-                        if enc3_sw == 1:
-                            _enc_awaiting_release[2] = False
-                            time.sleep(0.02)
-                    elif enc3_sw == 0 and _enc_last_sw[2] == 1:
-                        time.sleep(0.05)
-                        if GPIO.input(ENC3_SW) == 0:
-                            _enc_awaiting_release[2] = True
-                    _enc_last_sw[2] = enc3_sw
-                    
-                    # E4 button (GPIO21) - SKIPPED, conflicts with I2S DOUT
-                
-                # E5 button works in both modes (GPIO8 is safe)
-                if not ENC5_SW_DISABLED:
-                    try:
-                        enc5_sw = GPIO.input(ENC5_SW)
-                    except Exception:
-                        enc5_sw = 1
-                    _brightness_gpio8_state = enc5_sw
-                    if enc5_sw == 0 and _enc_last_sw[4] == 1:
-                        _brightness_click_flash = 1.0
-                        time.sleep(0.02)
-                        try:
-                            enc5_sw_after = GPIO.input(ENC5_SW)
-                        except Exception:
-                            enc5_sw_after = 1
-                        if enc5_sw_after == 0:
-                            toggle_brightness()
-                    _enc_last_sw[4] = enc5_sw
-                
-                # ===== Reset button (GPIO 25) =====
-                # Short press = cycle through submenu tabs (PRE -> SET -> PRE...)
-                # Long press (2s) = reset band to current Defaults slot (freq, thresh, Q/range, release, etc.)
-                reset_btn = GPIO.input(RESET_PIN)
+
+                # ===== Encoder 3 - Param B (Thresh/Beats) =====
+                direction = _read_encoder_quadrature(2, ENC3_CLK, ENC3_DT)
+                if direction != 0:
+                    _apply_encoder_delta(2, direction)
+
+                enc3_sw = _mcp_read(ENC3_SW)
+                if _enc_awaiting_release[2]:
+                    if enc3_sw == 1:
+                        _enc_awaiting_release[2] = False
+                elif enc3_sw == 0 and _enc_last_sw[2] == 1:
+                    _enc_awaiting_release[2] = True
+                _enc_last_sw[2] = enc3_sw
+
+                # ===== Encoder 4 - Param C (Release/Mode) =====
+                direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
+                if direction != 0:
+                    _apply_encoder_delta(3, direction)
+
+                enc4_sw = _mcp_read(ENC4_SW)
+                if _enc_awaiting_release[3]:
+                    if enc4_sw == 1:
+                        _enc_awaiting_release[3] = False
+                elif enc4_sw == 0 and _enc_last_sw[3] == 1:
+                    global _setup_enc4_channels
+                    if SUBMENU_TABS[submenu_tab] == "Settings":
+                        _setup_enc4_channels = not _setup_enc4_channels
+                        ui_flash("Mode: Chans" if _setup_enc4_channels else "Mode: Setup", 0.5)
+                    else:
+                        _home_enc4_alt = not _home_enc4_alt
+                        ui_flash("Mode: R-Mode" if _home_enc4_alt else "Mode: Release", 0.5)
+                    _enc_awaiting_release[3] = True
+                _enc_last_sw[3] = enc4_sw
+
+                # ===== Encoder 5 - Brightness =====
+                direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
+                if direction != 0:
+                    _apply_encoder_delta(4, direction)
+
+                # ENC5 switch is direct GPIO17
+                try:
+                    enc5_sw = GPIO.input(ENC5_SW_GPIO)
+                except Exception:
+                    enc5_sw = 1
+                _brightness_enc5sw_state = enc5_sw
+                if enc5_sw == 0 and _enc_last_sw[4] == 1:
+                    _brightness_click_flash = 1.0
+                    toggle_brightness()
+                _enc_last_sw[4] = enc5_sw
+
+                # ===== Reset button (GPIO25) =====
+                # Short press = cycle submenu tabs; long press (2s) = reset band to defaults
+                reset_btn = GPIO.input(RESET_BUTTON_GPIO)
                 if reset_btn == 0 and _reset_last_state == 1:
-                    # Button just pressed - start timing
                     _reset_press_time = time.time()
                 elif reset_btn == 0 and _reset_last_state == 0:
-                    # Button still held - check for long press
                     if _reset_press_time > 0:
                         hold_duration = time.time() - _reset_press_time
                         if hold_duration >= 2.0:
-                            # Long press detected - reset to defaults (full preset incl. Q/range + release mode)
                             global _fft_reset_msg_until
                             mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
                             preset = DEFAULTS_PRESETS[mode_name]
@@ -3381,17 +3230,15 @@ def encoder_reader():
                             band.thresh = thresh
                             band.decay_ms = decay_ms
                             band.q = q_factor
-                            _home_enc2_range_pct = None  # Resync Range ladder from restored band.q
-                            _fft_reset_msg_until = time.time() + 1.0  # Show "reset!" modal for 1s
+                            _home_enc2_range_pct = None
+                            _fft_reset_msg_until = time.time() + 1.0
                             ui_flash("Reset to defaults", 1.0)
-                            _reset_press_time = 0  # Prevent repeated triggers
+                            _reset_press_time = 0
                 elif reset_btn == 1 and _reset_last_state == 0:
-                    # Button just released
                     if _reset_press_time > 0:
                         hold_duration = time.time() - _reset_press_time
                         if hold_duration < 2.0:
                             # Short press - cycle tabs
-                            time.sleep(0.02)  # Debounce
                             submenu_tab = (submenu_tab + 1) % len(SUBMENU_TABS)
                             submenu_column = 0  # Jump to first column of new page
                             submenu_editing = False  # Exit edit mode, return to header selection
@@ -3950,7 +3797,7 @@ class OledUI:
                 gpio_DC=OLED_DC_PIN,
                 gpio_RST=OLED_RST_PIN,
             )
-            self.device = ssd1322(serial, width=width, height=height, rotate=0)
+            self.device = ssd1322(serial, width=width, height=height, rotate=0, framebuffer=luma_full_frame())
             # luma's default is contrast(0x7F); SSD1322 often looks washed out. Max by default, override with OLED_CONTRAST=0-255
             _oc = os.environ.get("OLED_CONTRAST", "255").strip() or "255"
             try:
@@ -5421,7 +5268,7 @@ def tui(stdscr):
         )
         bright_status = "OFF" if _brightness_off else f"{int(BRIGHTNESS*100)}%"
         click_indicator = " [CLICK!]" if _brightness_click_flash > 0.5 else ""
-        safe_addstr(stdscr, 2, 0, f"Brightness: {bright_status}  (saved: {int(_brightness_saved*100)}%)  GPIO8={_brightness_gpio8_state}{click_indicator}")
+        safe_addstr(stdscr, 2, 0, f"Brightness: {bright_status}  (saved: {int(_brightness_saved*100)}%)  E5SW(GPIO17)={_brightness_enc5sw_state}{click_indicator}")
 
         row = 4
         safe_addstr(stdscr, row, 0, "Band Env vs Threshold (| is threshold):")
@@ -5475,18 +5322,7 @@ def main():
     if not DEV_NO_HW:
         gpio_ok = setup_gpio_inputs()
         if not gpio_ok:
-            print("[WARN] GPIO init failed - continuing without hardware controls")
-        else:
-            # Initialize gpiozero encoders (interrupt-driven, more reliable).
-            # SKIP gpiozero entirely when DISABLE_I2S_ENCODERS=1 — its pin factory
-            # init can touch GPIO state in ways that break I2S audio even for
-            # "safe" pins. Fall back to pure RPi.GPIO polling for E1/E2 instead.
-            if DISABLE_I2S_ENCODERS:
-                print("[GPIO] DISABLE_I2S_ENCODERS=1 - skipping gpiozero (using RPi.GPIO polling for E1/E2)")
-            else:
-                setup_gpiozero_enc1()
-                setup_gpiozero_encoders()
-                print("[OK] gpiozero encoders initialized")
+            print("[WARN] GPIO/MCP23017 init failed - continuing without hardware controls")
 
     # DMX backend + sender thread
     dmx_backend = make_dmx_backend()
@@ -5503,9 +5339,9 @@ def main():
     # Encoder reader thread (GPIO) — only if GPIO setup succeeded (SPI/OLED may still work otherwise)
     if not DEV_NO_HW and gpio_ok:
         threading.Thread(target=encoder_reader, daemon=True).start()
-        print("[OK] Encoders: 5 rotary encoders (E5 SW disabled - SPI conflict)")
-        print("     E1(5,6,13) E2(17,27,22) E3(19,26,23) E4(16,20,21) E5(4,18,-)")
-        print("     Reset(25): short=reset, long(>1s)=brightness toggle")
+        print("[OK] Encoders: E1-E4 A/B/SW + E5 A/B via MCP23017; E5 SW GPIO17; Reset GPIO25; Extra GPIO7")
+        print("     MCP23017@0x20: E1(8,9,10) E2(11,12,13) E3(14,0,1) E4(2,3,4) E5(5,6,-)")
+        print("     Reset(GPIO25): short=tab cycle, long(>2s)=reset to defaults")
     elif not DEV_NO_HW and not gpio_ok:
         print("[INFO] Encoders disabled (GPIO init failed); OLED/audio still run if available.")
 
@@ -5538,15 +5374,6 @@ def main():
             if oled_ui and oled_ui.device is not None:
                 oled_ui.device.hide()
                 oled_ui.device.cleanup()
-        except Exception:
-            pass
-        
-        # Close gpiozero encoders BEFORE GPIO.cleanup() to avoid errors
-        try:
-            if _gz_enc1 is not None:
-                _gz_enc1.close()
-            for enc in _gz_encoders.values():
-                enc.close()
         except Exception:
             pass
         

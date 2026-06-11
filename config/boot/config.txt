@@ -89,4 +89,3 @@ dtoverlay=dwc2,dr_mode=host
 
 # Use only 1 chip select (CE1) to free GPIO8 for encoder 5 switch
 # This is REQUIRED for the 5-encoder setup
-dtoverlay=spi0-2cs,cs0_pin=0
