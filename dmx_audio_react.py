@@ -135,7 +135,7 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dmx_con
 # Calibrated for the "old" detector: previous +12 dB reference saturated the
 # trigger at 1 on most music, so the reference was lowered by 24 dB. The user's
 # preferred "-24 dB display" operating point now corresponds to 0 dB display.
-INPUT_GAIN_REF_DB = -12  # 0dB display = -12 dB absolute (calmer, more dynamic for "old" detector)
+INPUT_GAIN_REF_DB = 0    # 0dB display = 0 dB absolute (calibrated for HiFiBerry line-level input)
 INPUT_GAIN_MIN_DB = INPUT_GAIN_REF_DB - 24  # absolute floor (display: -24 dB)
 INPUT_GAIN_MAX_DB = INPUT_GAIN_REF_DB + 24  # absolute ceiling (display: +24 dB)
 INPUT_GAIN_DB = INPUT_GAIN_REF_DB
@@ -687,15 +687,15 @@ OLED_GRAY = (128, 128, 128)
 # New UI: Top-left = FFT, Top-right = submenu tabs, Bottom = HOME controls
 
 # Submenu tabs (cycled by reset button)
-SUBMENU_TABS = ["Presets", "Settings", "Setup"]
-submenu_tab = 0        # 0=PRE, 1=SET, 2=SETUP
-submenu_column = 0     # Column index; max depends on tab (Presets: 0–2; Settings: 0–2; Setup: 0–1)
+SUBMENU_TABS = ["Modes", "Settings", "Setup"]
+submenu_tab = 0        # 0=MOD, 1=SET, 2=SETUP
+submenu_column = 0     # Column index; max depends on tab (Modes: 0–2; Settings: 0–2; Setup: 0–1)
 submenu_editing = False  # Label of selected column is always highlighted
 
 # Submenu column labels for each tab
 SUBMENU_LABELS = {
-    "Presets": ["Preset", "Mode", "Beats"],
-    "Settings": ["Gain", "Defaults", ""],          # 3rd column blank (Detect mode locked to "old")
+    "Modes": ["Pgm", "Cycle", "Beats"],
+    "Settings": ["Gain", "Presets", ""],           # 3rd column blank (Detect mode locked to "old")
     "Setup": ["Output", "Chans", ""],              # Output=Dimmer/DMX, Chans=4-24; col 3 blank (layout)
 }
 
@@ -870,7 +870,7 @@ def get_all_band_energies_vectorized(fft_mag):
     return (band_sums / _FFT_BIN_COUNTS).astype(np.float32)
 
 # Visual gain for FFT display (makes bars appear taller within fixed view)
-FFT_VISUAL_GAIN = 2.5  # Boost bar height for HiFiBerry line-level input (-18dBFS typical)
+FFT_VISUAL_GAIN = 1.0
 
 # FFT state (numpy arrays for faster vectorized operations)
 fft_bands = np.zeros(len(FFT_BANDS), dtype=np.float32)
@@ -1067,9 +1067,21 @@ def bright_excess_normalized(live_band_env, thresh_mode, band, effective_thresh_
 encoder1_value = 0
 encoder1_button = False
 _reset_last_state = 1  # Reset button state (1 = not pressed)
-_reset_press_time = 0  # Timestamp when reset button was pressed (for long-press detection)
-_fft_reset_msg_until = 0.0  # Show centered "reset!" modal until this timestamp
+_reset_press_time = 0.0      # Monotonic time when reset button was pressed (debounce arm)
+_reset_countdown_active = False   # True during 3s countdown
+_reset_countdown_start = 0.0      # Monotonic time when 50ms debounce elapsed and countdown began
+_reset_countdown_complete = 0.0   # Wall time when reset executed (drives "Reset!" display)
+_reset_needs_release = False      # Blocks re-trigger until button fully released
 _extra_last_state = 1  # Extra button (GPIO7) state (1 = not pressed)
+
+# Dual-button save combo: hold Reset + Extra together for 3 seconds to save current
+# freq/trigger settings into whichever defaults preset is currently active.
+_btn_save_arm_start = 0.0     # Monotonic time when both buttons were first pressed (50ms debounce)
+_btn_save_hold_start = 0.0    # Monotonic time when debounce elapsed and 3s countdown began
+_btn_save_hold_active = False  # True while 3s countdown is running
+_btn_save_hold_complete = 0.0  # Wall time when save completed (drives "Saved!" flash)
+_btn_save_suppressed = False   # Suppress individual button actions for this press cycle
+_btn_save_needs_release = False  # True after save; blocks re-trigger until both buttons fully released
 
 # Encoder state for all 5 encoders
 # Encoders 1-4: Page, Param A, Param B, Param C (indices 0-3)
@@ -1083,11 +1095,25 @@ _enc_delta = [0, 0, 0, 0, 0]
 
 # Quadrature state machine for reliable direction detection
 # State is encoded as (CLK << 1) | DT, giving values 0-3
-# Valid transitions: 0->1->3->2->0 (CW) or 0->2->3->1->0 (CCW)
+# CW (code): 3->1->0->2->3   CCW (code): 3->2->0->1->3
+# Note: physical CW is code-CCW due to hardware wiring (corrected in _apply_encoder_delta).
 _enc_state = [3, 3, 3, 3, 3]  # Current state per encoder, 3 = rest (both high)
 _enc_rotation_dir = [0, 0, 0, 0, 0]  # Accumulated rotation direction since leaving rest
 _enc_count = [0, 0, 0, 0, 0]  # Raw quadrature counts (legacy, kept for compatibility)
 _enc_direction = [0, 0, 0, 0, 0]  # Locked direction during a rotation (-1, 0, or 1)
+
+# Full 8-transition quadrature table — every valid quarter-step contributes ±1.
+# Each valid quarter-step contributes ±1 to a per-encoder net counter.
+# A click fires when the encoder returns to the detent rest position (state 3)
+# and the net counter magnitude is ≥ 2 (needs at least half the steps in one
+# direction).  Single-bounce noise (net = ±1) is silently ignored.
+# Works correctly even if the 5 ms poller misses up to 2 of the 4 transitions.
+_QUAD_TABLE = {
+    (3, 1):  1, (1, 0):  1, (0, 2):  1, (2, 3):  1,   # code-CW  quarter steps
+    (3, 2): -1, (2, 0): -1, (0, 1): -1, (1, 3): -1,   # code-CCW quarter steps
+}
+_enc_net  = [0, 0, 0, 0, 0]  # net quarter-steps since last detent, per slot (enc2–enc5)
+_enc1_net = 0                 # net quarter-steps since last detent, for enc1
 
 # Velocity-sensitive encoding: track timestamps and smoothed velocity
 _enc_last_click_time = [0.0, 0.0, 0.0, 0.0, 0.0]  # Time of last click per encoder
@@ -1503,9 +1529,8 @@ def update_lights(dt_ms):
     # Only process configured channels (DMX_CHANNEL_COUNT)
     release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
     
-    # Calculate base release display value (in ms)
+    # Calculate base release display value (in ms) — full range, not clamped to 99
     base_release_display = int(band.decay_ms)
-    base_release_display = max(0, min(99, base_release_display))
     
     # Calculate base brightness display value
     base_brightness_display = int(BRIGHTNESS * 99)
@@ -2516,7 +2541,7 @@ def _apply_encoder_delta(enc_idx, direction):
         # ===== Encoder 5 (enc_idx=4): Brightness — 1 display unit per click =====
         if enc_idx == 4:
             if not _brightness_off:
-                bright_int = max(0, min(99, int(BRIGHTNESS * 99) + base_delta))
+                bright_int = max(0, min(99, round(BRIGHTNESS * 99) + base_delta))
                 BRIGHTNESS = bright_int / 99.0
                 _brightness_target = BRIGHTNESS
                 if RELEASE_MODES[RELEASE_MODE_INDEX] in ("bright", "both"):
@@ -2553,7 +2578,7 @@ def _apply_encoder_delta(enc_idx, direction):
         if enc_idx == 2:
             if BASE_PROGRAM == 6:
                 return
-            thresh_int = max(0, min(99, int(band.thresh * 99) + base_delta))
+            thresh_int = max(0, min(99, round(band.thresh * 99) + base_delta))
             band.thresh = thresh_int / 99.0
             return
 
@@ -2574,8 +2599,8 @@ def _apply_encoder_delta(enc_idx, direction):
                         RELEASE_MODE_INDEX = new_idx
                         _discrete_last_change[3] = now
             else:
-                # 1ms per click: snap to integer ms then step.
-                decay_int = max(40, min(5000, int(band.decay_ms) + base_delta))
+                # 100ms per click: snap to nearest 100ms then step.
+                decay_int = max(40, min(5000, round(band.decay_ms / 100) * 100 + base_delta * 100))
                 band.decay_ms = float(decay_int)
                 release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
                 if release_mode in ("react", "rand", "both"):
@@ -2826,8 +2851,15 @@ def _mcp_read(idx):
 
 
 def _read_encoder_quadrature(enc_idx, clk_idx, dt_idx):
-    """Read encoder via MCP23017 polling. Returns 1 (CW), -1 (CCW), 0 (no change)."""
-    global _enc_state
+    """Read one encoder via MCP23017 polling.
+
+    Tracks net quarter-steps in _enc_net[enc_idx].  Emits a click (±1) only
+    when the encoder returns to the detent rest position (state 3) and the net
+    direction magnitude is ≥ 2.  This fires correctly even if the 5 ms poller
+    misses up to half the transitions, and single-bounce noise (net = ±1) is
+    silently discarded.  Returns 1 (code-CW), -1 (code-CCW), or 0.
+    """
+    global _enc_state, _enc_net
     if _mcp is None:
         return 0
     try:
@@ -2842,18 +2874,33 @@ def _read_encoder_quadrature(enc_idx, clk_idx, dt_idx):
         return 0
     _enc_state[enc_idx] = new_state
 
-    # Quadrature state machine: CW: 3->1->0->2->3  CCW: 3->2->0->1->3
-    if old_state == 0:
-        if new_state == 2:
+    delta = _QUAD_TABLE.get((old_state, new_state), 0)
+
+    if new_state == 3:
+        net = _enc_net[enc_idx] + delta
+        if net >= 2:
+            _enc_net[enc_idx] = 0
             return 1
-        elif new_state == 1:
+        if net <= -2:
+            _enc_net[enc_idx] = 0
             return -1
+        # Carry partial net (clamped ±1) so fast-spin half-detents accumulate
+        # into the next click instead of being discarded.
+        _enc_net[enc_idx] = max(-1, min(1, net))
+        return 0
+
+    _enc_net[enc_idx] += delta
     return 0
 
 
 def _read_enc1_quadrature(clk_idx, dt_idx):
-    """Read Encoder 1 via MCP23017 polling. Returns 1 (CW), -1 (CCW), 0 (no change)."""
-    global _enc1_state
+    """Read Encoder 1 via MCP23017 polling — identical logic to _read_encoder_quadrature.
+
+    Uses dedicated state (_enc1_state) and net counter (_enc1_net) so enc1
+    is fully independent of the shared _enc_state / _enc_net arrays.
+    Returns 1 (code-CW), -1 (code-CCW), or 0.
+    """
+    global _enc1_state, _enc1_net
     if _mcp is None:
         return 0
     try:
@@ -2868,22 +2915,20 @@ def _read_enc1_quadrature(clk_idx, dt_idx):
         return 0
     _enc1_state = new_state
 
-    if old_state == 3:
-        if new_state == 1:
-            return 0
-        elif new_state == 2:
-            return 0
-    elif old_state == 1:
-        if new_state == 0:
-            return 0
-    elif old_state == 2:
-        if new_state == 0:
-            return 0
-    elif old_state == 0:
-        if new_state == 2:
+    delta = _QUAD_TABLE.get((old_state, new_state), 0)
+
+    if new_state == 3:
+        net = _enc1_net + delta
+        if net >= 2:
+            _enc1_net = 0
             return 1
-        elif new_state == 1:
+        if net <= -2:
+            _enc1_net = 0
             return -1
+        _enc1_net = max(-1, min(1, net))
+        return 0
+
+    _enc1_net += delta
     return 0
 
 
@@ -2895,7 +2940,7 @@ def _handle_submenu_value_change(direction):
     tab = SUBMENU_TABS[submenu_tab]
     col = submenu_column
     
-    if tab == "Presets":
+    if tab == "Modes":
         if col == 0:
             # Preset selection (1-6)
             BASE_PROGRAM = max(1, min(6, BASE_PROGRAM + direction))
@@ -2915,7 +2960,7 @@ def _handle_submenu_value_change(direction):
             new_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
             if new_mode in ("rnd/amb", "rnd") and BASE_PROGRAM == 6:
                 BASE_PROGRAM = random.randint(1, 5)
-            ui_flash(f"Mode: {new_mode}", 0.5)
+            ui_flash(f"Cycle: {new_mode}", 0.5)
         elif col == 2:
             # Beat cycles
             global CYCLE_STEPS_INDEX, CYCLE_STEPS
@@ -2998,6 +3043,7 @@ def encoder_reader():
     global encoder1_value, encoder1_button
     global current_page
     global _enc_last_clk, _enc_last_dt, _enc_last_sw, _enc_delta, _reset_last_state, _reset_press_time
+    global _reset_countdown_active, _reset_countdown_start, _reset_countdown_complete, _reset_needs_release
     global _enc_state, _enc_count, _enc_last_click_time, _enc_velocity_mult
     global _home_enc2_alt, _home_enc4_alt
     global _enc2_press_time, _enc2_saving, _enc2_save_complete
@@ -3028,9 +3074,10 @@ def encoder_reader():
             _enc_state[i] = 3
         _enc_rotation_dir[i] = 0
         _enc_count[i] = 0
+        _enc_net[i] = 0
 
     # Initialize Encoder 1 dedicated state
-    global _enc1_state, _enc1_rotation_dir, _enc1_last_click
+    global _enc1_state, _enc1_rotation_dir, _enc1_last_click, _enc1_net
     try:
         clk = _mcp_read(ENC1_CLK)
         dt  = _mcp_read(ENC1_DT)
@@ -3039,6 +3086,7 @@ def encoder_reader():
         _enc1_state = 3
     _enc1_rotation_dir = 0
     _enc1_last_click = 0.0
+    _enc1_net = 0
 
     # Initialize switch states
     _enc_last_sw[0] = _mcp_read(ENC1_SW)
@@ -3125,7 +3173,7 @@ def encoder_reader():
                 # ===== Encoder 5 - Edit highlighted section value =====
                 direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
                 if direction != 0:
-                    _handle_submenu_value_change(direction)
+                    _handle_submenu_value_change(-direction)  # negate: same hw inversion as enc1–4
 
                 # Enc5 switch (GPIO17): short press = cycle tabs, long press = save preset
                 try:
@@ -3156,65 +3204,123 @@ def encoder_reader():
                                 _enc_awaiting_release[4] = True
                     elif enc5_sw == 1 and _enc_last_sw[4] == 0:
                         if _enc1_press_time > 0:
-                            if _enc1_save_progress == 0:
-                                # Short press: cycle tabs
-                                submenu_tab = (submenu_tab + 1) % len(SUBMENU_TABS)
-                                submenu_column = 0
-                                ui_flash(f"Tab: {SUBMENU_TABS[submenu_tab]}", 0.5)
+                            pass  # Short press: tab cycling disabled for now
                         _enc1_press_time = 0.0
                         _enc1_save_progress = 0.0
                 _enc_last_sw[4] = enc5_sw
 
-                # ===== Reset button (GPIO25): long press (2s) = reset band to defaults =====
+                # ===== Read both direct buttons upfront for combo detection =====
                 reset_btn = GPIO.input(RESET_BUTTON_GPIO)
-                if reset_btn == 0 and _reset_last_state == 1:
-                    _reset_press_time = time.time()
-                elif reset_btn == 0 and _reset_last_state == 0:
-                    if _reset_press_time > 0:
-                        hold_duration = time.time() - _reset_press_time
-                        if hold_duration >= 2.0:
-                            global _fft_reset_msg_until
+                extra_btn = GPIO.input(EXTRA_BUTTON_GPIO)
+
+                # ===== Reset + Extra held together 3s: save current settings into active preset =====
+                global _btn_save_arm_start, _btn_save_hold_start, _btn_save_hold_active
+                global _btn_save_hold_complete, _btn_save_suppressed, _btn_save_needs_release
+                both_pressed = (reset_btn == 0 and extra_btn == 0)
+                if both_pressed and not _btn_save_needs_release:
+                    if _btn_save_arm_start == 0.0:
+                        # Both just pressed - start 50ms debounce, suppress individual actions
+                        _btn_save_arm_start = time.monotonic()
+                        _btn_save_suppressed = True
+                        _reset_press_time = 0
+                    elif not _btn_save_hold_active:
+                        # Debounce elapsed → begin 3s countdown
+                        if time.monotonic() - _btn_save_arm_start >= 0.05:
+                            _btn_save_hold_start = time.monotonic()
+                            _btn_save_hold_active = True
+                    else:
+                        hold_dur = time.monotonic() - _btn_save_hold_start
+                        if hold_dur >= 3.0 and _btn_save_hold_complete == 0.0:
+                            save_current_as_default()
                             mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
-                            preset = DEFAULTS_PRESETS[mode_name]
-                            if len(preset) >= 6:
-                                center_hz, thresh, decay_ms, q_factor, _, release_mode = preset
+                            _btn_save_hold_complete = time.time()
+                            _btn_save_hold_active = False
+                            _btn_save_hold_start = 0.0
+                            _btn_save_arm_start = 0.0
+                            _btn_save_needs_release = True
+                            ui_flash(f"Saved! ({mode_name})", 1.5)
+                else:
+                    if _btn_save_hold_active or _btn_save_arm_start > 0.0:
+                        # Released before completing - cancel countdown
+                        _btn_save_hold_active = False
+                        _btn_save_hold_start = 0.0
+                        _btn_save_arm_start = 0.0
+                    # Clear suppression and re-arm only when both buttons fully up
+                    if reset_btn == 1 and extra_btn == 1:
+                        _btn_save_suppressed = False
+                        _btn_save_needs_release = False
+
+                # Expire the "Saved!" display after 1.5 seconds
+                if _btn_save_hold_complete > 0 and time.time() - _btn_save_hold_complete >= 1.5:
+                    _btn_save_hold_complete = 0.0
+
+                # ===== Reset button (GPIO25): hold 3s = reset band to defaults =====
+                if not _btn_save_suppressed:
+                    if reset_btn == 0 and _reset_last_state == 1 and not _reset_needs_release:
+                        # Just pressed - arm debounce
+                        _reset_press_time = time.monotonic()
+                    elif reset_btn == 0 and _reset_last_state == 0 and _reset_press_time > 0:
+                        # Being held
+                        if not _reset_countdown_active:
+                            if time.monotonic() - _reset_press_time >= 0.05:
+                                _reset_countdown_start = time.monotonic()
+                                _reset_countdown_active = True
+                        else:
+                            if time.monotonic() - _reset_countdown_start >= 3.0 and _reset_countdown_complete == 0.0:
                                 global RELEASE_MODE_INDEX
-                                RELEASE_MODE_INDEX = release_mode
-                            else:
-                                center_hz, thresh, decay_ms, q_factor = preset[:4]
-                            band.center = center_hz
-                            band.thresh = thresh
-                            band.decay_ms = decay_ms
-                            band.q = q_factor
-                            _home_enc2_range_pct = None
-                            _fft_reset_msg_until = time.time() + 1.0
-                            ui_flash("Reset to defaults", 1.0)
-                            _reset_press_time = 0
-                elif reset_btn == 1 and _reset_last_state == 0:
-                    if _reset_press_time > 0:
-                        hold_duration = time.time() - _reset_press_time
-                        if hold_duration < 2.0:
-                            # Short press: cycle tabs
+                                mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+                                preset = DEFAULTS_PRESETS[mode_name]
+                                if len(preset) >= 6:
+                                    center_hz, thresh, decay_ms, q_factor, _, release_mode = preset
+                                    RELEASE_MODE_INDEX = release_mode
+                                else:
+                                    center_hz, thresh, decay_ms, q_factor = preset[:4]
+                                band.center = center_hz
+                                band.thresh = thresh
+                                band.decay_ms = decay_ms
+                                band.q = q_factor
+                                _home_enc2_range_pct = None
+                                _reset_countdown_complete = time.time()
+                                _reset_countdown_active = False
+                                _reset_countdown_start = 0.0
+                                _reset_press_time = 0.0
+                                _reset_needs_release = True
+                                ui_flash("Reset to defaults", 1.5)
+                    elif reset_btn == 1 and _reset_last_state == 0:
+                        if _reset_press_time > 0 and not _reset_needs_release:
+                            # Released before countdown finished: cycle tabs
                             submenu_tab = (submenu_tab + 1) % len(SUBMENU_TABS)
                             submenu_column = 0
                             ui_flash(f"Page: {SUBMENU_TABS[submenu_tab]}", 0.5)
-                    _reset_press_time = 0
+                        _reset_countdown_active = False
+                        _reset_countdown_start = 0.0
+                        _reset_press_time = 0.0
+                        _reset_needs_release = False
+
+                else:
+                    if reset_btn == 1 and _reset_last_state == 0:
+                        _reset_press_time = 0.0  # clear any stale timer
+
+                # Expire "Reset!" display after 1.5 seconds
+                if _reset_countdown_complete > 0 and time.time() - _reset_countdown_complete >= 1.5:
+                    _reset_countdown_complete = 0.0
+
                 _reset_last_state = reset_btn
 
                 # ===== Extra button (GPIO7): cycle section within current tab =====
-                extra_btn = GPIO.input(EXTRA_BUTTON_GPIO)
-                if extra_btn == 0 and _extra_last_state == 1:
-                    _tab_name = SUBMENU_TABS[submenu_tab]
-                    _max_col = 1 if _tab_name in ("Setup", "Settings") else 2
-                    submenu_column = (submenu_column + 1) % (_max_col + 1)
-                    _col_label = SUBMENU_LABELS.get(_tab_name, [""])[submenu_column]
-                    ui_flash(_col_label if _col_label else _tab_name, 0.4)
+                if not _btn_save_suppressed:
+                    if extra_btn == 0 and _extra_last_state == 1:
+                        _tab_name = SUBMENU_TABS[submenu_tab]
+                        _max_col = 1 if _tab_name in ("Setup", "Settings") else 2
+                        submenu_column = (submenu_column + 1) % (_max_col + 1)
+                        _col_label = SUBMENU_LABELS.get(_tab_name, [""])[submenu_column]
+                        ui_flash(_col_label if _col_label else _tab_name, 0.4)
                 _extra_last_state = extra_btn
 
             except RuntimeError:
                 break
 
-            time.sleep(0.005)  # 5ms polling - balanced for all encoders
+            time.sleep(0.002)  # 2ms polling - matches test script rate for reliable fast-spin
     finally:
         pass
 
@@ -4815,7 +4921,7 @@ class OledUI:
                 self._draw_text_kerned(draw, (px, y), label_str, self._font_small, fill=label_color, kerning=label_kern)
             
             # Get value for this column
-            if tab == "Presets":
+            if tab == "Modes":
                 if i == 0:  # Preset - show cycling state with parentheses
                     current_mode = CYCLES_BETWEEN_MODES[CYCLES_BETWEEN_INDEX]
                     if current_mode == "x+1" and CYCLE_PHASE == 1 and BASE_PROGRAM != 6:
@@ -4882,22 +4988,35 @@ class OledUI:
                 self._draw_text_kerned(draw, (px, val_y), val_str, self._font_small, fill=val_color, kerning=val_kern)
 
     def _draw_reset_modal(self, draw):
-        """Centered bordered panel over the main UI when long-press reset completes."""
-        if time.time() >= _fft_reset_msg_until:
+        """Countdown modal for reset button hold (3s), then 'Reset!' on completion."""
+        now = time.time()
+        if not _reset_countdown_active and _reset_countdown_complete == 0.0:
             return
         W, H = self.width, self.height
-        msg = "reset!"
-        try:
-            bbox = draw.textbbox((0, 0), msg, font=self._font_small)
-            l, t, r, b = bbox[0], bbox[1], bbox[2], bbox[3]
-            tw, th = r - l, b - t
-        except (TypeError, AttributeError):
-            l, t, r, b = 0, 0, 30, 8
-            tw, th = 30, 8
-        pad_x, pad_y = 10, 5
-        border = 2
-        box_w = tw + pad_x * 2 + border * 2
-        box_h = th + pad_y * 2 + border * 2
+        pad_x, pad_y, border = 12, 6, 2
+
+        if _reset_countdown_complete > 0 and now - _reset_countdown_complete < 1.5:
+            line1 = "Reset!"
+            line2 = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+        elif _reset_countdown_active:
+            elapsed = time.monotonic() - _reset_countdown_start
+            remaining = max(0.0, 3.0 - elapsed)
+            line1 = "Reset"
+            line2 = str(max(1, math.ceil(remaining)))
+        else:
+            return
+
+        def _measure(txt, font):
+            try:
+                bb = draw.textbbox((0, 0), txt, font=font)
+                return bb[2] - bb[0], bb[3] - bb[1]
+            except Exception:
+                return len(txt) * 6, 8
+
+        w1, h1 = _measure(line1, self._font_small)
+        w2, h2 = _measure(line2, self._font)
+        box_w = max(w1, w2) + pad_x * 2 + border * 2
+        box_h = h1 + h2 + pad_y * 3 + border * 2
         bx0 = (W - box_w) // 2
         by0 = (H - box_h) // 2
         bx1 = bx0 + box_w - 1
@@ -4906,9 +5025,63 @@ class OledUI:
         ix0, iy0 = bx0 + border, by0 + border
         ix1, iy1 = bx1 - border, by1 - border
         draw.rectangle((ix0, iy0, ix1, iy1), fill=OLED_BLACK)
-        text_x = ix0 + pad_x - l
-        text_y = iy0 + pad_y - t
-        draw.text((text_x, text_y), msg, font=self._font_small, fill=OLED_WHITE)
+        tx1 = ix0 + (ix1 - ix0 - w1) // 2
+        ty1 = iy0 + pad_y
+        draw.text((tx1, ty1), line1, font=self._font_small, fill=OLED_WHITE)
+        tx2 = ix0 + (ix1 - ix0 - w2) // 2
+        ty2 = ty1 + h1 + pad_y
+        draw.text((tx2, ty2), line2, font=self._font, fill=OLED_WHITE)
+
+    def _draw_save_preset_modal(self, draw):
+        """Centered modal for the Reset+Extra 3-second save combo countdown."""
+        now = time.time()
+        if not _btn_save_hold_active and _btn_save_hold_complete == 0.0:
+            return
+        W, H = self.width, self.height
+        pad_x, pad_y, border = 12, 6, 2
+
+        if _btn_save_hold_complete > 0 and now - _btn_save_hold_complete < 1.5:
+            # Post-save: show "Saved!" + preset name
+            mode_name = DEFAULTS_MODES[DEFAULTS_MODE_INDEX]
+            line1 = "Saved!"
+            line2 = mode_name
+        elif _btn_save_hold_active:
+            elapsed = time.monotonic() - _btn_save_hold_start
+            remaining = max(0.0, 3.0 - elapsed)
+            digit = str(max(1, math.ceil(remaining)))
+            line1 = "Save"
+            line2 = digit
+        else:
+            return
+
+        # Measure both lines
+        def _measure(txt, font):
+            try:
+                bb = draw.textbbox((0, 0), txt, font=font)
+                return bb[2] - bb[0], bb[3] - bb[1]
+            except Exception:
+                return len(txt) * 6, 8
+
+        w1, h1 = _measure(line1, self._font_small)
+        w2, h2 = _measure(line2, self._font)
+        box_w = max(w1, w2) + pad_x * 2 + border * 2
+        box_h = h1 + h2 + pad_y * 3 + border * 2  # gap between lines + top/bottom padding
+        bx0 = (W - box_w) // 2
+        by0 = (H - box_h) // 2
+        bx1 = bx0 + box_w - 1
+        by1 = by0 + box_h - 1
+        draw.rectangle((bx0, by0, bx1, by1), fill=OLED_WHITE)
+        ix0, iy0 = bx0 + border, by0 + border
+        ix1, iy1 = bx1 - border, by1 - border
+        draw.rectangle((ix0, iy0, ix1, iy1), fill=OLED_BLACK)
+        # Line 1 centered
+        tx1 = ix0 + (ix1 - ix0 - w1) // 2
+        ty1 = iy0 + pad_y
+        draw.text((tx1, ty1), line1, font=self._font_small, fill=OLED_WHITE)
+        # Line 2 centered (bigger font)
+        tx2 = ix0 + (ix1 - ix0 - w2) // 2
+        ty2 = ty1 + h1 + pad_y
+        draw.text((tx2, ty2), line2, font=self._font, fill=OLED_WHITE)
 
     def render_once(self):
         if not self.enabled or self.device is None:
@@ -4941,15 +5114,15 @@ class OledUI:
             cy = content_inset  # Content y start
             cw = W - content_inset * 2  # Content width
             ch = H - content_inset * 2  # Content height
-            
+
             # Layout inside content area
             # Top section (FFT + Submenu): ~38px tall
             # Bottom section (HOME controls): ~22px tall
-            
+
             half_width = cw // 2  # ~125px
             top_height = 38  # Taller top section for submenu content
-            
-            # Top-left: FFT (squashed) + horizontal env vs threshold — same outer box as before
+
+            # Top-left: FFT + horizontal env vs threshold
             draw.rectangle((cx, cy, cx + half_width - 1, cy + top_height - 1), outline=OLED_WHITE)
             inner_x = cx + 1
             inner_y = cy + 1
@@ -4969,21 +5142,22 @@ class OledUI:
                 live_band_env,
                 _effective_thresh,
             )
-            
+
             # Top-right: Submenu area (taller to fit 3 lines)
             submenu_x = cx + half_width + 2
             submenu_width = half_width - 4
             content_height = top_height - 11  # Height of content area below tabs
-            
+
             # Draw folder-style tabs with border enclosing content
             self._draw_submenu_tabs_and_border(draw, submenu_x, cy, submenu_width, content_height)
-            
+
             # Submenu content inside the bordered area
             self._draw_submenu_content(draw, submenu_x + 2, cy + 12, submenu_width - 4, content_height - 2)
-            
+
             # Bottom: HOME controls (4 columns) - pushed down
             self._draw_home_controls(draw, cx, cy + top_height + 2, cw)
             self._draw_reset_modal(draw)
+            self._draw_save_preset_modal(draw)  # save combo modal always renders on top
 
         try:
             self.device.display(image)

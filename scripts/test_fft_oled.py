@@ -118,8 +118,8 @@ def oled_loop(device):
         with lock:
             b = bars.copy()
 
-        # FFT spectrum — full width, top 48px
-        fft_h = 48
+        # FFT spectrum — top 50px (matches main program proportions)
+        fft_h = 50
         bar_w = OLED_W / NUM_BANDS
         for i, level in enumerate(b):
             bx0 = int(i * bar_w)
@@ -133,7 +133,7 @@ def oled_loop(device):
         # divider line
         draw.line((0, fft_h, OLED_W - 1, fft_h), fill=GRAY)
 
-        # status row — bottom 14px
+        # status row — bottom strip
         rms_val = float(np.sqrt(np.mean(bars**2)))
         db_val  = 20 * np.log10(max(rms_val, 1e-6))
         draw.text((2, fft_h + 3), f"HiFiBerry L  {db_val:+.0f}dB", font=font, fill=WHITE)
