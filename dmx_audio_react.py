@@ -2,31 +2,26 @@
 # dmx_audio_react.py (v2: NO OLA) + DEV_NO_HW + Plug&Play Audio + FFT OLED Display
 #
 # Audio-reactive DMX with optional hardware:
-#   - 5 rotary encoders with push buttons (no MCP3008)
-#   - SPI OLED display with FFT spectrum (CE1) - EastRising 3.2" SSD1322 256x64
+#   - 5 rotary encoders with push buttons via MCP23017 I2C expander (0x20)
+#   - SPI OLED display with FFT spectrum (CE0) - EastRising 3.2" SSD1322 256x64
 #
-# Hardware Wiring:
-#   SPI OLED:
-#     RST: GPIO 12
-#     DC:  GPIO 24
-#     CS:  CE1 (GPIO 7)
+# V3 PCB Hardware Wiring:
+#   SPI OLED (CE0):
+#     RST: GPIO 24  (physical pin 18)
+#     DC:  GPIO 23  (physical pin 16)
+#     CS:  CE0 / GPIO 8  (physical pin 24)
 #
-#   Rotary Encoder 1 (Page selection):
-#     CLK: GPIO 5,  DT: GPIO 6,  SW: GPIO 13
+#   MCP23017 I2C expander (addr 0x20):
+#     Encoder 1 (Submenu col): CLK=GPB0, DT=GPB1, SW=GPB2
+#     Encoder 2 (Param A):     CLK=GPB3, DT=GPB4, SW=GPB5
+#     Encoder 3 (Param B):     CLK=GPB6, DT=GPA0, SW=GPA1
+#     Encoder 4 (Param C):     CLK=GPA2, DT=GPA3, SW=GPA4
+#     Encoder 5 (Brightness):  CLK=GPA5, DT=GPA6
 #
-#   Rotary Encoder 2 (Param A - Freq/Speed/Preset):
-#     CLK: GPIO 17, DT: GPIO 27, SW: GPIO 22
-#
-#   Rotary Encoder 3 (Param B - trigger threshold):
-#     CLK: GPIO 19, DT: GPIO 26, SW: GPIO 23
-#
-#   Rotary Encoder 4 (Param C - Release/Mode):
-#     CLK: GPIO 16, DT: GPIO 20, SW: GPIO 21
-#
-#   Rotary Encoder 5 (Brightness):
-#     CLK: GPIO 4,  DT: GPIO 18, SW: GPIO 8
-#
-#   Reset Button: GPIO 25
+#   Direct Pi GPIO:
+#     Encoder 5 switch: GPIO 17  (physical pin 11)
+#     Reset button:     GPIO 25  (physical pin 22)
+#     Extra button:     GPIO 7   (physical pin 26)
 #
 # DMX backends:
 #   DMX_BACKEND=null  -> run without DMX output
@@ -489,9 +484,9 @@ WEIGHTING_ON  = False
 # INPUT_GAIN_DB / limits defined with CONFIG_FILE (loaded by load_defaults_mode)
 BRIGHTNESS    = DEFAULT_BRIGHT
 
-# Which stereo channel feeds the FFT/trigger (many USB interfaces use Input 1 = left, not right).
-# Set env AUDIO_INPUT_CHANNEL=left | right | mix  (default right = index 1, legacy Scarlett line-in note)
-_ai_ch = os.environ.get("AUDIO_INPUT_CHANNEL", "right").strip().lower()
+# Which stereo channel feeds the FFT/trigger. HiFiBerry DAC+ADC aux input is on left (ch0).
+# Set env AUDIO_INPUT_CHANNEL=left | right | mix  (default left = index 0 for HiFiBerry aux input)
+_ai_ch = os.environ.get("AUDIO_INPUT_CHANNEL", "left").strip().lower()
 if _ai_ch in ("0", "l", "left", "1l"):
     AUDIO_INPUT_CHANNEL_MODE = "left"
 elif _ai_ch in ("mix", "mono", "both", "avg", "stereo"):
@@ -602,12 +597,13 @@ STOP_THREADS = False
 # When > time.time(), knob readings are ignored
 IGNORE_KNOBS_UNTIL = 0.0
 
-# Preferred device name patterns (fallback)
+# Preferred device name patterns — HiFiBerry first since that's the installed HAT
 PREFERRED_INPUTS = [
+    r"hifiberry",
+    r"snd_rpi_hifiberry",
     r"scarlett",
     r"focusrite",
     r"usb audio",
-    r"hifiberry",
     r"wm8960",
     r"codec",
     r"line",
@@ -694,7 +690,7 @@ OLED_GRAY = (128, 128, 128)
 SUBMENU_TABS = ["Presets", "Settings", "Setup"]
 submenu_tab = 0        # 0=PRE, 1=SET, 2=SETUP
 submenu_column = 0     # Column index; max depends on tab (Presets: 0–2; Settings: 0–2; Setup: 0–1)
-submenu_editing = False  # True when encoder 1 is editing selected column value
+submenu_editing = False  # Label of selected column is always highlighted
 
 # Submenu column labels for each tab
 SUBMENU_LABELS = {
@@ -874,7 +870,7 @@ def get_all_band_energies_vectorized(fft_mag):
     return (band_sums / _FFT_BIN_COUNTS).astype(np.float32)
 
 # Visual gain for FFT display (makes bars appear taller within fixed view)
-FFT_VISUAL_GAIN = 1.0  # Default 1.0; trigger modes do their own normalization
+FFT_VISUAL_GAIN = 2.5  # Boost bar height for HiFiBerry line-level input (-18dBFS typical)
 
 # FFT state (numpy arrays for faster vectorized operations)
 fft_bands = np.zeros(len(FFT_BANDS), dtype=np.float32)
@@ -1073,6 +1069,7 @@ encoder1_button = False
 _reset_last_state = 1  # Reset button state (1 = not pressed)
 _reset_press_time = 0  # Timestamp when reset button was pressed (for long-press detection)
 _fft_reset_msg_until = 0.0  # Show centered "reset!" modal until this timestamp
+_extra_last_state = 1  # Extra button (GPIO7) state (1 = not pressed)
 
 # Encoder state for all 5 encoders
 # Encoders 1-4: Page, Param A, Param B, Param C (indices 0-3)
@@ -2514,26 +2511,24 @@ def _apply_encoder_delta(enc_idx, direction):
         return
     
     with _param_lock:
-        base_delta = 1 if direction > 0 else -1
+        base_delta = -1 if direction > 0 else 1  # hardware CW produces inverted quadrature signal
         
-        # ===== Encoder 5 (enc_idx=4): Brightness =====
+        # ===== Encoder 5 (enc_idx=4): Brightness — 1 display unit per click =====
         if enc_idx == 4:
             if not _brightness_off:
-                BRIGHTNESS = max(
-                    0.0,
-                    min(0.99, BRIGHTNESS + base_delta * ENC_STEP_TRIG_BRIGHT),
-                )
+                bright_int = max(0, min(99, int(BRIGHTNESS * 99) + base_delta))
+                BRIGHTNESS = bright_int / 99.0
                 _brightness_target = BRIGHTNESS
                 if RELEASE_MODES[RELEASE_MODE_INDEX] in ("bright", "both"):
                     _reactive_brightness_scale = BRIGHTNESS
-                    _effective_brightness_display = int(BRIGHTNESS * 99)
+                    _effective_brightness_display = bright_int
                     _brightness_knob_last_turn = time.time()
             return
-        
+
         # ===== Encoder 2 (enc_idx=1): Frequency/Q or Speed in AMBIENT mode =====
         if enc_idx == 1:
             if BASE_PROGRAM == 6:
-                ambient_speed = max(0.2, min(8.0, ambient_speed + base_delta * 0.2))
+                ambient_speed = max(0.2, min(8.0, ambient_speed + base_delta * 0.1))
             elif _home_enc2_alt:
                 # Range (Q): one quadrature step = one OLED unit (0–99), no velocity.
                 # Use a stored integer step index so band.q round-trip cannot collapse two ticks to one.
@@ -2550,26 +2545,18 @@ def _apply_encoder_delta(enc_idx, direction):
                 t = _home_enc2_range_pct / 99.0
                 band.q = max(q_min, min(Q_MAX, Q_MAX * (q_min / Q_MAX) ** t))
             else:
-                mult = max(1.0, _calc_velocity_multiplier(1, VELOCITY_MAX_FREQ))
-                delta = base_delta * mult
-                factor = 1.008 ** delta
-                new_center = max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, band.center * factor))
-                band.center = new_center
+                # 1Hz per click: snap to integer Hz then step.
+                band.center = float(max(FFT_MIN_FREQ, min(FFT_MAX_FREQ, int(band.center) + base_delta)))
             return
-        
-        # ===== Encoder 3 (enc_idx=2): Trigger threshold (disabled in AMBIENT) =====
-        # Same Trigger knob (band.thresh) on HOME and Settings tabs. Input gain is
-        # adjusted via encoder 1 on the Settings "Gain" column. Detection mode is
-        # locked to "old" and is no longer adjustable from any encoder.
+
+        # ===== Encoder 3 (enc_idx=2): Trigger threshold — 1 display unit per click =====
         if enc_idx == 2:
             if BASE_PROGRAM == 6:
                 return
-            band.thresh = max(
-                0.0,
-                min(1.0, band.thresh + base_delta * ENC_STEP_TRIG_BRIGHT),
-            )
+            thresh_int = max(0, min(99, int(band.thresh * 99) + base_delta))
+            band.thresh = thresh_int / 99.0
             return
-        
+
         # ===== Encoder 4 (enc_idx=3): Release/ReleaseMode or Fade in AMBIENT mode =====
         if enc_idx == 3:
             if BASE_PROGRAM == 6:
@@ -2587,13 +2574,12 @@ def _apply_encoder_delta(enc_idx, direction):
                         RELEASE_MODE_INDEX = new_idx
                         _discrete_last_change[3] = now
             else:
-                band.decay_ms = max(
-                    40.0,
-                    min(5000.0, band.decay_ms + base_delta * ENC_STEP_RELEASE_MS),
-                )
+                # 1ms per click: snap to integer ms then step.
+                decay_int = max(40, min(5000, int(band.decay_ms) + base_delta))
+                band.decay_ms = float(decay_int)
                 release_mode = RELEASE_MODES[RELEASE_MODE_INDEX]
                 if release_mode in ("react", "rand", "both"):
-                    _effective_release_display = int(band.decay_ms)
+                    _effective_release_display = decay_int
                     _release_knob_last_turn = time.time()
             return
 
@@ -3019,7 +3005,8 @@ def encoder_reader():
     global _enc_awaiting_release
     global _setup_enc3_detect, _setup_enc4_channels
     global _brightness_click_flash, _brightness_enc5sw_state
-    
+    global _extra_last_state
+
     if DEV_NO_HW:
         return
     
@@ -3065,6 +3052,7 @@ def encoder_reader():
 
     _reset_last_state = GPIO.input(RESET_BUTTON_GPIO)
     _reset_press_time = 0  # Track how long reset button is held
+    _extra_last_state = GPIO.input(EXTRA_BUTTON_GPIO)
     
     try:
         while not STOP_THREADS:
@@ -3072,116 +3060,46 @@ def encoder_reader():
                 # Bulk-read all MCP pins in one I2C transaction
                 _mcp_snapshot_update()
 
-                # ===== Encoder 1 - Submenu column selection/editing =====
+                # ===== Encoder 1 - Freq / Range =====
                 direction = _read_enc1_quadrature(ENC1_CLK, ENC1_DT)
                 if direction != 0:
-                    global submenu_column, submenu_editing
-                    if submenu_editing:
-                        # Editing mode: adjust the selected column's value
-                        _handle_submenu_value_change(direction)
-                    else:
-                        # Selection mode: move between columns
-                        # Presets: 3 cols (Preset/Mode/Beats); Settings: 2 cols (Gain/Defaults); Setup: 2 cols (Output/Chans)
-                        _tab_name = SUBMENU_TABS[submenu_tab]
-                        if _tab_name in ("Setup", "Settings"):
-                            _max_submenu_col = 1
-                        else:
-                            _max_submenu_col = 2
-                        submenu_column = max(
-                            0, min(_max_submenu_col, submenu_column + direction)
-                        )
-                
+                    _apply_encoder_delta(1, direction)
+
                 enc1_sw = _mcp_read(ENC1_SW)
-                global _enc1_press_time, _enc1_save_progress, _enc1_save_complete
-
-                # Non-blocking: check if waiting for button release
                 if _enc_awaiting_release[0]:
-                    if enc1_sw == 1:  # Button released
+                    if enc1_sw == 1:
                         _enc_awaiting_release[0] = False
-                    _enc_last_sw[0] = enc1_sw
-                else:
-                    is_settings_reset_editing = (SUBMENU_TABS[submenu_tab] == "Settings" and
-                                                 submenu_column == 1 and submenu_editing)
+                elif enc1_sw == 0 and _enc_last_sw[0] == 1:
+                    global _home_enc2_range_pct
+                    _home_enc2_alt = not _home_enc2_alt
+                    _home_enc2_range_pct = None
+                    ui_flash("Mode: Range" if _home_enc2_alt else "Mode: Freq", 0.5)
+                    _enc_awaiting_release[0] = True
+                _enc_last_sw[0] = enc1_sw
 
-                    if enc1_sw == 0 and _enc_last_sw[0] == 1:
-                        _enc1_press_time = time.time()
-                        _enc1_save_progress = 0.0
-                    elif enc1_sw == 0 and _enc_last_sw[0] == 0:
-                        # Button still held - check for long press on Settings/Reset (editing mode only)
-                        if _enc1_press_time > 0 and is_settings_reset_editing:
-                            hold_duration = time.time() - _enc1_press_time
-                            # Only start showing progress after 150ms delay
-                            if hold_duration >= 0.15:
-                                # Progress starts after 150ms, completes at ENC1_SAVE_HOLD_DURATION
-                                adjusted_duration = hold_duration - 0.15
-                                _enc1_save_progress = min(1.0, adjusted_duration / ENC1_SAVE_HOLD_DURATION)
-                            
-                            if hold_duration >= (ENC1_SAVE_HOLD_DURATION + 0.15):
-                                # Long press complete - save current settings to selected preset
-                                save_current_as_default()
-                                _enc1_press_time = 0.0
-                                _enc1_save_progress = 2.0  # Special value to show "saved!"
-                                _enc1_save_complete = time.time()
-                                # Non-blocking: mark awaiting release to prevent toggle
-                                _enc_awaiting_release[0] = True
-                    elif enc1_sw == 1 and _enc_last_sw[0] == 0:
-                        # Button just released
-                        if _enc1_press_time > 0:
-                            # If countdown was showing (progress > 0), just cancel - don't toggle
-                            if _enc1_save_progress > 0:
-                                # Countdown was active - cancel save, stay in current mode
-                                pass
-                            else:
-                                # No countdown was showing - normal short press toggle
-                                submenu_editing = not submenu_editing
-                                if submenu_editing:
-                                    ui_flash("Edit", 0.3)
-                                else:
-                                    ui_flash("Select", 0.3)
-                        _enc1_press_time = 0.0
-                        _enc1_save_progress = 0.0
-                    _enc_last_sw[0] = enc1_sw
-                
-                # ===== Encoder 2 - Param A (Freq/Speed/Preset) =====
+                # ===== Encoder 2 - Threshold =====
                 direction = _read_encoder_quadrature(1, ENC2_CLK, ENC2_DT)
                 if direction != 0:
-                    _apply_encoder_delta(1, direction)
+                    _apply_encoder_delta(2, direction)
 
                 enc2_sw = _mcp_read(ENC2_SW)
                 if _enc_awaiting_release[1]:
                     if enc2_sw == 1:
                         _enc_awaiting_release[1] = False
                 elif enc2_sw == 0 and _enc_last_sw[1] == 1:
-                    global _home_enc2_range_pct
-                    _home_enc2_alt = not _home_enc2_alt
-                    _home_enc2_range_pct = None
-                    ui_flash("Mode: Range" if _home_enc2_alt else "Mode: Freq", 0.5)
                     _enc_awaiting_release[1] = True
                 _enc_last_sw[1] = enc2_sw
 
-                # ===== Encoder 3 - Param B (Thresh/Beats) =====
+                # ===== Encoder 3 - Release / Release-Mode =====
                 direction = _read_encoder_quadrature(2, ENC3_CLK, ENC3_DT)
                 if direction != 0:
-                    _apply_encoder_delta(2, direction)
+                    _apply_encoder_delta(3, direction)
 
                 enc3_sw = _mcp_read(ENC3_SW)
                 if _enc_awaiting_release[2]:
                     if enc3_sw == 1:
                         _enc_awaiting_release[2] = False
                 elif enc3_sw == 0 and _enc_last_sw[2] == 1:
-                    _enc_awaiting_release[2] = True
-                _enc_last_sw[2] = enc3_sw
-
-                # ===== Encoder 4 - Param C (Release/Mode) =====
-                direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
-                if direction != 0:
-                    _apply_encoder_delta(3, direction)
-
-                enc4_sw = _mcp_read(ENC4_SW)
-                if _enc_awaiting_release[3]:
-                    if enc4_sw == 1:
-                        _enc_awaiting_release[3] = False
-                elif enc4_sw == 0 and _enc_last_sw[3] == 1:
                     global _setup_enc4_channels
                     if SUBMENU_TABS[submenu_tab] == "Settings":
                         _setup_enc4_channels = not _setup_enc4_channels
@@ -3189,27 +3107,65 @@ def encoder_reader():
                     else:
                         _home_enc4_alt = not _home_enc4_alt
                         ui_flash("Mode: R-Mode" if _home_enc4_alt else "Mode: Release", 0.5)
-                    _enc_awaiting_release[3] = True
-                _enc_last_sw[3] = enc4_sw
+                    _enc_awaiting_release[2] = True
+                _enc_last_sw[2] = enc3_sw
 
-                # ===== Encoder 5 - Brightness =====
-                direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
+                # ===== Encoder 4 - Brightness =====
+                direction = _read_encoder_quadrature(3, ENC4_CLK, ENC4_DT)
                 if direction != 0:
                     _apply_encoder_delta(4, direction)
 
-                # ENC5 switch is direct GPIO17
+                enc4_sw = _mcp_read(ENC4_SW)
+                _brightness_enc5sw_state = enc4_sw
+                if enc4_sw == 0 and _enc_last_sw[3] == 1:
+                    _brightness_click_flash = 1.0
+                    toggle_brightness()
+                _enc_last_sw[3] = enc4_sw
+
+                # ===== Encoder 5 - Edit highlighted section value =====
+                direction = _read_encoder_quadrature(4, ENC5_CLK, ENC5_DT)
+                if direction != 0:
+                    _handle_submenu_value_change(direction)
+
+                # Enc5 switch (GPIO17): short press = cycle tabs, long press = save preset
                 try:
                     enc5_sw = GPIO.input(ENC5_SW_GPIO)
                 except Exception:
                     enc5_sw = 1
-                _brightness_enc5sw_state = enc5_sw
-                if enc5_sw == 0 and _enc_last_sw[4] == 1:
-                    _brightness_click_flash = 1.0
-                    toggle_brightness()
+                global _enc1_press_time, _enc1_save_progress, _enc1_save_complete
+                if _enc_awaiting_release[4]:
+                    if enc5_sw == 1:
+                        _enc_awaiting_release[4] = False
+                else:
+                    is_settings_reset = (SUBMENU_TABS[submenu_tab] == "Settings" and
+                                         submenu_column == 1)
+                    if enc5_sw == 0 and _enc_last_sw[4] == 1:
+                        _enc1_press_time = time.time()
+                        _enc1_save_progress = 0.0
+                    elif enc5_sw == 0 and _enc_last_sw[4] == 0:
+                        if _enc1_press_time > 0 and is_settings_reset:
+                            hold_duration = time.time() - _enc1_press_time
+                            if hold_duration >= 0.15:
+                                adjusted_duration = hold_duration - 0.15
+                                _enc1_save_progress = min(1.0, adjusted_duration / ENC1_SAVE_HOLD_DURATION)
+                            if hold_duration >= (ENC1_SAVE_HOLD_DURATION + 0.15):
+                                save_current_as_default()
+                                _enc1_press_time = 0.0
+                                _enc1_save_progress = 2.0
+                                _enc1_save_complete = time.time()
+                                _enc_awaiting_release[4] = True
+                    elif enc5_sw == 1 and _enc_last_sw[4] == 0:
+                        if _enc1_press_time > 0:
+                            if _enc1_save_progress == 0:
+                                # Short press: cycle tabs
+                                submenu_tab = (submenu_tab + 1) % len(SUBMENU_TABS)
+                                submenu_column = 0
+                                ui_flash(f"Tab: {SUBMENU_TABS[submenu_tab]}", 0.5)
+                        _enc1_press_time = 0.0
+                        _enc1_save_progress = 0.0
                 _enc_last_sw[4] = enc5_sw
 
-                # ===== Reset button (GPIO25) =====
-                # Short press = cycle submenu tabs; long press (2s) = reset band to defaults
+                # ===== Reset button (GPIO25): long press (2s) = reset band to defaults =====
                 reset_btn = GPIO.input(RESET_BUTTON_GPIO)
                 if reset_btn == 0 and _reset_last_state == 1:
                     _reset_press_time = time.time()
@@ -3238,14 +3194,23 @@ def encoder_reader():
                     if _reset_press_time > 0:
                         hold_duration = time.time() - _reset_press_time
                         if hold_duration < 2.0:
-                            # Short press - cycle tabs
+                            # Short press: cycle tabs
                             submenu_tab = (submenu_tab + 1) % len(SUBMENU_TABS)
-                            submenu_column = 0  # Jump to first column of new page
-                            submenu_editing = False  # Exit edit mode, return to header selection
-                            ui_flash(f"Tab: {SUBMENU_TABS[submenu_tab]}", 0.5)
+                            submenu_column = 0
+                            ui_flash(f"Page: {SUBMENU_TABS[submenu_tab]}", 0.5)
                     _reset_press_time = 0
                 _reset_last_state = reset_btn
-                
+
+                # ===== Extra button (GPIO7): cycle section within current tab =====
+                extra_btn = GPIO.input(EXTRA_BUTTON_GPIO)
+                if extra_btn == 0 and _extra_last_state == 1:
+                    _tab_name = SUBMENU_TABS[submenu_tab]
+                    _max_col = 1 if _tab_name in ("Setup", "Settings") else 2
+                    submenu_column = (submenu_column + 1) % (_max_col + 1)
+                    _col_label = SUBMENU_LABELS.get(_tab_name, [""])[submenu_column]
+                    ui_flash(_col_label if _col_label else _tab_name, 0.4)
+                _extra_last_state = extra_btn
+
             except RuntimeError:
                 break
 
@@ -3797,7 +3762,7 @@ class OledUI:
                 gpio_DC=OLED_DC_PIN,
                 gpio_RST=OLED_RST_PIN,
             )
-            self.device = ssd1322(serial, width=width, height=height, rotate=0, framebuffer=luma_full_frame())
+            self.device = ssd1322(serial, width=width, height=height, rotate=2, framebuffer=luma_full_frame())
             # luma's default is contrast(0x7F); SSD1322 often looks washed out. Max by default, override with OLED_CONTRAST=0-255
             _oc = os.environ.get("OLED_CONTRAST", "255").strip() or "255"
             try:
@@ -5348,27 +5313,37 @@ def main():
     # Audio thread
     threading.Thread(target=audio_loop, daemon=True).start()
 
-    # TUI thread (enabled by default if running in a TTY)
-    # For smoother OLED/audio in production: run with ENABLE_TUI=0 to skip curses overhead
+    # TUI — run in the main thread so curses.wrapper owns terminal teardown.
+    # Running it in a daemon thread caused terminal corruption on exit: the main
+    # thread called curses.endwin() while the TUI thread was still active.
     use_tui = sys.stdout.isatty() and os.environ.get("ENABLE_TUI", "1") != "0"
-    if use_tui:
-        threading.Thread(target=lambda: curses.wrapper(tui), daemon=True).start()
-    else:
+    if not use_tui:
         print("[INFO] No TTY detected (or ENABLE_TUI=0). Running headless.")
 
-    # Keep main thread alive
     try:
-        while not STOP_THREADS:
-            time.sleep(0.25)
+        if use_tui:
+            # curses.wrapper blocks until tui() returns; it calls endwin() for us
+            # in its own finally, even on KeyboardInterrupt.
+            curses.wrapper(tui)
+        else:
+            while not STOP_THREADS:
+                time.sleep(0.25)
     except KeyboardInterrupt:
         pass
     finally:
         _set_stop(True)
         _set_run(False)
-        time.sleep(0.1)
+        time.sleep(0.15)
+
+        # endwin is only needed in headless mode (wrapper already called it in TUI mode).
+        # Call it unconditionally — it's a no-op if curses was never fully initialized.
+        try:
+            curses.endwin()
+        except Exception:
+            pass
 
         print("\nAll channels off. Bye.")
-        
+
         # Turn off OLED display
         try:
             if oled_ui and oled_ui.device is not None:
@@ -5376,7 +5351,7 @@ def main():
                 oled_ui.device.cleanup()
         except Exception:
             pass
-        
+
         try:
             if (not DEV_NO_HW) and (GPIO is not None):
                 GPIO.cleanup()

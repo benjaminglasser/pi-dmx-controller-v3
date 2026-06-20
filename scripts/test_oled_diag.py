@@ -22,15 +22,16 @@ GPIO.setup(RST, GPIO.OUT)
 # ── Test 1: DC + RST toggle only ───────────────────────────────────────────
 print("\n=== Test 1: DC + RST pin toggle (probe with multimeter) ===")
 print("Toggling DC(GPIO23) and RST(GPIO24) — each should read 0V / 3.3V")
-print("Press Ctrl-C to move on to the next test.\n")
-try:
-    while True:
-        GPIO.output(DC, 1); GPIO.output(RST, 1)
-        print("  HIGH — probe pin 14 and pin 15, should read 3.3V"); time.sleep(1)
-        GPIO.output(DC, 0); GPIO.output(RST, 0)
-        print("  LOW  — probe pin 14 and pin 15, should read 0V");   time.sleep(1)
-except KeyboardInterrupt:
-    print("\n  Moving on...")
+print("Press Enter to move on to the next test.\n")
+import threading
+_advance = threading.Event()
+threading.Thread(target=lambda: (input(), _advance.set()), daemon=True).start()
+while not _advance.is_set():
+    GPIO.output(DC, 1); GPIO.output(RST, 1)
+    print("  HIGH — probe pin 14 and pin 15, should read 3.3V"); time.sleep(1)
+    GPIO.output(DC, 0); GPIO.output(RST, 0)
+    print("  LOW  — probe pin 14 and pin 15, should read 0V");   time.sleep(1)
+print("  Moving on...")
 GPIO.output(DC, 0)
 GPIO.output(RST, 1)
 
@@ -47,18 +48,18 @@ print("  Red probe on OLED pin 16 (CS/GPIO8)")
 print("  Between transfers: should read 3.3V")
 print("  During transfers:  briefly dips, meter may show ~2.5-3.0V")
 print("  Steady 0V the whole time = GPIO conflict")
-print("  Press Ctrl-C to move on.\n")
-try:
-    i = 0
-    while True:
-        GPIO.output(DC, 0)
-        spi.xfer2([0xFD, 0x12])
-        if i % 20 == 0:
-            print(f"  Sent {i} transfers — what does the meter read on pin 16?")
-        time.sleep(0.05)
-        i += 1
-except KeyboardInterrupt:
-    print("\n  Moving on...")
+print("  Press Enter to move on.\n")
+_advance2 = threading.Event()
+threading.Thread(target=lambda: (input(), _advance2.set()), daemon=True).start()
+i = 0
+while not _advance2.is_set():
+    GPIO.output(DC, 0)
+    spi.xfer2([0xFD, 0x12])
+    if i % 20 == 0:
+        print(f"  Sent {i} transfers — what does the meter read on pin 16?")
+    time.sleep(0.05)
+    i += 1
+print("  Moving on...")
 
 # ── Test 3: Bit-bang with manual CS — bypasses hardware SPI entirely ───────
 print("\n=== Test 3: Full bit-bang SPI (manual CS on GPIO8) ===")

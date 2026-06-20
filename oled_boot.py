@@ -25,9 +25,9 @@ except ImportError as e:
     sys.exit(0)
 
 # Match dmx_audio_react.py hardware
-OLED_SPI_DEV = 1
-OLED_RST_PIN = 12
-OLED_DC_PIN = 24
+OLED_SPI_DEV = 0   # CE0 (GPIO8, physical pin 24)
+OLED_RST_PIN = 24  # BCM GPIO24 (physical pin 18)
+OLED_DC_PIN  = 23  # BCM GPIO23 (physical pin 16)
 OLED_WIDTH = 256
 OLED_HEIGHT = 64
 
@@ -108,7 +108,7 @@ def main():
     try:
         ser = spi(device=OLED_SPI_DEV, port=0, bus_speed_hz=4000000,
                  gpio_DC=OLED_DC_PIN, gpio_RST=OLED_RST_PIN)
-        device = ssd1322(ser, width=OLED_WIDTH, height=OLED_HEIGHT, rotate=0)
+        device = ssd1322(ser, width=OLED_WIDTH, height=OLED_HEIGHT, rotate=2)
     except Exception as e:
         print(f"[oled_boot] init failed: {e}", file=sys.stderr)
         sys.exit(0)
