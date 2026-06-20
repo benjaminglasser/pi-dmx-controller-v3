@@ -1,4 +1,4 @@
-# Pi DMX Controller v2
+# Pi DMX Controller v3
 
 Audio-reactive DMX lighting controller running on Raspberry Pi. Analyzes audio in real time via FFT and drives DMX fixtures over RS485/UART. Controlled via 5 rotary encoders and an OLED display.
 
