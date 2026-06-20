@@ -40,7 +40,7 @@ After reboot, the OLED splash plays and the DMX controller starts automatically.
 ## Step 1: Flash the SD card
 
 1. Download [Raspberry Pi Imager](https://www.raspberrypi.com/software/).
-2. Select **Raspberry Pi OS (64-bit)**.
+2. Select **Raspberry Pi OS (64-bit)** — choose the version based on **Debian 13 (Trixie)**, which is what this project runs on. In the Imager it appears as "Raspberry Pi OS (64-bit)" under the latest release. Confirm the Debian version says **Trixie / 13** before flashing.
 3. In **OS Customisation** (gear icon), set:
    - **Username: `pi`** — matches all defaults in this repo; anything else means editing service files before bootstrap.
    - Enable **SSH** (password or key).
