@@ -11,7 +11,7 @@ Use this guide when setting up a new Raspberry Pi from scratch. Everything below
 
 # 1. Install git and clone the repo
 sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/benjaminglasser/pi-dmx-controller-v2.git ~/pi-dmx-controller-v2
+git clone https://github.com/benjaminglasser/pi-dmx-controller-v3.git ~/pi-dmx-controller-v2
 cd ~/pi-dmx-controller-v2
 
 # 2. Copy firmware config (enables SPI, UART, disables BT)
@@ -55,7 +55,7 @@ The bootstrap script expects the repo at exactly `~/pi-dmx-controller-v2`.
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/benjaminglasser/pi-dmx-controller-v2.git ~/pi-dmx-controller-v2
+git clone https://github.com/benjaminglasser/pi-dmx-controller-v3.git ~/pi-dmx-controller-v2
 cd ~/pi-dmx-controller-v2
 ```
 

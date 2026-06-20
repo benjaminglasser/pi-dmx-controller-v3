@@ -26,7 +26,7 @@ One-line summary of what you run after SSH-ing into a fresh Pi:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/benjaminglasser/pi-dmx-controller-v2.git ~/pi-dmx-controller-v2
+git clone https://github.com/benjaminglasser/pi-dmx-controller-v3.git ~/pi-dmx-controller-v2
 cd ~/pi-dmx-controller-v2
 sudo cp config/boot/config.txt /boot/firmware/config.txt
 sudo sed -i 's/console=serial0,[0-9]\+ //g' /boot/firmware/cmdline.txt
