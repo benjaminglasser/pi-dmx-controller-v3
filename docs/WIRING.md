@@ -1,113 +1,114 @@
-# 🧩 Wiring Guide — DMX Audio-Reactive Controller (Raspberry Pi)
+# Wiring Guide — Pi DMX Controller V3 PCB
 
-This guide covers all wiring for the **Raspberry Pi + HiFiBerry DAC+ADC + MCP3008** setup with six knobs, a rotary program switch, a reset button, and a status LED.
-
----
-
-## Overview
-
-| Component | Purpose | GPIO / Interface |
-|------------|----------|------------------|
-| **HiFiBerry DAC+ADC** | Audio input & output | I2S bus |
-| **MCP3008 ADC** | Reads six potentiometers | SPI bus (CE0) |
-| **Rotary Switch** | Selects 1 of 4 programs | GPIO 21 – 24 |
-| **Reset Button** | Restores default parameters | GPIO 25 |
-| **Blue LED** | Indicates system ready | GPIO 5 |
+All connections for the current V3 PCB: SSD1322 OLED, MCP23017 encoder expander, direct GPIO buttons, RS485 DMX UART, and audio.
 
 ---
 
-## MCP3008 Connections (SPI0 CE0)
+## Raspberry Pi GPIO Pinout (relevant pins)
 
-| MCP3008 Pin | Connects To | Notes |
-|--------------|-------------|-------|
-| VDD / VREF | 3.3 V ( Pi pin 1 ) | Power |
-| AGND / DGND | Ground ( Pi pin 6 ) | Common ground |
-| CLK | BCM 11 ( Pi pin 23 ) | SPI Clock |
-| MOSI | BCM 10 ( Pi pin 19 ) | Master Out Slave In |
-| MISO | BCM 9 ( Pi pin 21 ) | Master In Slave Out |
-| CE0 | BCM 8 ( Pi pin 24 ) | Chip Enable |
-| CH0 – CH5 | Knobs 1–6 (10 kΩ pots) | Each to 3.3 V / GND / signal wire |
-| CH6 – CH7 | Unused | Optional future inputs |
-
-Each potentiometer (10 kΩ) →  
-• Left leg → 3.3 V  
-• Right leg → GND  
-• Middle leg → MCP3008 channel (CH0–CH5)
-
-| Channel | Parameter |
-|----------|------------|
-| CH0 | Center Frequency |
-| CH1 | Q Factor |
-| CH2 | Threshold |
-| CH3 | Attack Time |
-| CH4 | Decay Time |
-| CH5 | Brightness |
+| BCM | Physical | Function |
+|-----|----------|---------|
+| 2 | 3 | I2C SDA — MCP23017 |
+| 3 | 5 | I2C SCL — MCP23017 |
+| 7 | 26 | Extra button (active low, internal pull-up) |
+| 8 | 24 | SPI CE0 — OLED chip select |
+| 9 | 21 | SPI MISO |
+| 10 | 19 | SPI MOSI |
+| 11 | 23 | SPI SCLK |
+| 14 | 8 | UART TX → RS485 DI |
+| 15 | 10 | UART RX ← RS485 RO |
+| 17 | 11 | Encoder 5 push button (active low) |
+| 23 | 16 | OLED DC |
+| 24 | 18 | OLED RST |
+| 25 | 22 | Reset button (active low, internal pull-up) |
 
 ---
 
-## Rotary Program Switch (4-Way)
+## OLED Display — EastRising 3.2" SSD1322 (256×64 SPI)
 
-Connect four switch outputs to these GPIOs (internal pull-ups enabled):
+| OLED Pin | Connects To | Notes |
+|----------|-------------|-------|
+| VCC | 3.3V (pin 1) | |
+| GND | GND (pin 6) | |
+| SCK | BCM 11 / pin 23 | SPI clock |
+| SDA (MOSI) | BCM 10 / pin 19 | SPI data |
+| CS | BCM 8 / pin 24 | CE0 |
+| DC | BCM 23 / pin 16 | Data/command select |
+| RST | BCM 24 / pin 18 | Reset |
 
-| Function | GPIO Pin | Program Code |
-|-----------|-----------|--------------|
-| Switch Bit 1 | BCM 21 | (1, 1, 1, 1) → Program 1 (All) |
-| Switch Bit 2 | BCM 22 | (1, 1, 1, 0) → Program 2 (Chase) |
-| Switch Bit 3 | BCM 23 | (1, 0, 1, 0) → Program 3 (Random) |
-| Switch Bit 4 | BCM 24 | (0, 1, 1, 0) → Program 4 (Ambient) |
-
-All switch commons → GND.  
-Each position connects a unique combo of these GPIOs to ground, as shown above.
-
----
-
-## Reset Button (BCM 25)
-
-| Pin | Connection |
-|------|-------------|
-| 1 | BCM 25 |
-| 2 | GND |
-
-The script uses an internal pull-up resistor, so pressing the button pulls the pin LOW.  
-Pressing restores default parameters instantly.
+The display is on **CE0** (`spidev0.0`). `config/boot/config.txt` enables SPI with a single chip select so GPIO8 is available.
 
 ---
 
-## 🔵 System LED (BCM 5)
+## Rotary Encoders — via MCP23017 I2C Expander (addr 0x20)
 
-| Pin | Connection |
-|------|-------------|
-| Anode (+) | BCM 5 → through 330 Ω resistor |
-| Cathode (–) | GND |
+Connect the MCP23017 to the Pi's I2C bus:
 
-The LED lights solid when the program and OLA are running, signaling the system is ready.
+| MCP23017 Pin | Connects To |
+|--------------|-------------|
+| VDD | 3.3V |
+| GND | GND |
+| SDA | BCM 2 / pin 3 |
+| SCL | BCM 3 / pin 5 |
+| A0, A1, A2 | GND (sets I2C addr 0x20) |
+
+Encoder wiring on the MCP23017:
+
+| Encoder | Function | CLK Pin | DT Pin | SW Pin |
+|---------|----------|---------|--------|--------|
+| E1 | Submenu / column select | GPB0 | GPB1 | GPB2 |
+| E2 | Parameter A | GPB3 | GPB4 | GPB5 |
+| E3 | Parameter B | GPB6 | GPA0 | GPA1 |
+| E4 | Parameter C | GPA2 | GPA3 | GPA4 |
+| E5 | Brightness (rotation) | GPA5 | GPA6 | — |
+
+Encoder 5 push button is wired **directly to Pi GPIO 17** (not through MCP23017).
+
+Each encoder: common pin → GND. Internal pull-ups enabled in software.
 
 ---
 
-## 🧷 DMX Output
+## Buttons (Direct GPIO)
 
-Use a USB-DMX interface (e.g., Enttec Open DMX USB) connected to the Pi.  
-OLA detects it automatically as **Universe 1**.
+| Button | BCM | Physical | Notes |
+|--------|-----|----------|-------|
+| Encoder 5 push | 17 | pin 11 | Active low, internal pull-up |
+| Reset | 25 | pin 22 | Active low, internal pull-up — restores default params |
+| Extra | 7 | pin 26 | Active low, internal pull-up |
 
 ---
 
-## Pin Reference (BCM Layout Summary)
+## DMX Output — GPIO UART → RS485 → XLR
 
-| Pin | Function |
-|------|-----------|
-| BCM 5 | Blue LED |
-| BCM 8 – 11 | SPI (MCP3008) |
-| BCM 21 – 24 | Rotary Switch (Program) |
-| BCM 25 | Reset Button |
+The app sends DMX directly over `/dev/serial0` (UART on GPIO 14/15) through an RS485 transceiver (e.g. DMXKing, MAX485 module, or similar).
+
+| Pi Pin | RS485 Module Pin | Notes |
+|--------|-----------------|-------|
+| BCM 14 / pin 8 | DI (data in) | UART TX |
+| BCM 15 / pin 10 | RO (receiver out) | UART RX |
+| 3.3V or 5V | VCC | Check module voltage |
+| GND | GND | Common ground |
+| DE + RE | 3.3V or tied together | Always-transmit mode |
+
+RS485 A/B → XLR pin 3/2 (pin 1 = shield/ground).
+
+> Keep ground common between Pi, RS485 module, and DMX fixtures.  
+> Use shielded cable for the RS485 run.  
+> If fixtures never respond: check A/B polarity (swap if needed), verify DE/RE are both high.
+
+---
+
+## Audio Input
+
+**USB interface (default):** plug in any class-compliant USB audio interface or microphone. Use `arecord -l` to confirm it appears.
+
+**HiFiBerry DAC+ ADC (optional HAT):** connects via I2S (standard 40-pin header). Follow HiFiBerry's mounting guide. Requires `dtoverlay=hifiberry-dacplusadc` in `config.txt` and `config/alsa/asound.conf` copied to `/etc/asound.conf` — see QUICKSTART Step 3.
 
 ---
 
 ## Tips
-- Keep all grounds common between Pi, MCP3008, and DMX hardware.  
-- Use short shielded wires for analog signals (CH0–CH5) to reduce noise.  
-- If the pots behave inversely, swap the outer legs (3.3 V ↔ GND).  
-- Always power down the Pi before rewiring any GPIO pins.
 
----
-
-© 2025 Ben Glasser
+- All grounds must be common (Pi, RS485 module, encoders, OLED, audio interface).
+- Use short wires for I2C and SPI runs; keep RS485 away from analog lines.
+- Power down the Pi before rewiring GPIO pins.
+- If encoders feel backwards, swap CLK/DT on that encoder's MCP23017 pins.
